@@ -234,7 +234,6 @@ pub struct Cli {
     pub binaries_dir: Option<PathBuf>,
 }
 
-/// Parse a `--storage` argument into a [`StoragePreference`].
 /// Parse a `--watch` duration argument into a [`std::time::Duration`].
 ///
 /// Accepts a combination of `d`/`h`/`m`/`s` units (`1h30m`, `2d12h`, `90s`)

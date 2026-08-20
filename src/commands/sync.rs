@@ -649,7 +649,7 @@ pub(crate) async fn push_over_ssh(
     let result = executor
         .push(src_path, &options)
         .await
-        .map_err(anyhow::Error::msg);
+        .map_err(anyhow::Error::new);
     // Close the channel so the remote sees EOF and can finish cleanly.
     drop(executor);
     handle.finish(result).await
@@ -750,7 +750,7 @@ pub(crate) async fn push_multi_over_ssh(
     let result = executor
         .push_multi(base, roots, &options)
         .await
-        .map_err(anyhow::Error::msg);
+        .map_err(anyhow::Error::new);
     drop(executor);
     handle.finish(result).await
 }
@@ -841,7 +841,7 @@ pub(crate) async fn pull_over_ssh(
     let result = executor
         .pull(dst_path, options)
         .await
-        .map_err(anyhow::Error::msg);
+        .map_err(anyhow::Error::new);
     drop(executor);
     handle.finish(result).await
 }
@@ -925,7 +925,7 @@ fn deploy_source(
         return Ok(path);
     }
     if os == local_os && arch == local_arch {
-        return std::env::current_exe().map_err(anyhow::Error::msg);
+        return std::env::current_exe().map_err(anyhow::Error::new);
     }
     let names = candidates
         .iter()

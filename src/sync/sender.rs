@@ -427,6 +427,14 @@ impl Sender {
         let rel = read.rel;
         match read.handle.await {
             Ok(Ok(data)) => {
+                // A size mismatch means the source changed between the scan
+                // and the read — the recorded metadata is stale, so under
+                // `--remove-source-files`/`--verify` the source must never be
+                // deleted. Skip the file, mirroring the chunked/delta paths.
+                if data.len() as u64 != read.expected_size {
+                    source_changed(&rel, skipped);
+                    return Ok(());
+                }
                 // The whole-file hash exists only when the post-transfer
                 // comparison will consume it.
                 let checksum = if self.verify_hash {
@@ -653,6 +661,7 @@ impl Sender {
                 // `rel_display` are moved here rather than recomputed.
                 batch_reads.push_back(BatchRead {
                     rel: rel_display,
+                    expected_size: task.source_size,
                     handle: tokio::spawn(async move {
                         tokio::fs::read(&full).await.map_err(Error::Io)
                     }),
@@ -1287,6 +1296,10 @@ enum SendOutcome {
 struct BatchRead {
     /// Wire-relative path (frame path + skip report identity).
     rel: String,
+    /// The scanned size, compared against the read size after the join (a
+    /// mismatch means the source changed mid-transfer — the same guard the
+    /// chunked and delta paths apply).
+    expected_size: u64,
     /// The running read (owns the on-disk source path).
     handle: tokio::task::JoinHandle<Result<Vec<u8>>>,
 }

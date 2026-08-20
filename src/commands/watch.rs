@@ -468,7 +468,7 @@ pub(crate) async fn watch_pull(
                     let result = executor
                         .pull_watch(&dst_path, &options, delay)
                         .await
-                        .map_err(anyhow::Error::msg);
+                        .map_err(anyhow::Error::new);
                     drop(executor);
                     handle.finish(result.map(|_| ())).await
                 }),
@@ -492,7 +492,7 @@ pub(crate) async fn watch_local(
 ) -> Result<()> {
     tokio::fs::create_dir_all(dst_path)
         .await
-        .map_err(anyhow::Error::msg)?;
+        .map_err(anyhow::Error::new)?;
     let mut options = options.clone();
     options.progress = None;
 
@@ -555,7 +555,7 @@ pub(crate) async fn push_local_over_server(
 ) -> Result<SyncStats> {
     let (mut child, send, recv) = spawn_server_child(dst, options)?;
     let mut executor = Executor::new(send, recv);
-    let result = executor.push(src, options).await.map_err(anyhow::Error::msg);
+    let result = executor.push(src, options).await.map_err(anyhow::Error::new);
     drop(executor);
     finish_server_child(&mut child, result).await
 }
@@ -573,7 +573,7 @@ pub(crate) async fn push_multi_local_over_server(
     let result = executor
         .push_multi(base, roots, options)
         .await
-        .map_err(anyhow::Error::msg);
+        .map_err(anyhow::Error::new);
     drop(executor);
     finish_server_child(&mut child, result).await
 }
@@ -591,8 +591,8 @@ type ServerChild = (
 fn spawn_server_child(dst: &Path, options: &ExecutorOptions) -> Result<ServerChild> {
     // The server child is rooted at `dst`, so it must exist before spawn.
     let dst = dst.to_path_buf();
-    std::fs::create_dir_all(&dst).map_err(anyhow::Error::msg)?;
-    let bin = std::env::current_exe().map_err(anyhow::Error::msg)?;
+    std::fs::create_dir_all(&dst).map_err(anyhow::Error::new)?;
+    let bin = std::env::current_exe().map_err(anyhow::Error::new)?;
     let mut cmd = tokio::process::Command::new(&bin);
     cmd.arg("--server");
     // `server_args` returns each forwarded flag as its own token; they are
@@ -604,7 +604,7 @@ fn spawn_server_child(dst: &Path, options: &ExecutorOptions) -> Result<ServerChi
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::inherit())
         .spawn()
-        .map_err(anyhow::Error::msg)?;
+        .map_err(anyhow::Error::new)?;
     let stdin = child
         .stdin
         .take()
@@ -626,7 +626,7 @@ async fn finish_server_child<T>(
     child: &mut tokio::process::Child,
     result: anyhow::Result<T>,
 ) -> anyhow::Result<T> {
-    let status = child.wait().await.map_err(anyhow::Error::msg)?;
+    let status = child.wait().await.map_err(anyhow::Error::new)?;
     if !status.success() {
         anyhow::bail!("cp2 --server child exited with {status}");
     }
