@@ -688,12 +688,16 @@ pub async fn push_multi(
                     pull_options.remove_source_files || pull_options.verify,
                     pull_options.rollsum,
                 );
+                // Read source files against *the manifest's* root, not the
+                // literal serve path: with `include_root` (a no-slash remote
+                // path) the scanner re-homes entries under the parent, so
+                // joining against `source_root` would double the directory.
                 let mut stats = sender
                     .send(
                         &mut ctrl_send,
                         &mut ctrl_recv,
                         &source_manifest,
-                        &source_root,
+                        source_manifest.root.as_path(),
                         &pull_options,
                     )
                     .await?;
@@ -873,7 +877,13 @@ async fn serve_watch_pull<W: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
             options.rollsum,
         );
         let stats = sender
-            .send(ctrl_send, ctrl_recv, &source_manifest, source_root, options)
+            .send(
+                ctrl_send,
+                ctrl_recv,
+                &source_manifest,
+                source_manifest.root.as_path(),
+                options,
+            )
             .await?;
         total.files_sent += stats.files_sent;
         total.bytes_transferred += stats.bytes_transferred;

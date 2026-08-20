@@ -329,12 +329,14 @@ async fn remote_path_scopes_the_transfer() {
     );
     assert!(!dst.path().join("a.txt").exists());
 
-    // Pull reads from root/backup.
+    // Pull reads from root/backup. A no-slash remote path recreates the
+    // directory under the destination (rsync `host:backup` semantics).
     pull_tree(dst.path(), restore.path(), &options).await;
     assert_eq!(
-        std::fs::read(restore.path().join("a.txt")).unwrap(),
+        std::fs::read(restore.path().join("backup/a.txt")).unwrap(),
         b"scoped"
     );
+    assert!(!restore.path().join("a.txt").exists());
 }
 #[tokio::test]
 async fn compressed_transfer_roundtrip() {
