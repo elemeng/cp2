@@ -69,6 +69,10 @@ impl std::fmt::Display for StoragePreference {
     }
 }
 
+// Production never converts a detected storage class into a preference (the
+// `--storage auto → resolved class` reporting path doesn't fold back into a
+// preference), so this conversion only serves the round-trip tests.
+#[cfg(test)]
 impl From<StorageClass> for StoragePreference {
     fn from(class: StorageClass) -> Self {
         match class {

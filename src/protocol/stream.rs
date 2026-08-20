@@ -39,6 +39,22 @@ const CHUNK_TAG: u8 = 0;
 /// straight from the sender's buffers, read straight into the receiver's.
 const BATCH_TAG: u8 = 1;
 
+/// True if a payload length fits the 30-bit frame-length field. Every length
+/// goes on the wire through [`frame_prefix`], which ORs in the flag bits, so
+/// this guard keeps the invariant (30-bit cap) in one place.
+#[must_use]
+fn len_ok(len: usize) -> bool {
+    len <= MAX_LEN as usize
+}
+
+/// Build the 4-byte big-endian length prefix for a `len`-byte payload,
+/// OR-ing in `flag`. Callers must have already checked [`len_ok`], which
+/// bounds `len` to 30 bits so the cast cannot truncate.
+#[expect(clippy::cast_possible_truncation)]
+fn frame_prefix(len: usize, flag: u32) -> [u8; 4] {
+    (len as u32 | flag).to_be_bytes()
+}
+
 /// Serialize a frame into a length-prefixed wire buffer, compressing the
 /// payload when `compress` is set and the payload exceeds `threshold` bytes.
 ///
@@ -55,17 +71,14 @@ pub fn encode(frame: &Frame, compress: bool, threshold: usize) -> Result<Vec<u8>
         (data, 0)
     };
 
-    if payload.len() > MAX_LEN as usize {
+    if !len_ok(payload.len()) {
         return Err(ProtocolError::Protocol(
             "Frame exceeds maximum length".to_string(),
         ));
     }
-    // Bounded by the MAX_LEN guard above, so the cast cannot truncate.
-    #[expect(clippy::cast_possible_truncation)]
-    let len = (payload.len() as u32) | flag;
 
     let mut wire = Vec::with_capacity(4 + payload.len());
-    wire.extend_from_slice(&len.to_be_bytes());
+    wire.extend_from_slice(&frame_prefix(payload.len(), flag));
     wire.extend_from_slice(&payload);
     Ok(wire)
 }
@@ -136,15 +149,12 @@ pub async fn send_chunk_frame<W: AsyncWrite + Unpin>(
 /// Returns an error if the frame exceeds the maximum length.
 pub fn chunk_frame_wire(file_id: u64, data: &[u8], out: &mut Vec<u8>) -> Result<()> {
     let total = 1 + 8 + data.len();
-    if total > MAX_LEN as usize {
+    if !len_ok(total) {
         return Err(ProtocolError::Protocol(
             "Chunk frame exceeds maximum length".to_string(),
         ));
     }
-    // Bounded by the MAX_LEN guard above, so the cast cannot truncate.
-    #[expect(clippy::cast_possible_truncation)]
-    let framed_len = (total as u32) | CHUNK_FLAG;
-    out.extend_from_slice(&framed_len.to_be_bytes());
+    out.extend_from_slice(&frame_prefix(total, CHUNK_FLAG));
     out.push(CHUNK_TAG);
     out.extend_from_slice(&file_id.to_le_bytes());
     out.extend_from_slice(data);
@@ -180,10 +190,11 @@ pub async fn send_batch_raw<W: AsyncWrite + Unpin>(
         ));
     }
     let mut head = Vec::with_capacity(4 + 1 + 4);
-    // Bounded by the MAX_LEN guard above, so the casts cannot truncate
-    // (every record carries ≥ 21 header bytes, so the count is bounded too).
+    // Bounded by the MAX_LEN guard above, so the truncated total is valid
+    // (every record carries ≥ 21 header bytes, so `items.len()` is bounded).
     #[expect(clippy::cast_possible_truncation)]
-    head.extend_from_slice(&((total as u32) | CHUNK_FLAG).to_be_bytes());
+    let total = total as u32;
+    head.extend_from_slice(&frame_prefix(total as usize, CHUNK_FLAG));
     head.push(BATCH_TAG);
     #[expect(clippy::cast_possible_truncation)]
     head.extend_from_slice(&(items.len() as u32).to_le_bytes());

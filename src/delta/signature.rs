@@ -121,17 +121,23 @@ pub struct ChunkSignature {
 }
 
 impl ChunkSignature {
+    /// Build a signature from already-computed parts (`weak` is always
+    /// `None` here — the fixed-block rollsum engine sets it separately).
+    pub(crate) fn from_parts(offset: u64, len: u32, strong_hash: [u8; 32]) -> Self {
+        Self {
+            offset,
+            len,
+            weak: None,
+            strong_hash,
+        }
+    }
+
     /// Build a signature from a chunk emitted by `chunkrs`.
     fn from_chunk(chunk: &Chunk) -> DeltaResult<Self> {
         let strong_hash = chunk_hash(chunk)?;
         let len = u32::try_from(chunk.len())
             .map_err(|_| DeltaError::Chunking(format!("chunk too large: {}", chunk.len())))?;
-        Ok(Self {
-            offset: chunk.start(),
-            len,
-            weak: None,
-            strong_hash,
-        })
+        Ok(Self::from_parts(chunk.start(), len, strong_hash))
     }
 }
 

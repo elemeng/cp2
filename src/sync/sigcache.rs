@@ -20,19 +20,7 @@
 
 use std::path::{Path, PathBuf};
 
-use serde::{Deserialize, Serialize};
-
 use crate::delta::Signature;
-
-/// One cache entry: the key (size + mtime of the destination file) plus the
-/// signature of that content.
-#[derive(Debug, Serialize, Deserialize)]
-struct Entry {
-    file_size: u64,
-    mtime_sec: u64,
-    mtime_nsec: u32,
-    signature: Signature,
-}
 
 struct SigCache {
     dir: PathBuf,
@@ -61,14 +49,12 @@ impl SigCache {
         mtime_nsec: u32,
     ) -> Option<Signature> {
         let bytes = std::fs::read(self.entry_path(path)).ok()?;
-        let entry: Entry = postcard::from_bytes(&bytes).ok()?;
-        if entry.file_size != file_size
-            || entry.mtime_sec != mtime_sec
-            || entry.mtime_nsec != mtime_nsec
-        {
+        let (f_size, f_mtime_sec, f_mtime_nsec, signature): (u64, u64, u32, Signature) =
+            postcard::from_bytes(&bytes).ok()?;
+        if f_size != file_size || f_mtime_sec != mtime_sec || f_mtime_nsec != mtime_nsec {
             return None;
         }
-        Some(entry.signature)
+        Some(signature)
     }
 
     fn store(
@@ -79,13 +65,9 @@ impl SigCache {
         mtime_nsec: u32,
         signature: &Signature,
     ) {
-        let entry = Entry {
-            file_size,
-            mtime_sec,
-            mtime_nsec,
-            signature: signature.clone(),
-        };
-        let Ok(bytes) = postcard::to_allocvec(&entry) else {
+        // Serialize the borrowed tuple (size + mtime key, then the signature)
+        // so a large basis chunk table is not cloned just to be written.
+        let Ok(bytes) = postcard::to_allocvec(&(file_size, mtime_sec, mtime_nsec, signature)) else {
             return;
         };
         if std::fs::create_dir_all(&self.dir).is_err() {

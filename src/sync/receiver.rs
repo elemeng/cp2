@@ -169,13 +169,13 @@ impl Receiver {
         ctrl_recv: &mut R,
         source_meta: Vec<FileMeta>,
     ) -> Result<(u64, u64, Vec<SkippedFile>)> {
-        let mut state = ApplyState::new(source_meta.clone(), self.apply_jobs);
         // The run's transferable file count (the pull side's display
         // denominator — the files among the source manifest's entries).
         let files_total = source_meta
             .iter()
             .filter(|m| m.kind == crate::protocol::FileKind::File)
             .count() as u64;
+        let mut state = ApplyState::new(source_meta, self.apply_jobs);
 
         let outcome: Result<(u64, u64, Vec<SkippedFile>)> = async move {
             let loop_result: Result<()> = async {

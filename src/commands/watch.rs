@@ -8,7 +8,7 @@
 
 use crate::cli::Cli;
 use crate::protocol::TargetOs;
-use crate::sync::watcher::{MAX_COALESCE, SYNC_ERROR_BACKOFF, start_watcher};
+use crate::sync::watcher::{SYNC_ERROR_BACKOFF, start_watcher};
 use crate::sync::{Executor, ExecutorOptions, SyncStats};
 use crate::target::RemoteTarget;
 use crate::transport::{JumpHost, RemoteClient};
@@ -313,20 +313,18 @@ where
             _ = tokio::signal::ctrl_c() => return Ok(()),
         }
 
-        // Debounce: wait for a quiet window (or the coalesce cap).
-        let window_start = tokio::time::Instant::now();
-        loop {
-            tokio::select! {
-                res = changes.recv() => {
-                    if res.is_none() {
-                        break; // channel closed: sync what we have, then exit
-                    }
-                    // More changes: restart the quiet window (the cap is absolute).
-                }
-                () = tokio::time::sleep(delay) => break,
-                () = tokio::time::sleep_until(window_start + MAX_COALESCE) => break,
-                _ = tokio::signal::ctrl_c() => return Ok(()),
-            }
+        // Debounce: wait for a quiet window (or the coalesce cap), stopping
+        // cleanly on Ctrl-C. A closed channel falls through to sync what we
+        // have, then the post-sync drain ends the loop.
+        match crate::sync::watcher::wait_debounce(changes, delay, async {
+            tokio::signal::ctrl_c().await.unwrap_or(());
+            Ok(())
+        })
+        .await?
+        {
+            crate::sync::watcher::BurstWait::Aborted => return Ok(()),
+            crate::sync::watcher::BurstWait::Ready
+            | crate::sync::watcher::BurstWait::ChannelClosed => {}
         }
 
         // Sync, re-running immediately if changes arrived during the run;

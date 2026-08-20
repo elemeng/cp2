@@ -952,30 +952,26 @@ async fn wait_for_changes<R: AsyncRead + Unpin>(
     if dirty {
         return Ok(WatchWait::Changed);
     }
-    let window_start = tokio::time::Instant::now();
+    let outcome = crate::sync::watcher::wait_debounce(changes, delay, watch_disconnect(ctrl_recv))
+        .await?;
+    Ok(match outcome {
+        crate::sync::watcher::BurstWait::Ready => WatchWait::Changed,
+        crate::sync::watcher::BurstWait::ChannelClosed
+        | crate::sync::watcher::BurstWait::Aborted => WatchWait::Disconnected,
+    })
+}
+
+/// The disconnect probe raced against the server's debounce wait. Resolves
+/// `Ok(())` only when the client has closed the connection; any other read
+/// outcome is a protocol error.
+async fn watch_disconnect<R: AsyncRead + Unpin>(ctrl_recv: &mut R) -> Result<()> {
     let mut probe = [0u8; 64];
-    loop {
-        tokio::select! {
-            res = changes.recv() => {
-                if res.is_none() {
-                    return Ok(WatchWait::Disconnected); // watcher stopped
-                }
-                // More changes: restart the quiet window (the cap is absolute).
-            }
-            () = tokio::time::sleep(delay) => return Ok(WatchWait::Changed),
-            () = tokio::time::sleep_until(window_start + crate::sync::watcher::MAX_COALESCE) => {
-                return Ok(WatchWait::Changed);
-            }
-            n = ctrl_recv.read(&mut probe) => match n {
-                Ok(0) => return Ok(WatchWait::Disconnected), // client closed
-                Ok(_) => {
-                    return Err(Error::Other(
-                        "Unexpected data from client during watch wait".to_string(),
-                    ))
-                }
-                Err(e) => return Err(Error::Io(e)),
-            },
-        }
+    match ctrl_recv.read(&mut probe).await {
+        Ok(0) => Ok(()), // client closed the connection
+        Ok(_) => Err(Error::Other(
+            "Unexpected data from client during watch wait".to_string(),
+        )),
+        Err(e) => Err(Error::Io(e)),
     }
 }
 

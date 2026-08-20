@@ -6,7 +6,7 @@
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher, recommended_watcher};
 use std::path::Path;
 use std::time::Duration;
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 /// Cap on the debounce window: a never-ending burst of events (e.g. a build
 /// writing thousands of files) must not starve the sync forever.
@@ -15,6 +15,48 @@ pub(crate) const MAX_COALESCE: Duration = Duration::from_secs(10);
 /// Backoff after a failed sync before retrying the same changes (watch push
 /// loop, initial-sync retry, and server-side scan retry all share it).
 pub(crate) const SYNC_ERROR_BACKOFF: Duration = Duration::from_secs(5);
+
+/// Why a debounced wait on the changes channel ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BurstWait {
+    /// A quiet window elapsed, or the coalesce cap was hit: run a sync cycle.
+    Ready,
+    /// The changes channel closed (the watcher stopped).
+    ChannelClosed,
+    /// The abort condition fired (Ctrl-C on the client, a disconnect probe on
+    /// the server): stop watching.
+    Aborted,
+}
+
+/// Wait out a debounced change burst on `changes`: the first event opens a
+/// quiet window (`delay`), further events restart it, but [`MAX_COALESCE`]
+/// caps the total wait so a continuous stream still syncs. `abort` is raced
+/// against the wait so callers can stop early (a signal, a disconnect probe);
+/// it resolves `Err` to abort the session with an error.
+pub(crate) async fn wait_debounce(
+    changes: &mut UnboundedReceiver<()>,
+    delay: Duration,
+    abort: impl core::future::Future<Output = crate::Result<()>>,
+) -> crate::Result<BurstWait> {
+    let window_start = tokio::time::Instant::now();
+    let mut abort = core::pin::pin!(abort);
+    loop {
+        tokio::select! {
+            res = changes.recv() => {
+                if res.is_none() {
+                    return Ok(BurstWait::ChannelClosed);
+                }
+                // More changes: restart the quiet window (the cap is absolute).
+            }
+            () = tokio::time::sleep(delay) => return Ok(BurstWait::Ready),
+            () = tokio::time::sleep_until(window_start + MAX_COALESCE) => return Ok(BurstWait::Ready),
+            res = &mut abort => {
+                res?;
+                return Ok(BurstWait::Aborted);
+            }
+        }
+    }
+}
 
 /// Start a recursive watcher on `root`, forwarding every sync-worthy event
 /// as a unit signal on `tx`.

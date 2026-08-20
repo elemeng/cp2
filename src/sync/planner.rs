@@ -241,13 +241,7 @@ impl Planner {
             link_target: src.link_target.clone(),
             link_kind: src.link_kind,
             link_to: None,
-            special: match src.kind {
-                FileKind::Fifo
-                | FileKind::Socket
-                | FileKind::BlockDevice
-                | FileKind::CharDevice => Some((src.kind, src.rdev)),
-                _ => None,
-            },
+            special: Self::is_special(src.kind).then_some((src.kind, src.rdev)),
             source_path: src.source_path.clone(),
             dereferenced: src.dereferenced,
         }

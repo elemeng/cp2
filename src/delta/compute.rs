@@ -30,6 +30,44 @@ use crate::delta::signature::{
 /// copy run gets.
 const COPY_STREAM_CHUNK: u32 = 1024 * 1024;
 
+/// Stream the whole source as one literal-runs delta for an empty (or
+/// non-rollsum) basis. Bounded in `buf_size` chunks — no `read_to_end` —
+/// with the same literal-budget abort as the chunked paths: a basis that
+/// matches nothing must not accumulate the whole source as one in-memory
+/// literal. Shared by the `FastCDC` ([`compute_delta_limited`]) and rollsum
+/// ([`compute_delta_rollsum`]) engines.
+fn stream_all_literal<R: Read>(
+    source: &mut R,
+    buf_size: usize,
+    dest_size: u64,
+    max_literal: u64,
+    verify: bool,
+) -> DeltaResult<Delta> {
+    let mut hasher = verify.then(blake3::Hasher::new);
+    let mut delta = Delta::new(0, dest_size);
+    let mut buf = vec![0u8; buf_size];
+    let mut literal_bytes: u64 = 0;
+    loop {
+        let n = source
+            .read(&mut buf)
+            .map_err(|e| DeltaError::Chunking(format!("read error: {e}")))?;
+        if n == 0 {
+            break;
+        }
+        delta.push_literal(&buf[..n]);
+        if let Some(h) = &mut hasher {
+            h.update(&buf[..n]);
+        }
+        literal_bytes += n as u64;
+        if literal_bytes > max_literal {
+            return Err(DeltaError::LiteralBudgetExceeded { limit: max_literal });
+        }
+    }
+    delta.source_size = literal_bytes;
+    delta.checksum = hasher.map(|h| *h.finalize().as_bytes());
+    Ok(delta)
+}
+
 /// Compute a delta between `source` and a basis described by `signature`.
 ///
 /// The source is streamed and chunked with the same `FastCDC` configuration used
@@ -84,35 +122,15 @@ pub fn compute_delta_limited<R: Read>(
     mut sig_out: Option<&mut Vec<ChunkSignature>>,
 ) -> DeltaResult<Delta> {
     let table = SignatureTable::from_signature(signature);
-    let mut hasher = verify.then(blake3::Hasher::new);
-
-    let mut delta = Delta::new(0, signature.file_size);
 
     // Empty basis: everything is literal. Streamed in bounded chunks (no
     // `read_to_end`), with the same budget abort as the chunked path.
     if table.is_empty() {
-        let mut buf = vec![0u8; READ_CHUNK];
-        let mut literal_bytes: u64 = 0;
-        loop {
-            let n = source
-                .read(&mut buf)
-                .map_err(|e| DeltaError::Chunking(format!("read error: {e}")))?;
-            if n == 0 {
-                break;
-            }
-            delta.push_literal(&buf[..n]);
-            if let Some(h) = &mut hasher {
-                h.update(&buf[..n]);
-            }
-            literal_bytes += n as u64;
-            if literal_bytes > max_literal {
-                return Err(DeltaError::LiteralBudgetExceeded { limit: max_literal });
-            }
-        }
-        delta.source_size = literal_bytes;
-        delta.checksum = hasher.map(|h| *h.finalize().as_bytes());
-        return Ok(delta);
+        return stream_all_literal(source, READ_CHUNK, signature.file_size, max_literal, verify);
     }
+
+    let mut hasher = verify.then(blake3::Hasher::new);
+    let mut delta = Delta::new(0, signature.file_size);
 
     let mut literal_bytes: u64 = 0;
     let source_size = for_each_chunk(source, |chunk| {
@@ -126,13 +144,9 @@ pub fn compute_delta_limited<R: Read>(
         // Free byproduct: the source's chunk signature — the new destination
         // content's basis signature (see `sig_out`).
         if let Some(out) = &mut sig_out {
-            out.push(ChunkSignature {
-                offset: chunk.start(),
-                len: u32::try_from(chunk.len())
-                    .map_err(|_| DeltaError::Chunking("chunk too large".to_string()))?,
-                weak: None,
-                strong_hash: hash,
-            });
+            let len = u32::try_from(chunk.len())
+                .map_err(|_| DeltaError::Chunking("chunk too large".to_string()))?;
+            out.push(ChunkSignature::from_parts(chunk.start(), len, hash));
         }
         if literal_bytes > max_literal {
             return Err(DeltaError::LiteralBudgetExceeded { limit: max_literal });
@@ -220,31 +234,9 @@ pub fn compute_delta_rollsum<R: Read>(
         .iter()
         .find_map(|c| c.weak.map(|_| c.len as usize))
     else {
-        // Empty basis or not a rollsum signature: everything is literal.
-        // Streamed in bounded chunks, with the same budget abort as the
-        // chunked path (a basis that matches nothing must not accumulate the
-        // whole source as one in-memory literal).
-        let mut buf = vec![0u8; ROLLSUM_BUF];
-        let mut total: u64 = 0;
-        loop {
-            let n = source
-                .read(&mut buf)
-                .map_err(|e| DeltaError::Chunking(format!("read error: {e}")))?;
-            if n == 0 {
-                break;
-            }
-            delta.push_literal(&buf[..n]);
-            if let Some(h) = &mut hasher {
-                h.update(&buf[..n]);
-            }
-            total += n as u64;
-            if total > max_literal {
-                return Err(DeltaError::LiteralBudgetExceeded { limit: max_literal });
-            }
-        }
-        delta.source_size = total;
-        delta.checksum = hasher.map(|h| *h.finalize().as_bytes());
-        return Ok(delta);
+        // Empty basis or not a rollsum signature: everything is literal (see
+        // `stream_all_literal` — bounded chunks, same budget abort).
+        return stream_all_literal(source, ROLLSUM_BUF, signature.file_size, max_literal, verify);
     };
 
     // Hash table (rsync's `build_hash_table`): a flat head array with an

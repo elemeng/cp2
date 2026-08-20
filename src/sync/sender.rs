@@ -23,7 +23,7 @@ use crate::sync::scanner::Manifest;
 use crate::sync::stats::SyncStats;
 use crate::sync::strategy::{FileClass, TransferStrategy, classify_file_size, determine_strategy};
 use crate::sync::wire::{
-    file_id, file_meta_from_entry, from_peer, manifest_from_file_meta, wire_rel,
+    file_id, file_meta_from_entry, file_source, from_peer, manifest_from_file_meta, wire_rel,
 };
 use crate::sync::bandwidth::BandwidthLimiter;
 use crate::{Error, Result};
@@ -689,8 +689,10 @@ impl Sender {
             // drains at the 128 MiB budget or at the end of the plan.
 
             // The batch path needs no file id (batch records carry a
-            // per-run sequence number), so the hash is computed only here.
-            let fid = file_id(&task.relative_path.to_string_lossy());
+            // per-run sequence number), so the hash is computed only here —
+            // over the already-normalized wire path rather than re-converting
+            // the task's `PathBuf`.
+            let fid = file_id(&rel_display);
             let outcome = if let Some((basis_rel, basis_rx)) = cross_basis {
                 // Cross-file delta: a sibling transferred earlier in this
                 // plan is the basis. Its signature arrives via the channel
@@ -825,7 +827,7 @@ impl Sender {
                 if !ref_txs.is_empty() {
                     spawn_ref_signature_job(&full, ref_txs);
                 }
-                self.send_chunked(ctrl_send, fid, &task.relative_path, &full, task.source_size, files_total)
+                self.send_chunked(ctrl_send, fid, &rel_display, &full, task.source_size, files_total)
                     .await
                     .map(SendOutcome::Sent)
             };
@@ -1029,18 +1031,16 @@ impl Sender {
         &self,
         ctrl: &mut W,
         fid: u64,
-        rel: &Path,
+        display: &str,
         full: &Path,
         size: u64,
         files_total: u64,
     ) -> Result<(u64, [u8; 32])> {
-        let display = wire_rel(rel);
-
         stream::send_frame(
             ctrl,
             &Frame::FileStart {
                 file_id: fid,
-                file_path: display.clone(),
+                file_path: display.to_string(),
                 size,
             },
         )
@@ -1105,7 +1105,7 @@ impl Sender {
             }
             sent += len as u64;
             if let Some(report) = &self.progress {
-                report(&display, sent, size, files_total);
+                report(display, sent, size, files_total);
             }
             // Join the read-ahead before the next iteration.
             let (read_result, hasher_back, file_back, buf_back) = read_task
@@ -1161,7 +1161,7 @@ impl Sender {
                     self.send_chunked(
                         ctrl_send,
                         job.fid,
-                        Path::new(&rel),
+                        &rel,
                         &job.full,
                         job.expected_size,
                         files_total,
@@ -1196,7 +1196,7 @@ impl Sender {
                     .await
                     .map_err(Error::Io)?
                     .len();
-                self.send_chunked(ctrl_send, job.fid, Path::new(&rel), &job.full, size, files_total)
+                self.send_chunked(ctrl_send, job.fid, &rel, &job.full, size, files_total)
                     .await
                     .map(|(sent, hash)| (sent, hash, None))
             }
@@ -1623,10 +1623,7 @@ fn compute_cross_delta_job(
 /// `--follow-links` recursion carry an explicit source path outside the scan
 /// root; everything else resolves under `source_root` by its relative path.
 fn task_source(source_root: &Path, task: &SyncTask) -> PathBuf {
-    match &task.source_path {
-        Some(path) => path.clone(),
-        None => source_root.join(&task.relative_path),
-    }
+    file_source(source_root, task.source_path.as_deref(), &task.relative_path)
 }
 
 

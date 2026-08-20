@@ -134,6 +134,16 @@ pub(crate) fn atime_secs(meta: &std::fs::Metadata) -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
+/// The file's atime nanosecond remainder (see [`atime_secs`]) — carried so
+/// `-U`/`--atimes` can restore sub-second fidelity.
+#[must_use]
+pub(crate) fn atime_nsecs(meta: &std::fs::Metadata) -> u32 {
+    meta.accessed()
+        .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .map_or(0, |d| d.subsec_nanos())
+}
+
 /// Restore a file's owner/group (`-a` archive mode, best-effort — 0-Root
 /// stays the default: the owner is the SSH connection user, no chown unless
 /// asked). A non-root receiver cannot chown to another uid/gid — the attempt

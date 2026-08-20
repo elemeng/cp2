@@ -15,7 +15,7 @@ use crate::sync::filter::FilterSet;
 use crate::sync::linkpolicy::{
     LinkClass, classify_link, compute_exec_hint, final_mode, rewrite_internal_target,
 };
-use crate::sync::wire::wire_str;
+use crate::sync::wire::{file_source, wire_str};
 
 /// A single file (or empty directory) discovered by the scanner.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1225,10 +1225,7 @@ fn rel_of_internal_target(link_path: &Path, target: &str, root: &Path) -> String
 /// recursion carry an explicit path outside the scan root; everything else
 /// resolves as `root.join(relative_path)`.
 fn entry_source(root: &Path, entry: &FileEntry) -> PathBuf {
-    entry
-        .source_path
-        .clone()
-        .unwrap_or_else(|| root.join(&entry.relative_path))
+    file_source(root, entry.source_path.as_deref(), Path::new(&entry.relative_path))
 }
 
 /// Whether `path` (relative name `rel`) is a Shell Link (.lnk) on this scan.
@@ -1481,10 +1478,7 @@ fn mtime_secs(meta: &std::fs::Metadata) -> i64 {
 /// The file's mtime nanosecond remainder — always recorded so `-a` (archive)
 /// can restore sub-second fidelity; the default applies whole seconds only.
 fn mtime_nsecs(meta: &std::fs::Metadata) -> u32 {
-    meta.modified()
-        .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
-        .duration_since(std::time::SystemTime::UNIX_EPOCH)
-        .map_or(0, |d| d.subsec_nanos())
+    crate::platform::fs::mtime_nsecs(meta)
 }
 
 /// The file's last-access time in seconds since the Unix epoch — always
@@ -1495,10 +1489,7 @@ fn atime_secs(meta: &std::fs::Metadata) -> i64 {
 
 /// The file's atime nanosecond remainder. See [`atime_secs`].
 fn atime_nsecs(meta: &std::fs::Metadata) -> u32 {
-    meta.accessed()
-        .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
-        .duration_since(std::time::SystemTime::UNIX_EPOCH)
-        .map_or(0, |d| d.subsec_nanos())
+    crate::platform::fs::atime_nsecs(meta)
 }
 
 /// The file's owner uid (Unix); `None` where ownership does not exist

@@ -2,7 +2,7 @@
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use typed_path::Utf8UnixPathBuf;
 
@@ -15,6 +15,16 @@ pub(crate) fn file_id(path: &str) -> u64 {
     let mut h = DefaultHasher::new();
     path.hash(&mut h);
     h.finish()
+}
+
+/// The on-disk source path of an entry/task: an explicitly carried source
+/// path (a subtree pulled in via `--follow-links` recursion) wins; otherwise
+/// the relative path resolves under `root`.
+pub(crate) fn file_source(root: &Path, source: Option<&Path>, relative_path: &Path) -> PathBuf {
+    match source {
+        Some(path) => path.to_path_buf(),
+        None => root.join(relative_path),
+    }
 }
 
 /// Encode a scanner mtime (`i64`) into its wire form (`u64`). Pre-1970
