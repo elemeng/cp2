@@ -146,9 +146,25 @@ pub async fn execute(cli: &mut Cli) -> Result<()> {
     }
 
     let mut options = options_from_cli(cli);
-    if !cli.quiet {
+    if !cli.quiet && !cli.no_progress {
         install_progress(&mut options);
     }
+
+    // rsync trailing-slash semantics for the local source: a single-directory
+    // source *without* a trailing slash recreates the directory under the
+    // destination (`cp2 dir user@host:dst` → `dst/dir/*`); a trailing slash
+    // takes the contents only. Globs and `--files-from` build their own root,
+    // and a file source is handled as a single-file sync. The pull side (a
+    // remote source) is not set here — its flag rides the `PullRequest` and is
+    // applied by the server sender.
+    options.include_root_component = match &src {
+        Location::Local(_) => {
+            src_is_dir
+                && source_multi.is_none()
+                && crate::sync::scanner::include_root_component(&source)
+        }
+        Location::Remote(_) => false,
+    };
 
     // The transport (system ssh or the pure-Rust russh client), the
     // optional jump host, and the optional --password are resolved once per

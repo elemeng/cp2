@@ -58,9 +58,31 @@ fn warn_on_link_flag_conflicts(cli: &Cli) {
     }
 }
 
+/// Warn about decision flags that silently cancel, no-op, or override each
+/// other (rsync-style intent warnings, not hard errors — the planner still
+/// applies its documented precedence). Links are handled separately in
+/// [`warn_on_link_flag_conflicts`].
+fn warn_on_decision_flag_conflicts(cli: &Cli) {
+    if cli.max_delete.is_some() && !cli.delete {
+        tracing::warn!("--max-delete has no effect without --delete");
+    }
+    if cli.existing && cli.ignore_existing {
+        tracing::warn!(
+            "--existing and --ignore-existing contradict each other: \
+             nothing would be updated or created"
+        );
+    }
+    if cli.ignore_times && cli.checksum {
+        tracing::warn!(
+            "--ignore-times overrides --checksum: every file is transferred regardless of matches"
+        );
+    }
+}
+
 /// Build executor options from the CLI flags.
 pub(crate) fn options_from_cli(cli: &Cli) -> ExecutorOptions {
     warn_on_link_flag_conflicts(cli);
+    warn_on_decision_flag_conflicts(cli);
     ExecutorOptions {
         checksum: cli.checksum,
         delete: cli.delete,
@@ -104,6 +126,9 @@ pub(crate) fn options_from_cli(cli: &Cli) -> ExecutorOptions {
         // OS on push, the local OS on pull/local copy (spec §2.2 / §3.2).
         target_os: TargetOs::Unix,
         progress: None,
+        // Overridden per direction by `sync::execute` (trailing-slash
+        // semantics for the local source) or by the pull frame (server side).
+        include_root_component: false,
     }
 }
 

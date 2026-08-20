@@ -183,6 +183,15 @@ pub struct ScanOptions {
     /// directories (best-effort; symlinks are not covered) and carry them on
     /// the wire. Off by default — collection is per-entry syscalls.
     pub xattrs: bool,
+    /// rsync trailing-slash semantics: when the source root is a directory and
+    /// the source path had no trailing slash, the directory's own name is
+    /// recreated at the destination (`cp2 dir DST` → `DST/dir/*`). When set,
+    /// the scanner prefixes every entry's relative path with the root's file
+    /// name and roots the manifest at the *parent* directory, so the sender
+    /// reads `parent/name/...` and the receiver builds `DST/name/...`. A
+    /// trailing slash on the source (contents mode) leaves this `false`.
+    /// Source scans only — never set on a destination scan.
+    pub include_root_component: bool,
     /// Relative paths the *peer* source manifest classifies as links (symlinks
     /// or `.lnk` shortcuts). Set only on a destination scan: it lets the walk
     /// recognize a materialized shortcut by content alone — a Unix-source
@@ -215,7 +224,27 @@ impl Default for ScanOptions {
             source_link_paths: None,
             archive: false,
             xattrs: false,
+            include_root_component: false,
         }
+    }
+}
+
+/// rsync trailing-slash semantics for a source path *string*: whether the
+/// source's last path component should be recreated at the destination
+/// (`cp2 dir DST` → `DST/dir/*`). "Contents" mode (`false`) applies when the
+/// path is empty, ends with a separator (`dir/`), or its last component is
+/// `.` or `..`; otherwise the component is included (`true`).
+#[must_use]
+pub(crate) fn include_root_component(path: &str) -> bool {
+    if path.is_empty() {
+        return false;
+    }
+    if path.ends_with(['/', '\\']) {
+        return false;
+    }
+    match path.rsplit(['/', '\\']).next() {
+        Some(comp) => !comp.is_empty() && comp != "." && comp != "..",
+        None => false,
     }
 }
 
@@ -317,9 +346,30 @@ impl Scanner {
         self.apply_permission_matrix(&mut entries);
         self.collect_entry_xattrs(&canonical, &mut entries);
 
+        // rsync trailing-slash semantics (`cp2 dir DST` → `DST/dir/*`): the
+        // source dir's own name is recreated, so entries are named relative to
+        // the *parent* and prefixed with the root component. Guard the
+        // filesystem root — `/` has no file name to include. Hashing and the
+        // permission/xattr passes above already ran against `canonical`, so
+        // only the wire names and the manifest root change here.
+        let root = if self.options.include_root_component
+            && let Some(dir_name) = canonical.file_name()
+        {
+            let prefix = dir_name.to_string_lossy().into_owned();
+            for entry in &mut entries {
+                entry.relative_path = format!("{prefix}/{}", entry.relative_path);
+            }
+            canonical
+                .parent()
+                .unwrap_or(&canonical)
+                .to_path_buf()
+        } else {
+            canonical.clone()
+        };
+
         let total_bytes = entries.iter().map(|f| f.size).sum();
         Ok(Manifest {
-            root: canonical,
+            root,
             files: entries,
             total_bytes,
             skipped,
@@ -1634,6 +1684,63 @@ mod tests {
         assert!(manifest.files[1].is_dir);
         assert_eq!(manifest.files[2].relative_path, "sub/b.txt");
         assert_eq!(manifest.files[2].size, 4);
+    }
+
+    #[test]
+    fn include_root_component_helper() {
+        // No trailing slash, a real last component → include the directory.
+        assert!(include_root_component("dir"));
+        assert!(include_root_component("./dir"));
+        assert!(include_root_component("/abs/dir"));
+        assert!(include_root_component("C:\\path\\dir"));
+        assert!(include_root_component("user@host:backup"));
+        // Trailing separator → contents mode.
+        assert!(!include_root_component("dir/"));
+        assert!(!include_root_component("dir\\"));
+        // Empty / `.` / `..` last component → contents mode.
+        assert!(!include_root_component(""));
+        assert!(!include_root_component("."));
+        assert!(!include_root_component("dir/."));
+        assert!(!include_root_component("dir/.."));
+        assert!(!include_root_component("/"));
+    }
+
+    #[tokio::test]
+    async fn scan_include_root_component_prefixes_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let name = dir.path().file_name().unwrap().to_string_lossy().into_owned();
+        tokio::fs::write(dir.path().join("a.txt"), b"aaa")
+            .await
+            .unwrap();
+        tokio::fs::create_dir(dir.path().join("sub")).await.unwrap();
+        tokio::fs::write(dir.path().join("sub/b.txt"), b"bbbb")
+            .await
+            .unwrap();
+
+        let manifest = Scanner::new(ScanOptions {
+            include_root_component: true,
+            ..ScanOptions::default()
+        })
+        .scan(dir.path())
+        .await
+        .unwrap();
+        // Entries are prefixed with the root's name and rooted at the parent,
+        // so the sender reads `parent/name/...` (rsync `dir DST` → `DST/dir`).
+        let canon_dir = dir.path().canonicalize().unwrap();
+        assert_eq!(manifest.root, canon_dir.parent().unwrap().to_path_buf());
+        assert!(manifest
+            .files
+            .iter()
+            .any(|f| f.relative_path == format!("{name}/a.txt")));
+        assert!(manifest
+            .files
+            .iter()
+            .any(|f| f.relative_path == format!("{name}/sub/b.txt")));
+        // Every entry carries the prefix.
+        assert!(manifest
+            .files
+            .iter()
+            .all(|f| f.relative_path.starts_with(&format!("{name}/"))));
     }
 
     #[tokio::test]

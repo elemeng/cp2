@@ -227,6 +227,13 @@ pub struct ExecutorOptions {
     /// rsync's `-P`-style listing + progress comes from here (the CLI installs
     /// a renderer by default).
     pub progress: Option<ProgressFn>,
+    /// rsync trailing-slash semantics for the *source*: when the source is a
+    /// directory and its path had no trailing slash, the directory's own name
+    /// is recreated at the destination (`cp2 dir DST` → `DST/dir/*`). Set only
+    /// on the sending side; a destination scan never carries it (the receiver
+    /// just applies the paths the sender names). Round-trips to the remote
+    /// pull sender through the [`Frame::PullRequest`] `include_root` field.
+    pub include_root_component: bool,
 }
 
 /// Build the scanner options for a tree scan from the run options; the
@@ -257,6 +264,7 @@ fn scanner_options(
         source_link_paths,
         archive: options.archive,
         xattrs: options.xattrs,
+        include_root_component: is_source_scan && options.include_root_component,
     }
 }
 
@@ -278,6 +286,10 @@ fn pull_request(options: &ExecutorOptions, watch: bool, watch_delay_ms: u32) -> 
         compress: options.compress,
         bwlimit: options.bwlimit,
         client_os: options.target_os,
+        // rsync trailing-slash semantics for the remote source: a no-slash
+        // path (`user@host:dir`) recreates `dir` at the client's destination;
+        // a trailing slash (`user@host:dir/`) takes the contents only.
+        include_root: crate::sync::scanner::include_root_component(&options.remote_path),
     }
 }
 
@@ -321,6 +333,7 @@ impl Default for ExecutorOptions {
             preserve_times: true,
             target_os: TargetOs::Unix,
             progress: None,
+            include_root_component: false,
         }
     }
 }
@@ -624,6 +637,7 @@ pub async fn push_multi(
                 compress,
                 bwlimit,
                 client_os,
+                include_root,
             } => {
                 let source_root = resolve_serve_path(root, &path)?;
                 // The client's options (filters, decision flags, compression,
@@ -644,6 +658,7 @@ pub async fn push_multi(
                     exclude: excludes,
                     include: includes,
                     target_os: client_os,
+                    include_root_component: include_root,
                     ..options.clone()
                 };
                 if watch {

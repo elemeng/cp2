@@ -53,8 +53,10 @@ fn test_local_copy() {
     std::fs::create_dir(src.path().join("sub")).unwrap();
     std::fs::write(src.path().join("sub/b.txt"), b"world").unwrap();
 
+    // A trailing slash on the source copies its contents into the
+    // destination (`cp2 src/ DST/out` → `out/a.txt`), matching rsync.
     let output = cp2_command()
-        .arg(src.path())
+        .arg(format!("{}/", src.path().display()))
         .arg(dst.path().join("out"))
         .output()
         .unwrap();
@@ -72,6 +74,39 @@ fn test_local_copy() {
         std::fs::read(dst.path().join("out/sub/b.txt")).unwrap(),
         b"world"
     );
+}
+
+#[test]
+fn test_local_copy_includes_dir_without_slash() {
+    let src = TempDir::new().unwrap();
+    let dst = TempDir::new().unwrap();
+    std::fs::write(src.path().join("a.txt"), b"hello").unwrap();
+
+    // No trailing slash: rsync recreates the source dir under the
+    // destination (`cp2 src DST/out` → `out/<src-name>/a.txt`).
+    let name = src
+        .path()
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let output = cp2_command()
+        .arg(src.path())
+        .arg(dst.path().join("out"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert_eq!(
+        std::fs::read(dst.path().join("out").join(&name).join("a.txt")).unwrap(),
+        b"hello"
+    );
+    // The contents-only location must not also exist.
+    assert!(!dst.path().join("out/a.txt").exists());
 }
 
 #[test]

@@ -157,6 +157,11 @@ pub enum Frame {
         /// can build the permission matrix and link representation for the
         /// correct target (spec §2.2 / §3.2 — the source side decides).
         client_os: TargetOs,
+        /// rsync trailing-slash semantics for the remote source: whether the
+        /// last path component of `path` should be recreated at the client's
+        /// destination (`user@host:dir` → `DST/dir/*`, the no-slash form) or
+        /// its contents taken only (`user@host:dir/` → `DST/*`).
+        include_root: bool,
     },
 
     /// A delta recipe for one file. The delta carries literal bytes inline,
@@ -566,6 +571,7 @@ mod tests {
                 compress: false,
                 bwlimit: None,
                 client_os: TargetOs::Unix,
+                include_root: true,
             },
             Frame::CreateLinks {
                 links: vec![LinkSpec {

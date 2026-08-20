@@ -19,6 +19,7 @@ async fn test_sync_command_dry_run() {
         no_auto_install: true,
         verbose: 0,
         quiet: false,
+        no_progress: false,
         dry_run: true,
         delete: false,
         update: false,
@@ -149,7 +150,7 @@ async fn remove_source_files_local_copy() {
 
     let status = tokio::process::Command::new(env!("CARGO_BIN_EXE_cp2"))
         .arg("--remove-source-files")
-        .arg(src.path())
+        .arg(format!("{}/", src.path().display()))
         .arg(dst.path())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -179,7 +180,7 @@ async fn verify_flag_local_copy() {
 
     let status = tokio::process::Command::new(env!("CARGO_BIN_EXE_cp2"))
         .arg("--verify")
-        .arg(src.path())
+        .arg(format!("{}/", src.path().display()))
         .arg(dst.path())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
