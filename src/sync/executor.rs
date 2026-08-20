@@ -1,0 +1,1076 @@
+//! Sync executor: top-level orchestration for push, pull, and serve.
+//!
+//! The executor owns the byte stream (the ssh stdio channel) and dispatches
+//! roles; the actual work is delegated to the sender (`sync::sender`) and
+//! receiver (`sync::receiver`). Decision logic stays pure (see
+//! `planner`/`strategy`).
+
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use crate::platform::storage::{StorageClass, StoragePreference};
+use crate::protocol::{FileMeta, Frame, TargetOs, stream};
+use crate::security::PathSanitizer;
+use crate::sync::handshake;
+use crate::sync::receiver::Receiver;
+use crate::sync::scanner::{Manifest, ScanOptions, Scanner};
+use crate::sync::sender::Sender;
+use crate::sync::stats::SyncStats;
+use crate::sync::strategy::optimal_thread_count;
+use crate::sync::wire::{from_peer, manifest_from_file_meta};
+use crate::{Error, Result};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
+
+/// Per-file progress reporter: `(path, done_bytes, total_bytes)`, called as
+/// files are read/written and ending with `done == total` per file.
+pub type ProgressFn = Arc<dyn Fn(&str, u64, u64, u64) + Send + Sync>;
+// (path, done, total, files_total) — files_total is the run's transferable
+// file count (the sender's plan or the receiver's manifest), so the display
+// can show `[index/total]` and the remaining count.
+
+/// IO wrapper that reports bytes moved through the progress callback
+/// (`(path, done, total)`): the sender wraps its source reader (live delta
+/// progress) and the receiver wraps its destination writer (apply progress).
+/// One type serves both directions — the `Read`/`Write` impls are gated by
+/// the inner type's capabilities.
+pub(crate) struct ProgressStream<T> {
+    inner: T,
+    path: String,
+    total: u64,
+    files_total: u64,
+    done: u64,
+    report: ProgressFn,
+}
+
+impl<T> ProgressStream<T> {
+    /// Wrap `inner`, reporting progress toward `total` for `path`; the
+    /// report carries the run's transferable file count (`files_total`) so
+    /// the display can show `[index/total]` and the remaining count.
+    #[must_use]
+    pub(crate) fn new(
+        inner: T,
+        path: String,
+        total: u64,
+        files_total: u64,
+        report: ProgressFn,
+    ) -> Self {
+        Self {
+            inner,
+            path,
+            total,
+            files_total,
+            done: 0,
+            report,
+        }
+    }
+}
+
+impl<T: std::io::Read> std::io::Read for ProgressStream<T> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        if n > 0 {
+            self.done += n as u64;
+            (self.report)(&self.path, self.done, self.total, self.files_total);
+        }
+        Ok(n)
+    }
+}
+
+impl<T: std::io::Write> std::io::Write for ProgressStream<T> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.done += n as u64;
+        (self.report)(&self.path, self.done, self.total, self.files_total);
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+
+/// Options controlling an executor run.
+#[derive(Clone)]
+// Mirrors the rsync decision flags one-to-one; grouping the booleans would
+// obscure the mapping (see the CLI definition in `cli.rs`).
+#[expect(clippy::struct_excessive_bools)]
+pub struct ExecutorOptions {
+    /// Use BLAKE3 hashes to decide changes (slower, more accurate).
+    pub checksum: bool,
+    /// Remove destination files not present in the source.
+    pub delete: bool,
+    /// Skip files where the destination is newer.
+    pub update_only: bool,
+    /// Skip files that already exist.
+    pub ignore_existing: bool,
+    /// rsync `--existing`: only update files present on the receiver, do not
+    /// create new ones (directories are still created).
+    pub existing: bool,
+    /// rsync `--ignore-times`: transfer everything, ignoring the size+mtime
+    /// quick check.
+    pub ignore_times: bool,
+    /// Refuse to delete more than this many files per sync (rsync
+    /// `--max-delete`); `None` = unlimited.
+    pub max_delete: Option<u64>,
+    /// Keep the replaced destination file as `<name>~` (rsync `--backup`).
+    pub backup: bool,
+    /// Explicit worker count for transfer + hashing (`-j`). `None` tunes the
+    /// count automatically from the target storage class (see [`Self::storage`]).
+    pub jobs: Option<usize>,
+    /// Storage class used for automatic worker tuning. `Auto` (the default)
+    /// detects the class of the filesystem being written (receiver) or hashed
+    /// (source tree); an explicit `Hdd`/`Ssd` skips detection.
+    pub storage: StoragePreference,
+    /// Compress data frames with lz4 (`-z`).
+    pub compress: bool,
+    /// Bandwidth cap in bytes/second (None = unlimited).
+    pub bwlimit: Option<u64>,
+    /// Exclude paths matching these globs (applies to the source tree).
+    pub exclude: Vec<String>,
+    /// Include paths matching these globs, overriding `exclude`.
+    pub include: Vec<String>,
+    /// fsync every received file before it is renamed into place (receiver side).
+    pub fsync: bool,
+    /// Remote target path: empty = the serve root (account home), a leading
+    /// `/` = absolute, otherwise relative to the serve root. Set by the CLI
+    /// from the `path` in `user@host:path`.
+    pub remote_path: String,
+    /// Keep partial files at the destination when a transfer aborts
+    /// (rsync `-P`); the next run delta-resumes against them.
+    pub partial: bool,
+    /// Use the rsync-style rollsum delta engine (fixed blocks + byte-sliding
+    /// scan) instead of `FastCDC`. Both peers must agree — the flag is
+    /// forwarded through the server argv.
+    pub rollsum: bool,
+    /// Suppress the non-error output (rsync `-q`): the per-file listing, the
+    /// transfer summary, the deploy and watch lines. Errors and the skipped
+    /// file report still print. Forwarded to the server so its own summary is
+    /// silenced too.
+    pub quiet: bool,
+    /// Remove source files after they have been transferred successfully
+    /// (rsync `--remove-source-files`): move-off workflows (capture
+    /// instruments) where the source disk must be freed once the data is on
+    /// the destination. The receiver hashes each applied file and the sender
+    /// deletes a source only when the hashes match (BLAKE3). Directories and
+    /// symlinks are never removed; a file whose destination apply was skipped
+    /// is kept.
+    pub remove_source_files: bool,
+    /// Verify, after the transfer, that the destination bytes match the
+    /// source (BLAKE3, computed on the fly — no re-reads). Reports any
+    /// mismatch as a skipped file (exit 23) but deletes nothing. Only files
+    /// this run transferred are verified; use `--checksum` to re-hash a whole
+    /// tree that was already in sync. Implies per-file fsync (a verified
+    /// file is also durable).
+    pub verify: bool,
+    /// Full rsync `-a`: additionally preserve owner, group, and special files
+    /// (fifos, sockets, devices) — Unix-like systems only; silently skipped
+    /// on Windows, where the Unix ownership/device model does not exist.
+    /// Implies [`Self::literal_links`].
+    pub archive: bool,
+    /// Keep links and shortcuts as they are (rsync `-l` semantics): every
+    /// symlink is recreated with its literal target string (no DEST-relative
+    /// rewriting, no external-link dereference or skip) and Windows-source
+    /// `.lnk` shortcuts are copied as opaque files. On a Windows target a
+    /// symlink still materializes as a `.lnk`, but the target stays literal.
+    /// Implied by `-a`; `--skip-links`/`--follow-links` override it.
+    pub literal_links: bool,
+    /// Keep *internal* links with their literal target string instead of the
+    /// DEST-relative rewrite (self-contained mirrors); the external-link
+    /// policy is unchanged.
+    pub literal_internal_links: bool,
+    /// Keep external *file-target* links as links with their literal target
+    /// instead of dereferencing them; ignored when the target is Windows.
+    pub literal_external_file_links: bool,
+    /// Keep external *directory-target* links as links with their literal
+    /// target instead of skipping them.
+    pub literal_external_dir_links: bool,
+    /// Recursive sync (rsync `-r`). When off, only the source root's direct
+    /// files are synced; subdirectories are skipped.
+    pub recursive: bool,
+    /// Preserve symlinks as links (rsync `-l`). When off (`--skip-links`),
+    /// every symlink and shortcut is skipped entirely — not synced, not
+    /// followed.
+    pub preserve_links: bool,
+    /// Dereference every symlink (`--follow-links`, rsync `-L`): the target's
+    /// content is copied in the link's place — file targets as regular files,
+    /// directory targets recursed with loop detection.
+    pub follow_links: bool,
+    /// Write files sparsely (`--sparse`, rsync `-S`): runs of zeros of at
+    /// least 4096 bytes become holes at the destination instead of allocated
+    /// blocks (VM images, database files). Content bytes are unchanged.
+    pub sparse: bool,
+    /// Copy extended attributes (`--xattrs`, rsync `-X`): name/value pairs
+    /// for files and directories, best-effort (symlinks are not covered).
+    pub xattrs: bool,
+    /// Restore the source's last-access time (`--atimes`, rsync `-U`);
+    /// otherwise the receiver's atime is left alone (`UTIME_OMIT`).
+    pub atimes: bool,
+    /// Preserve permission bits (rsync `-p`). When off, the sender computes
+    /// explicit 0644/0755 defaults instead of source-derived bits (spec
+    /// §2.2) and the Windows-source `exec_hint` heuristic is disabled.
+    pub preserve_perms: bool,
+    /// Preserve modification times (rsync `-t`). When off, the destination
+    /// gets the transfer time and the quick check falls back to size-only
+    /// (rsync's behavior — size+mtime comparison would be meaningless).
+    pub preserve_times: bool,
+    /// The *target* side's OS, driving the permission matrix and link
+    /// representation at scan time (spec §2.2 / §3.2). The source side
+    /// decides; the receiver never re-derives it. Set by the CLI: the probed
+    /// remote OS on push, the local OS on pull (reported to the server in the
+    /// `PullRequest`), and the local OS for local copies.
+    pub target_os: TargetOs,
+    /// Per-file progress reporter: `(path, done_bytes, total_bytes)`. Called
+    /// as files are read/written, ending with `done == total` per file.
+    /// rsync's `-P`-style listing + progress comes from here (the CLI installs
+    /// a renderer by default).
+    pub progress: Option<ProgressFn>,
+}
+
+/// Build the scanner options for a tree scan from the run options; the
+/// differing fields (filter, scan side, perms, link paths) are explicit.
+fn scanner_options(
+    options: &ExecutorOptions,
+    root: &Path,
+    filter: Option<crate::sync::FilterSet>,
+    is_source_scan: bool,
+    no_perms: bool,
+    source_link_paths: Option<std::collections::HashSet<String>>,
+) -> ScanOptions {
+    ScanOptions {
+        hash: options.checksum,
+        hash_workers: resolve_hash_workers(options, root),
+        filter,
+        recursive: options.recursive,
+        preserve_links: options.preserve_links,
+        follow_links: options.follow_links,
+        literal_links: options.literal_links,
+        literal_internal_links: options.literal_internal_links,
+        literal_external_file_links: options.literal_external_file_links,
+        literal_external_dir_links: options.literal_external_dir_links,
+        target_os: options.target_os,
+        is_source_scan,
+        no_perms,
+        source_os: crate::sync::scanner::local_os(),
+        source_link_paths,
+        archive: options.archive,
+        xattrs: options.xattrs,
+    }
+}
+
+/// The pull-request frame for the run options; `watch`/`watch_delay_ms` are
+/// the only fields the one-shot and server-driven watch pulls differ on.
+fn pull_request(options: &ExecutorOptions, watch: bool, watch_delay_ms: u32) -> Frame {
+    Frame::PullRequest {
+        path: options.remote_path.clone(),
+        excludes: options.exclude.clone(),
+        includes: options.include.clone(),
+        checksum: options.checksum,
+        delete: options.delete,
+        update_only: options.update_only,
+        ignore_existing: options.ignore_existing,
+        existing: options.existing,
+        ignore_times: options.ignore_times,
+        watch,
+        watch_delay_ms,
+        compress: options.compress,
+        bwlimit: options.bwlimit,
+        client_os: options.target_os,
+    }
+}
+
+
+impl Default for ExecutorOptions {
+    fn default() -> Self {
+        Self {
+            checksum: false,
+            delete: false,
+            update_only: false,
+            ignore_existing: false,
+            existing: false,
+            ignore_times: false,
+            max_delete: None,
+            backup: false,
+            jobs: None,
+            storage: StoragePreference::Auto,
+            compress: false,
+            bwlimit: None,
+            exclude: Vec::new(),
+            include: Vec::new(),
+            fsync: false,
+            remote_path: String::new(),
+            partial: true,
+            rollsum: false,
+            quiet: false,
+            remove_source_files: false,
+            verify: false,
+            archive: false,
+            literal_links: false,
+            literal_internal_links: false,
+            literal_external_file_links: false,
+            literal_external_dir_links: false,
+            recursive: true,
+            preserve_links: true,
+            follow_links: false,
+            sparse: false,
+            xattrs: false,
+            atimes: false,
+            preserve_perms: true,
+            preserve_times: true,
+            target_os: TargetOs::Unix,
+            progress: None,
+        }
+    }
+}
+
+/// Executes sync plans over a single bidirectional byte stream.
+pub struct Executor {
+    send: Box<dyn AsyncWrite + Unpin + Send>,
+    recv: Box<dyn AsyncRead + Unpin + Send>,
+}
+
+impl Executor {
+    /// Create a new executor over the given stream halves.
+    #[must_use]
+    /// Create an executor over any byte stream (ssh stdio, a local server
+    /// child, a russh stream).
+    pub fn new(
+        send: Box<dyn AsyncWrite + Unpin + Send>,
+        recv: Box<dyn AsyncRead + Unpin + Send>,
+    ) -> Self {
+        Self { send, recv }
+    }
+
+    /// Push `local` to the peer: scan → handshake → exchange manifests →
+    /// plan → apply.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on transport, I/O, or protocol failure.
+    pub async fn push(&mut self, local: &Path, options: &ExecutorOptions) -> Result<SyncStats> {
+        let source_manifest = scan_tree(local, options, true).await?;
+        // `manifest.root` (not `local`): for a single-file source it is the
+        // parent directory, so entries resolve as `parent/name`.
+        self.push_scanned(&source_manifest.root, &source_manifest, options)
+            .await
+    }
+
+    /// Push several source roots as the top-level entries of one sync
+    /// (glob-expanded sources): every root in `roots` is scanned and merged
+    /// under `base`, so all matches share a single plan, summary, and
+    /// `--delete` pass. `base` is the pattern's static-prefix directory —
+    /// entries are named relative to it, so `base.join(entry)` is the source
+    /// file on disk.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on transport, I/O, or protocol failure.
+pub async fn push_multi(
+        &mut self,
+        base: &Path,
+        roots: &[PathBuf],
+        options: &ExecutorOptions,
+    ) -> Result<SyncStats> {
+        let scanner = Scanner::new(scanner_options(
+            options,
+            base,
+            Some(crate::sync::FilterSet {
+                includes: options.include.clone(),
+                excludes: options.exclude.clone(),
+            }),
+            true,
+            !options.preserve_perms,
+            None,
+        ));
+        let source_manifest = scanner.scan_multi(base, roots).await?;
+        self.push_scanned(base, &source_manifest, options).await
+    }
+
+    /// Handshake and run the sender over an already-scanned manifest whose
+    /// entries live under `source_root` (shared by [`Self::push`] and
+    /// [`Self::push_multi`]).
+    async fn push_scanned(
+        &mut self,
+        source_root: &Path,
+        source_manifest: &Manifest,
+        options: &ExecutorOptions,
+    ) -> Result<SyncStats> {
+        tracing::info!(
+            "push scan: {} files, {} bytes",
+            source_manifest.len(),
+            source_manifest.total_bytes
+        );
+
+        let mut ctrl_send = self.send.as_mut();
+        let mut ctrl_recv = self.recv.as_mut();
+        handshake::client(&mut ctrl_send, &mut ctrl_recv).await?;
+
+        let sender = Sender::new(
+            options.bwlimit,
+            options.progress.clone(),
+            resolve_apply_jobs(options, source_root),
+            options.remove_source_files || options.verify,
+            options.rollsum,
+        );
+        let stats = sender
+            .send(
+                &mut ctrl_send,
+                &mut ctrl_recv,
+                source_manifest,
+                source_root,
+                options,
+            )
+            .await?;
+
+        Ok(stats)
+    }
+
+    /// Pull a tree from the peer into `local` (rsync-style pull).
+    ///
+    /// Sends a [`Frame::PullRequest`], receives the peer's manifest, then
+    /// applies the deltas the peer computes against our local files.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on transport, I/O, or protocol failure.
+    pub async fn pull(&mut self, local: &Path, options: &ExecutorOptions) -> Result<SyncStats> {
+        let start = Instant::now();
+
+        // The pull target may not exist yet; rsync creates it.
+        tokio::fs::create_dir_all(local).await.map_err(Error::Io)?;
+
+        let mut ctrl_send = self.send.as_mut();
+        let mut ctrl_recv = self.recv.as_mut();
+        handshake::client(&mut ctrl_send, &mut ctrl_recv).await?;
+
+        stream::send_frame(&mut ctrl_send, &pull_request(options, false, 0)).await?;
+
+        // The peer plays the sender: it sends its source manifest.
+        let (source_files, verify) = match stream::receive_frame(&mut ctrl_recv).await? {
+            Frame::IndexRequest {
+                file_list,
+                verify,
+                ..
+            } => (file_list, verify),
+            Frame::Error { message } => return Err(Error::Other(format!("Peer error: {message}"))),
+            _ => return Err(Error::Other("Expected IndexRequest from peer".to_string())),
+        };
+
+        // We are the receiver: scan our destination and apply the recipes.
+        let dest_manifest = scan_dest(local, options, &source_files).await?;
+        let receiver = Receiver::new(
+            local,
+            options,
+            resolve_apply_jobs(options, local),
+            verify,
+        )?;
+        let stats = receiver
+            .receive(&mut ctrl_send, &mut ctrl_recv, source_files, &dest_manifest)
+            .await?;
+        tracing::info!(
+            "pull complete: {} files, {} bytes in {:?}",
+            stats.files_received,
+            stats.bytes_transferred,
+            start.elapsed()
+        );
+
+        Ok(stats)
+    }
+
+    /// Pull repeatedly over one session, driven by the server: the server
+    /// watches its own source tree and starts an incremental cycle whenever
+    /// it changes (see [`Self::serve`]).
+    ///
+    /// The first cycle runs immediately on connect; later cycles follow each
+    /// server-side change burst. The session ends on Ctrl-C (the stream is
+    /// dropped, so the server sees EOF) or when the server disconnects.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on transport, I/O, or protocol failure; a server
+    /// disconnect surfaces as an EOF read error.
+    pub async fn pull_watch(
+        &mut self,
+        local: &Path,
+        options: &ExecutorOptions,
+        delay: Duration,
+    ) -> Result<SyncStats> {
+        let start = Instant::now();
+
+        // The pull target may not exist yet; rsync creates it.
+        tokio::fs::create_dir_all(local).await.map_err(Error::Io)?;
+
+        let mut ctrl_send = self.send.as_mut();
+        let mut ctrl_recv = self.recv.as_mut();
+        handshake::client(&mut ctrl_send, &mut ctrl_recv).await?;
+
+        stream::send_frame(
+            &mut ctrl_send,
+            &pull_request(
+                options,
+                true,
+                u32::try_from(delay.as_millis()).unwrap_or(u32::MAX),
+            ),
+        )
+        .await?;
+
+        let mut total = SyncStats::default();
+        loop {
+            tokio::select! {
+                frame = stream::receive_frame(&mut ctrl_recv) => {
+                    let frame = from_peer(frame?)?;
+                    match frame {
+                        Frame::IndexRequest {
+                            file_list,
+                            verify,
+                            ..
+                        } => {
+                            // One cycle: report our destination, apply the
+                            // recipes, ack — then wait for the next burst.
+                            let dest_manifest = scan_dest(local, options, &file_list).await?;
+                            let receiver = Receiver::new(
+                                local,
+                                options,
+                                resolve_apply_jobs(options, local),
+                                verify,
+                            )?;
+                            let stats = receiver
+                                .receive(&mut ctrl_send, &mut ctrl_recv, file_list, &dest_manifest)
+                                .await?;
+                            total.files_received += stats.files_received;
+                            total.bytes_transferred += stats.bytes_transferred;
+                            tracing::info!(
+                                "watch pull cycle: {} files, {} bytes",
+                                stats.files_received,
+                                stats.bytes_transferred
+                            );
+                        }
+                        Frame::Error { message } => {
+                            return Err(Error::Other(format!("Peer error: {message}")))
+                        }
+                        other => {
+                            return Err(Error::Other(format!(
+                                "Unexpected frame in pull-watch: {other:?}"
+                            )))
+                        }
+                    }
+                }
+                _ = tokio::signal::ctrl_c() => {
+                    // Dropping the session closes the stream and the server
+                    // exits on EOF. Cancelling a mid-frame read here is fine:
+                    // the stream is never reused after this point.
+                    break;
+                }
+            }
+        }
+        total.duration = start.elapsed();
+        Ok(total)
+    }
+
+    /// Serve a connection from the peer.
+    ///
+    /// Handles both directions:
+    /// - a **push** arrives as `IndexRequest` (we are the receiver), or
+    /// - a **pull** arrives as `PullRequest` (we are the sender).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on transport, I/O, or protocol failure.
+    pub async fn serve(&mut self, root: &Path, options: &ExecutorOptions) -> Result<SyncStats> {
+        let start = Instant::now();
+
+        let mut ctrl_send = self.send.as_mut();
+        let mut ctrl_recv = self.recv.as_mut();
+        handshake::server(&mut ctrl_send, &mut ctrl_recv).await?;
+
+        let stats = match stream::receive_frame(&mut ctrl_recv).await? {
+            // Push: the peer is the sender; we receive files into the target
+            // path (relative to our serve root), creating it if needed.
+            Frame::IndexRequest {
+                file_list,
+                path,
+                verify,
+            } => {
+                let target = resolve_serve_path(root, &path)?;
+                tokio::fs::create_dir_all(&target)
+                    .await
+                    .map_err(Error::Io)?;
+                let dest_manifest = scan_dest(&target, options, &file_list).await?;
+                let receiver = Receiver::new(
+                    &target,
+                    options,
+                    resolve_apply_jobs(options, &target),
+                    verify,
+                )?;
+                receiver
+                    .receive(&mut ctrl_send, &mut ctrl_recv, file_list, &dest_manifest)
+                    .await?
+            }
+            // Pull: the peer asks for a tree; we are the sender.
+            Frame::PullRequest {
+                path,
+                excludes,
+                includes,
+                checksum,
+                delete,
+                update_only,
+                ignore_existing,
+                existing,
+                ignore_times,
+                watch,
+                watch_delay_ms,
+                compress,
+                bwlimit,
+                client_os,
+            } => {
+                let source_root = resolve_serve_path(root, &path)?;
+                // The client's options (filters, decision flags, compression,
+                // bandwidth) apply to the tree we send. Struct-update keeps
+                // the frame-owned exclude/include lists instead of cloning the
+                // server's and overwriting them. `target_os` is the *client's*
+                // OS — the sender needs it to build the permission/link
+                // matrices for the pull direction (spec §2.2 / §3.2).
+                let pull_options = ExecutorOptions {
+                    checksum,
+                    delete,
+                    update_only,
+                    ignore_existing,
+                    existing,
+                    ignore_times,
+                    compress,
+                    bwlimit,
+                    exclude: excludes,
+                    include: includes,
+                    target_os: client_os,
+                    ..options.clone()
+                };
+                if watch {
+                    // Server-driven pull-watch: watch the source tree and run
+                    // an incremental cycle per change burst until the client
+                    // disconnects.
+                    let delay = Duration::from_millis(u64::from(watch_delay_ms));
+                    return serve_watch_pull(
+                        &mut ctrl_send,
+                        &mut ctrl_recv,
+                        &source_root,
+                        &pull_options,
+                        delay,
+                    )
+                    .await;
+                }
+                let source_manifest = scan_tree(&source_root, &pull_options, true).await?;
+                tracing::info!(
+                    "serve pull: {} files from {}",
+                    source_manifest.len(),
+                    source_root.display()
+                );
+                let sender = Sender::new(
+                    pull_options.bwlimit,
+                    options.progress.clone(),
+                    resolve_apply_jobs(&pull_options, &source_root),
+                    pull_options.remove_source_files || pull_options.verify,
+                    pull_options.rollsum,
+                );
+                let mut stats = sender
+                    .send(
+                        &mut ctrl_send,
+                        &mut ctrl_recv,
+                        &source_manifest,
+                        &source_root,
+                        &pull_options,
+                    )
+                    .await?;
+                stats.duration = start.elapsed();
+                stats
+            }
+            Frame::Error { message } => return Err(Error::Other(format!("Peer error: {message}"))),
+            other => {
+                return Err(Error::Other(format!(
+                    "Expected IndexRequest or PullRequest, got {other:?}"
+                )));
+            }
+        };
+
+        tracing::info!("serve complete: {:?} in {:?}", stats, start.elapsed());
+        Ok(stats)
+    }
+}
+
+/// Scan a directory with the given hashing policy.
+///
+/// `apply_filter` enables the include/exclude filter — always on the source
+/// side of a transfer, never on the destination scan. It doubles as the
+/// source/destination marker: the permission matrix (spec §2.2) is applied
+/// only to source scans.
+async fn scan_tree(root: &Path, options: &ExecutorOptions, apply_filter: bool) -> Result<Manifest> {
+    let filter = if apply_filter {
+        Some(crate::sync::FilterSet {
+            includes: options.include.clone(),
+            excludes: options.exclude.clone(),
+        })
+    } else {
+        None
+    };
+    let scanner = Scanner::new(scanner_options(
+        options,
+        root,
+        filter,
+        apply_filter,
+        !options.preserve_perms,
+        None,
+    ));
+    scanner.scan(root).await
+}
+
+/// Scan the receiver's destination for the peer's source manifest.
+///
+/// Without `--delete` the destination is probed only for the paths the
+/// source names ([`Scanner::scan_targeted`]), so a huge destination costs
+/// O(source), not O(destination) — the planner needs a destination entry
+/// only to quick-check a source path. With `--delete` the full tree is
+/// required: every extra that could be removed must be named, and the
+/// source's directories may cover the whole root, so the complete walk is
+/// used and behaves exactly as before.
+async fn scan_dest(
+    root: &Path,
+    options: &ExecutorOptions,
+    source_files: &[FileMeta],
+) -> Result<Manifest> {
+    // Paths the peer classifies as links: the destination scan keys its
+    // `.lnk` recognition on them. A Unix-source symlink materializes as an
+    // *extensionless* `.lnk` on a Windows target (the `.lnk` extension gate
+    // would miss it), and an arbitrary data file whose body merely starts
+    // with the `.lnk` magic must never be misclassified — the source's own
+    // classification is the only safe key.
+    let source_links: HashSet<String> = source_files
+        .iter()
+        .filter(|m| m.link_target.is_some())
+        .map(|m| m.path.clone())
+        .collect();
+    let scanner = Scanner::new(scanner_options(
+        options,
+        root,
+        None,
+        false,
+        false,
+        (!source_links.is_empty()).then_some(source_links),
+    ));
+    if options.delete {
+        return scanner.scan(root).await;
+    }
+    let source = manifest_from_file_meta(source_files);
+    scanner.scan_targeted(root, &source).await
+}
+
+/// Receiver-side apply window (concurrent file-application tasks) when the
+/// target storage is a single rotating disk: parallel writers to one head
+/// thrash the disk, so drop to sequential applies.
+const APPLY_JOBS_HDD: usize = 1;
+/// Receiver-side apply window for SSD/NVMe (or undetectable storage); the
+/// long-standing default that overlaps writes across files.
+const APPLY_JOBS_SSD: usize = 16;
+
+/// The effective storage class for `root`: an explicit `--storage` override
+/// wins; `Auto` detects the filesystem's class (best-effort).
+fn effective_storage(options: &ExecutorOptions, root: &Path) -> StorageClass {
+    match options.storage {
+        StoragePreference::Hdd => StorageClass::Hdd,
+        StoragePreference::Ssd => StorageClass::Ssd,
+        StoragePreference::Auto => crate::platform::storage::detect_storage(root),
+    }
+}
+
+/// Number of parallel hash workers for a tree rooted at `root`: an explicit
+/// `-j` wins; otherwise tuned from the storage class (hashing an HDD tree is
+/// seek-bound — a single worker avoids a random-read storm).
+fn resolve_hash_workers(options: &ExecutorOptions, root: &Path) -> usize {
+    match options.jobs {
+        Some(n) => n.max(1),
+        None => match effective_storage(options, root) {
+            StorageClass::Hdd => 1,
+            _ => optimal_thread_count(true),
+        },
+    }
+}
+
+/// Receiver-side apply window for a destination rooted at `root`: an explicit
+/// `-j` wins; otherwise tuned from the storage class (see [`APPLY_JOBS_HDD`]).
+fn resolve_apply_jobs(options: &ExecutorOptions, root: &Path) -> usize {
+    let storage = effective_storage(options, root);
+    let jobs = match options.jobs {
+        Some(n) => n.max(1),
+        None => match storage {
+            StorageClass::Hdd => APPLY_JOBS_HDD,
+            _ => APPLY_JOBS_SSD,
+        },
+    };
+    tracing::info!(
+        "apply window {jobs} for {} (storage {storage:?}, explicit jobs {:?})",
+        root.display(),
+        options.jobs
+    );
+    jobs
+}
+
+/// Serve a watch-mode pull: watch `source_root` and drive incremental cycles
+/// (scan → send → wait for changes) over the persistent session until the
+/// client disconnects.
+async fn serve_watch_pull<W: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
+    ctrl_send: &mut W,
+    ctrl_recv: &mut R,
+    source_root: &Path,
+    options: &ExecutorOptions,
+    delay: Duration,
+) -> Result<SyncStats> {
+    let (tx, mut changes) = tokio::sync::mpsc::unbounded_channel::<()>();
+    let _watcher = crate::sync::watcher::start_watcher(source_root, tx)
+        .map_err(|e| Error::Other(format!("Failed to watch source: {e}")))?;
+
+    let start = Instant::now();
+    let mut total = SyncStats::default();
+    loop {
+        // Scan failures (a directory being removed mid-sync, a transient I/O
+        // error) are retried with backoff: no frames have been sent yet, so
+        // the session stays coherent. A client disconnect during the wait
+        // ends the session.
+        let source_manifest = loop {
+            match scan_tree(source_root, options, true).await {
+                Ok(manifest) => break manifest,
+                Err(e) => {
+                    tracing::warn!(
+                        "watch pull scan failed: {e}; retrying in {:?}",
+                        crate::sync::watcher::SYNC_ERROR_BACKOFF
+                    );
+                    if wait_for_disconnect(ctrl_recv).await? {
+                        total.duration = start.elapsed();
+                        return Ok(total);
+                    }
+                }
+            }
+        };
+        let sender = Sender::new(
+            options.bwlimit,
+            options.progress.clone(),
+            resolve_apply_jobs(options, source_root),
+            options.remove_source_files || options.verify,
+            options.rollsum,
+        );
+        let stats = sender
+            .send(ctrl_send, ctrl_recv, &source_manifest, source_root, options)
+            .await?;
+        total.files_sent += stats.files_sent;
+        total.bytes_transferred += stats.bytes_transferred;
+        tracing::info!(
+            "watch pull cycle: served {} files, {} bytes",
+            stats.files_sent,
+            stats.bytes_transferred
+        );
+
+        match wait_for_changes(ctrl_recv, &mut changes, delay).await? {
+            // `Changed`: the match is the last statement in the loop, so it
+            // iterates again without an explicit continue.
+            WatchWait::Changed => {}
+            WatchWait::Disconnected => break,
+        }
+    }
+    total.duration = start.elapsed();
+    Ok(total)
+}
+
+/// Sleep the sync-error backoff on the server side, aborting early when the
+/// client disconnects (EOF on `ctrl_recv`). Returns `true` when the session
+/// should end because the client is gone.
+async fn wait_for_disconnect<R: AsyncRead + Unpin>(ctrl_recv: &mut R) -> Result<bool> {
+    let mut probe = [0u8; 64];
+    tokio::select! {
+        () = tokio::time::sleep(crate::sync::watcher::SYNC_ERROR_BACKOFF) => Ok(false),
+        n = ctrl_recv.read(&mut probe) => match n {
+            Ok(0) => Ok(true), // client closed the connection
+            Ok(_) => Err(Error::Other(
+                "Unexpected data from client during scan retry".to_string(),
+            )),
+            Err(e) => Err(Error::Io(e)),
+        },
+    }
+}
+
+/// Outcome of waiting for source changes on the server.
+enum WatchWait {
+    /// A change burst was observed (or the debounce window expired): run the
+    /// next sync cycle.
+    Changed,
+    /// The client closed the connection: end the watch session.
+    Disconnected,
+}
+
+/// Wait for a debounced change burst on the server side of a watch-pull
+/// session, aborting early when the client disconnects (EOF on `ctrl_recv`).
+///
+/// Changes that already arrived during the previous cycle return immediately
+/// (the tree is dirty); otherwise the wait restarts its quiet window on every
+/// event, capped by the shared coalesce limit so a continuous stream still
+/// syncs.
+async fn wait_for_changes<R: AsyncRead + Unpin>(
+    ctrl_recv: &mut R,
+    changes: &mut tokio::sync::mpsc::UnboundedReceiver<()>,
+    delay: Duration,
+) -> Result<WatchWait> {
+    // Changes during the previous cycle: sync again right away. Drain every
+    // pending signal — one cycle covers the whole burst, not one cycle per
+    // queued event (the same coalescing the client-side loop applies).
+    let mut dirty = false;
+    while changes.try_recv().is_ok() {
+        dirty = true;
+    }
+    if dirty {
+        return Ok(WatchWait::Changed);
+    }
+    let window_start = tokio::time::Instant::now();
+    let mut probe = [0u8; 64];
+    loop {
+        tokio::select! {
+            res = changes.recv() => {
+                if res.is_none() {
+                    return Ok(WatchWait::Disconnected); // watcher stopped
+                }
+                // More changes: restart the quiet window (the cap is absolute).
+            }
+            () = tokio::time::sleep(delay) => return Ok(WatchWait::Changed),
+            () = tokio::time::sleep_until(window_start + crate::sync::watcher::MAX_COALESCE) => {
+                return Ok(WatchWait::Changed);
+            }
+            n = ctrl_recv.read(&mut probe) => match n {
+                Ok(0) => return Ok(WatchWait::Disconnected), // client closed
+                Ok(_) => {
+                    return Err(Error::Other(
+                        "Unexpected data from client during watch wait".to_string(),
+                    ))
+                }
+                Err(e) => return Err(Error::Io(e)),
+            },
+        }
+    }
+}
+
+/// Resolve a peer-supplied target path against the serve `root`.
+///
+/// `""` means the root itself. A path with a leading `/` (or a Windows drive
+/// prefix) is an **absolute** server path — rsync semantics: the account can
+/// already reach anywhere over plain ssh, so the serve root does not contain
+/// it. `..` components are still rejected. Any other path is taken relative
+/// to the root (`"backup"` → `root/backup`).
+fn resolve_serve_path(root: &Path, path: &str) -> Result<std::path::PathBuf> {
+    if path.is_empty() {
+        return Ok(root.to_path_buf());
+    }
+    let p = Path::new(path);
+    match p.components().next() {
+        Some(std::path::Component::RootDir | std::path::Component::Prefix(_)) => {
+            if p.components()
+                .any(|c| c == std::path::Component::ParentDir)
+            {
+                return Err(Error::Other(format!(
+                    "Unsafe path '{path}': .. is not allowed"
+                )));
+            }
+            Ok(p.to_path_buf())
+        }
+        _ => sanitize_join(root, path),
+    }
+}
+
+/// Join a peer-supplied relative path under root, rejecting traversal.
+fn sanitize_join(root: &Path, rel: &str) -> Result<std::path::PathBuf> {
+    let sanitizer =
+        PathSanitizer::new(root).map_err(|e| Error::Other(format!("Path sanitizer: {e}")))?;
+    sanitizer
+        .join(rel)
+        .map_err(|e| Error::Other(format!("Unsafe path '{rel}': {e}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn options(jobs: Option<usize>, storage: StoragePreference) -> ExecutorOptions {
+        ExecutorOptions {
+            jobs,
+            storage,
+            ..ExecutorOptions::default()
+        }
+    }
+
+    #[test]
+    fn explicit_jobs_wins_over_storage() {
+        let opts = options(Some(4), StoragePreference::Hdd);
+        // The user's explicit -j beats the storage-tuned default on both sides.
+        assert_eq!(resolve_apply_jobs(&opts, Path::new("/tmp")), 4);
+        assert_eq!(resolve_hash_workers(&opts, Path::new("/tmp")), 4);
+    }
+
+    #[test]
+    fn hdd_tunes_sequential() {
+        let opts = options(None, StoragePreference::Hdd);
+        assert_eq!(resolve_apply_jobs(&opts, Path::new("/tmp")), 1);
+        assert_eq!(resolve_hash_workers(&opts, Path::new("/tmp")), 1);
+    }
+
+    #[test]
+    fn ssd_tunes_default() {
+        let opts = options(None, StoragePreference::Ssd);
+        assert_eq!(resolve_apply_jobs(&opts, Path::new("/tmp")), APPLY_JOBS_SSD);
+        assert_eq!(
+            resolve_hash_workers(&opts, Path::new("/tmp")),
+            optimal_thread_count(true)
+        );
+    }
+
+    #[test]
+    fn auto_with_unknown_storage_falls_back_to_ssd_defaults() {
+        // A nonexistent root cannot be classified → Unknown → SSD defaults
+        // (the long-standing behavior), never a crash.
+        let opts = options(None, StoragePreference::Auto);
+        let missing = Path::new("/nonexistent/cp2-tune-test");
+        assert_eq!(resolve_apply_jobs(&opts, missing), APPLY_JOBS_SSD);
+        assert_eq!(
+            resolve_hash_workers(&opts, missing),
+            optimal_thread_count(true)
+        );
+    }
+
+    #[test]
+    fn zero_jobs_clamps_to_one() {
+        let opts = options(Some(0), StoragePreference::Auto);
+        assert_eq!(resolve_apply_jobs(&opts, Path::new("/tmp")), 1);
+        assert_eq!(resolve_hash_workers(&opts, Path::new("/tmp")), 1);
+    }
+
+    #[test]
+    fn resolve_serve_path_relative_and_absolute() {
+        let root = tempfile::tempdir().unwrap();
+        // Empty path → the serve root itself.
+        assert_eq!(
+            resolve_serve_path(root.path(), "").unwrap(),
+            root.path().to_path_buf()
+        );
+        // Relative paths stay contained under the root.
+        assert_eq!(
+            resolve_serve_path(root.path(), "backup").unwrap(),
+            root.path().join("backup")
+        );
+        assert_eq!(
+            resolve_serve_path(root.path(), "softwares/cp2").unwrap(),
+            root.path().join("softwares/cp2")
+        );
+        // Absolute paths (rsync semantics) pass through untouched.
+        assert_eq!(
+            resolve_serve_path(root.path(), "/home/user/x").unwrap(),
+            Path::new("/home/user/x")
+        );
+        // `..` is still rejected in both forms.
+        assert!(resolve_serve_path(root.path(), "..").is_err());
+        assert!(resolve_serve_path(root.path(), "/home/user/../x").is_err());
+    }
+}

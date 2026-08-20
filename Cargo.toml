@@ -1,0 +1,101 @@
+[package]
+name = "cp2"
+version = "0.1.1"
+edition = "2024"
+rust-version = "1.93"
+authors = ["elemeng"]
+license = "MIT"
+repository = "https://github.com/elemeng/cp2"
+description = "Pure-Rust cp & rsync-style copy/sync tool for local or network files, with delta transfer and verification (Linux, macOS, Windows)"
+readme = "README.md"
+keywords = ["sync", "rsync", "ssh", "backup", "file-sync"]
+categories = ["command-line-utilities", "filesystem"]
+# Dev-only content: CI workflows, release scripts, and the build-output
+# directory stay out of the published crate. `/target` is anchored to the
+# package root (gitignore-style) so `src/target/` is not matched.
+exclude = [".github/", "scripts/", "/target"]
+
+[features]
+default = []
+
+[lib]
+name = "cp2"
+path = "src/lib.rs"
+
+[[bin]]
+name = "cp2"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1.53", features = ["rt-multi-thread", "fs", "io-util", "io-std", "macros", "sync", "time", "process", "signal", "net"] }
+libc = "0.2"
+notify = "8.2"
+
+blake3 = { version = "1.8", features = ["rayon"] }
+lz4_flex = { version = "0.14", default-features = false, features = ["std"] }
+chunkrs = { path = "../chunkrs", features = ["hash-parallel"] }
+glob = "0.3"
+jwalk = "0.9"
+# Windows Shell Link (.lnk) parsing + generation for the link policy (spec
+# §3.2): pure Rust, builds on every platform so fixture parsing is testable
+# in CI; the writer (`ShellLink::save`) is gated behind `binwrite` +
+# `unstable-save` (only the Windows receiver calls it, at `cfg(windows)` call
+# sites).
+lnk = { version = "0.6", features = ["binwrite", "unstable-save"] }
+
+clap = { version = "4.6", features = ["derive", "cargo", "env"] }
+
+bytes = { version = "1.12", features = ["serde"] }
+base64 = "0.23"
+serde = { version = "1.0", features = ["derive"] }
+postcard = { version = "1.1", default-features = false, features = ["use-std"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+anyhow = "1.0"
+thiserror = "2.0"
+num_cpus = "1.17"
+zeroize = "1"
+
+[dev-dependencies]
+tempfile = "3.27"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
+] }
+# The russh transport (pure-Rust SSH client) replaces the system `ssh`
+# process on Windows, where OpenSSH's ControlMaster multiplexing is broken
+# (`getsockname failed: Not a socket` — every session dies). It is also the
+# transport mobile embeddings (iOS/Android) will use; those targets extend
+# this gate when they are built. Unix keeps the battle-tested system ssh.
+# The aws-lc-rs crypto backend is C-based: native Windows builds need the
+# MSVC C toolchain, and cross-building the windows-gnu sidecar needs a
+# mingw-w64 C compiler.
+#
+# aws-lc-sys assembles its x86_64 code with NASM; a fresh Windows machine
+# with just the MSVC Build Tools does not have NASM, which used to break
+# plain `cargo install cp2`. The direct dependency below enables aws-lc-sys's
+# `prebuilt-nasm` feature (feature unification, so the transitive build gets
+# it too): whenever NASM is not on PATH, the crate's shipped prebuilt NASM
+# objects are used instead, so the build never *requires* NASM. (aws-lc-sys
+# itself still prefers a found NASM — upstream behavior we cannot override;
+# the prebuilt path is the guaranteed fallback.)
+russh = "0.62"
+rpassword = "7"
+aws-lc-sys = { version = "0.43", features = ["prebuilt-nasm"] }
+
+# Lint discipline (CI runs `cargo clippy --all-targets -- -D warnings`, which
+# promotes the pedantic warnings below to errors).
+[lints.clippy]
+all = { level = "deny", priority = 10 }
+pedantic = { level = "warn", priority = 9 }
+# `FileMeta::new` is a field-by-field constructor mirroring the wire struct;
+# its eight arguments keep the `#[expect]` in `frame.rs` meaningful.
+too_many_arguments = { level = "warn", priority = 11 }
+# Line counts are a weak proxy for readability; the long functions here are
+# frame-dispatch loops and CLI scripts whose per-unit work is already
+# extracted into helpers.
+too_many_lines = { level = "allow", priority = 11 }

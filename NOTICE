@@ -1,0 +1,39 @@
+cp2
+
+This product includes software adapted from the following projects, under
+their respective licenses. The required copyright lines are retained here;
+per-module attribution lives in the source headers.
+
+Adapted code:
+
+  copia
+    Copyright (c) 2026 Pragmatic AI Labs
+    License: MIT
+    Adapted in src/delta/ (Delta/DeltaOp types, apply_patch, signature).
+
+  pxs
+    Copyright (c) 2025, nbari
+    License: BSD-3-Clause
+    Adapted in src/platform/staging.rs (StagedFile: staged temp + atomic
+    commit).
+
+  sparsync
+    Copyright (c) 2026 sparsync contributors
+    License: MIT
+    Adapted in the frame wire protocol and src/sync/scanner.rs (scan and
+    manifest pipeline).
+
+  sy
+    Copyright (c) 2025 Nick Russo
+    License: MIT
+    Adapted in src/sync/planner.rs and the transport abstraction.
+
+  robosync
+    Copyright (c) 2024 RoboSync Contributors
+    License: MIT
+    Adapted in src/sync/strategy.rs (file-tier transfer strategy).
+
+The MIT and BSD-3-Clause licenses permit copying, modification, and
+distribution with attribution. cp2 itself is licensed under the MIT License
+(see LICENSE). No code is derived from GPL-licensed projects; rsync
+contributed design and interface semantics only.

@@ -1,0 +1,131 @@
+name: release
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+# Builds every supported cp2 target, smoke-tests each binary with
+# `cp2 --help` on its own platform, assembles the distribution tarball
+# (all binaries + install.sh), and publishes it to a GitHub Release on tags.
+# Every matrix row runs natively: musl Linux on x86_64 and ARM64 Ubuntu
+# runners, macOS on Intel/ARM runners, Windows on MSVC.
+
+permissions:
+  contents: write
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --all-targets
+      - run: cargo clippy --all-targets -- -D warnings
+
+  build:
+    needs: test
+    # Full multi-target build only on release tags or manual dispatch;
+    # ordinary pushes/PRs just run the test gate.
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
+          - target: x86_64-apple-darwin
+            os: macos-13
+          - target: aarch64-apple-darwin
+            os: macos-14
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+          # No ARM64 Windows runner exists on GitHub: cross-compile via zig
+          # and skip the native smoke test for this row.
+          - target: aarch64-pc-windows-msvc
+            os: ubuntu-latest
+            zig: true
+            native: false
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: install musl C toolchain (Linux)
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: install zig + cargo-zigbuild (cross C toolchain)
+        if: matrix.zig
+        uses: goto-bus-stop/setup-zig@v2
+      - name: install cargo-zigbuild
+        if: matrix.zig
+        run: cargo install cargo-zigbuild
+      - name: build
+        run: |
+          if [ "${{ matrix.zig }}" = "true" ]; then
+            cargo zigbuild --release --target "${{ matrix.target }}"
+          else
+            cargo build --release --target "${{ matrix.target }}"
+          fi
+      - name: smoke test the binary on its own platform
+        # Skipped for the cross-compiled ARM64 Windows row: no ARM64 Windows
+        # host exists on GitHub-hosted runners.
+        if: matrix.native != false
+        run: |
+          BIN="target/${{ matrix.target }}/release/cp2"
+          [ -f "$BIN" ] || BIN="$BIN.exe"
+          "$BIN" --version
+          "$BIN" --help | head -3
+      - name: upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: cp2-${{ matrix.target }}
+          path: |
+            target/${{ matrix.target }}/release/cp2
+            target/${{ matrix.target }}/release/cp2.exe
+          if-no-files-found: error
+
+  assemble:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: binaries
+      - name: assemble tarball
+        run: |
+          VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          STAGE="cp2-$VERSION"
+          mkdir -p "$STAGE"
+          # rename each artifact binary to cp2-<triple>[.exe]
+          for dir in binaries/cp2-*; do
+            triple=${dir#binaries/cp2-}
+            if [ -f "$dir/cp2.exe" ]; then
+              mv "$dir/cp2.exe" "$STAGE/cp2-$triple.exe"
+            else
+              mv "$dir/cp2" "$STAGE/cp2-$triple"
+            fi
+          done
+          cp scripts/install.sh "$STAGE/install.sh"
+          chmod +x "$STAGE/install.sh"
+          tar -czf "$STAGE.tar.gz" "$STAGE"
+          echo "TARBALL=$STAGE.tar.gz" >> "$GITHUB_ENV"
+          ls -la "$STAGE"
+      - name: publish release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ env.TARBALL }}
+            binaries/**/cp2
+            binaries/**/cp2.exe
