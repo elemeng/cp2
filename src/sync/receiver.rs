@@ -70,9 +70,6 @@ pub(crate) struct Receiver {
     preserve_atimes: bool,
     /// Per-file progress reporter (see `ExecutorOptions::progress`).
     progress: Option<ProgressFn>,
-    /// The run's transferable file count (the pull side's display
-    /// `[index/total]` denominator), set from the source manifest.
-    files_total: u64,
 }
 
 impl Receiver {
@@ -113,7 +110,6 @@ impl Receiver {
             xattrs: options.xattrs,
             preserve_atimes: options.atimes,
             progress: options.progress.clone(),
-            files_total: 0,
         })
     }
 
@@ -214,7 +210,7 @@ impl Receiver {
                             self.handle_file_start(&mut state, file_id, &file_path, size)?;
                         }
                         Frame::FileChunk { file_id, data, .. } => {
-                            self.handle_file_chunk(&mut state, file_id, data).await?;
+                            self.handle_file_chunk(&mut state, file_id, data, files_total).await?;
                         }
                         Frame::FileEnd { .. } => {
                             self.handle_file_end(&mut state).await?;
@@ -539,6 +535,7 @@ impl Receiver {
         state: &mut ApplyState,
         file_id: u64,
         data: Vec<u8>,
+        files_total: u64,
     ) -> Result<()> {
         let Some(f) = &mut state.in_flight else {
             return Err(Error::Other("FileChunk without FileStart".to_string()));
@@ -560,7 +557,7 @@ impl Receiver {
         let n = data.len() as u64;
         f.offset += n;
         if let Some(report) = &self.progress {
-            report(&f.display, f.offset, f.size, self.files_total);
+            report(&f.display, f.offset, f.size, files_total);
         }
         // Defer the write: this task chains the previous one (blocking on
         // its join inside the blocking pool — writes stay strictly
