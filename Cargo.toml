@@ -55,6 +55,8 @@ anyhow = "1.0"
 thiserror = "2.0"
 num_cpus = "1.17"
 zeroize = "1"
+soft-canonicalize = { version = "0.5.6", features = ["dunce"] }
+typed-path = "0.12.3"
 
 [dev-dependencies]
 tempfile = "3.27"

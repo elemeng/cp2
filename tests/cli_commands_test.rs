@@ -225,8 +225,20 @@ async fn files_from_flag_local_copy() {
         .unwrap();
     assert!(status.success(), "cp2 exited with {status}");
 
-    // The root-relative structure is mirrored under the destination.
-    let mirror = dst.path().join(src.path().strip_prefix("/").unwrap());
+    // The root-relative structure is mirrored under the destination. Strip
+    // the filesystem root portably (the leading `/` on Unix, the drive prefix
+    // on Windows) — `strip_prefix("/")` only works on Unix-style paths.
+    let root_relative: std::path::PathBuf = src
+        .path()
+        .components()
+        .filter(|c| {
+            !matches!(
+                c,
+                std::path::Component::RootDir | std::path::Component::Prefix(_)
+            )
+        })
+        .collect();
+    let mirror = dst.path().join(root_relative);
     assert_eq!(std::fs::read(mirror.join("a.txt")).unwrap(), b"a");
     assert_eq!(std::fs::read(mirror.join("sub/b.txt")).unwrap(), b"b");
     assert!(!mirror.join("skip.txt").exists());
