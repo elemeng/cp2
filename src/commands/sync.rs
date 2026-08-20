@@ -1203,10 +1203,21 @@ fn install_progress(options: &mut ExecutorOptions) {
                 .checked_mul(100)
                 .and_then(|d| d.checked_div(total))
                 .unwrap_or(100);
-            // Display-only speed estimate: a byte count beyond f64's exact
-            // range (2^53) can only round, not overflow.
+            // Display-only speed estimate over a short window (bytes since the
+            // last redraw — ~100 ms at the 10/s throttle), not a lifetime
+            // average: the run-wide figure would be dragged down by the
+            // connect/planning time before any bytes flowed. The fallback
+            // covers a zero-length window on the first redraw.
+            let delta_bytes = st.bytes.saturating_sub(st.last_speed_bytes);
+            let delta_secs = now.duration_since(st.last_speed_at).as_secs_f64();
+            st.last_speed_bytes = st.bytes;
+            st.last_speed_at = now;
             #[expect(clippy::cast_precision_loss)]
-            let speed = st.bytes as f64 / st.start.elapsed().as_secs_f64();
+            let speed = if delta_secs > 0.0 {
+                delta_bytes as f64 / delta_secs
+            } else {
+                st.bytes as f64 / st.start.elapsed().as_secs_f64()
+            };
             let remaining = files_total.saturating_sub(st.completed);
             let _ = write!(
                 out,
@@ -1235,6 +1246,9 @@ struct ProgressState {
     /// reported twice — the wrapper's final write plus the explicit call).
     completed_paths: std::collections::HashSet<String>,
     last_redraw: Option<std::time::Instant>,
+    /// Bytes and timestamp for the windowed (since-last-redraw) speed readout.
+    last_speed_bytes: u64,
+    last_speed_at: std::time::Instant,
     /// Pending per-file completion lines. On a large transfer the per-line
     /// write syscalls alone cost seconds per 100 K files, so lines are
     /// batched and flushed on a size or time budget instead.
@@ -1256,6 +1270,8 @@ impl Default for ProgressState {
             last_done: std::collections::HashMap::new(),
             completed_paths: std::collections::HashSet::new(),
             last_redraw: None,
+            last_speed_bytes: 0,
+            last_speed_at: now,
             pending: String::new(),
             last_flush: now,
         }
