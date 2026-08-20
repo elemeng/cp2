@@ -748,8 +748,7 @@ impl RemoteClient {
             #[cfg(target_os = "windows")]
             Transport::Russh => {
                 let connection = self.ensure_russh(peer, jump).await?;
-                let handle = connection.handle.clone();
-                match russh::open_preamble_on(&handle, remote_path, server_args).await {
+                match russh::open_preamble_on(&connection.handle, remote_path, server_args).await {
                     Ok(Some((os, arch, send, recv, session))) => Ok(Some(PreambleSession {
                         os,
                         arch,
@@ -812,8 +811,7 @@ impl RemoteClient {
             #[cfg(target_os = "windows")]
             Transport::Russh => {
                 let connection = self.ensure_russh(peer, jump).await?;
-                let handle = connection.handle.clone();
-                match russh::deploy_and_serve_on(&handle, remote_path, server_args, local_binary)
+                match russh::deploy_and_serve_on(&connection.handle, remote_path, server_args, local_binary)
                     .await
                 {
                     Ok((send, recv, session)) => Ok(Session {

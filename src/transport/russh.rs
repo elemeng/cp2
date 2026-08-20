@@ -41,7 +41,7 @@ use ssh_key::known_hosts::{Entry, HostPatterns, Marker};
 use zeroize::Zeroize;
 use std::io::{IsTerminal, Write};
 use std::net::ToSocketAddrs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -1313,7 +1313,7 @@ pub(crate) async fn open_preamble_on(
     let remote_cmd = crate::transport::ssh::preamble_command(remote_path, server_args);
     let channel = handle.channel_open_session().await?;
     channel.exec(true, remote_cmd).await?;
-    let (read_half, write_half) = channel.split();
+    let (mut read_half, write_half) = channel.split();
     let send: Box<dyn AsyncWrite + Unpin + Send> = Box::new(write_half.make_writer());
     let (bytes_tx, bytes_rx) = mpsc::channel::<bytes::Bytes>(64);
     let recv_task = tokio::spawn(async move {
@@ -1380,7 +1380,7 @@ pub(crate) async fn deploy_and_serve_on(
         crate::transport::ssh::deploy_serve_command(remote_path, server_args, payload.len() as u64);
     let channel = handle.channel_open_session().await?;
     channel.exec(true, remote_cmd).await?;
-    let (read_half, write_half) = channel.split();
+    let (mut read_half, write_half) = channel.split();
     let mut send: Box<dyn AsyncWrite + Unpin + Send> = Box::new(write_half.make_writer());
     // The payload first; the protocol frames ride the same channel.
     send.write_all(&payload).await?;
