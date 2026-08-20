@@ -13,6 +13,7 @@
 
 use crate::protocol::TargetOs;
 use std::path::{Component, Path, PathBuf};
+use typed_path::{Utf8Component, Utf8UnixPath, Utf8UnixPathBuf};
 
 /// File extensions that make a Windows-source file executable on a Unix
 /// destination (the `exec_hint` heuristic, spec §2.1). Case-insensitive.
@@ -81,23 +82,28 @@ pub fn final_mode(
 /// components. Purely lexical (no filesystem access); `from_dir` and `to`
 /// must be rooted in the same tree for the result to stay meaningful. The
 /// identity case yields `.`.
+///
+/// Operates on [`Utf8UnixPath`] with Unix semantics on every host, so the
+/// relative / `..` / `/`-join logic does not depend on the compilation
+/// target's `std::path` rules — the link targets it produces are wire
+/// ('/'-separated) paths.
 #[must_use]
-pub fn rel_path(from_dir: &Path, to: &Path) -> PathBuf {
-    let from: Vec<Component> = from_dir.components().collect();
-    let to: Vec<Component> = to.components().collect();
+pub fn rel_path(from_dir: &Utf8UnixPath, to: &Utf8UnixPath) -> Utf8UnixPathBuf {
+    let from: Vec<_> = from_dir.components().collect();
+    let to: Vec<_> = to.components().collect();
     let common = from
         .iter()
         .zip(to.iter())
         .take_while(|(a, b)| a == b)
         .count();
-    let mut out = PathBuf::new();
+    let mut out = Utf8UnixPathBuf::new();
     for _ in common..from.len() {
         out.push("..");
     }
     for c in &to[common..] {
-        out.push(c.as_os_str());
+        out.push(c.as_str());
     }
-    if out.as_os_str().is_empty() {
+    if out.as_str().is_empty() {
         out.push(".");
     }
     out
@@ -107,15 +113,14 @@ pub fn rel_path(from_dir: &Path, to: &Path) -> PathBuf {
 /// target's relative path inside the tree, expressed relative to the link's
 /// own directory. DEST mirrors the source's relative structure, so the same
 /// string resolves correctly at the destination (spec §3.2 — DEST
-/// self-containment). Wire paths are '/'-separated.
+/// self-containment). Wire paths are '/'-separated, so the whole rewrite runs
+/// on [`Utf8UnixPath`] (Unix semantics on every host).
 #[must_use]
 pub fn rewrite_internal_target(link_rel: &str, target_rel: &str) -> String {
-    let link_dir = Path::new(link_rel)
+    let link_dir = Utf8UnixPath::new(link_rel)
         .parent()
-        .unwrap_or_else(|| Path::new(""));
-    rel_path(link_dir, Path::new(target_rel))
-        .to_string_lossy()
-        .replace('\\', "/")
+        .unwrap_or_else(|| Utf8UnixPath::new(""));
+    rel_path(link_dir, Utf8UnixPath::new(target_rel)).to_string()
 }
 
 /// How a symlink's target classifies relative to the scan root (spec §3.1).
@@ -285,11 +290,26 @@ mod tests {
 
     #[test]
     fn rel_path_descends_and_ascends() {
-        assert_eq!(rel_path(Path::new("a"), Path::new("a/t.txt")), PathBuf::from("t.txt"));
-        assert_eq!(rel_path(Path::new("a/b"), Path::new("a/c.txt")), PathBuf::from("../c.txt"));
-        assert_eq!(rel_path(Path::new("a/b"), Path::new("d/e.txt")), PathBuf::from("../../d/e.txt"));
-        assert_eq!(rel_path(Path::new("a"), Path::new("a")), PathBuf::from("."));
-        assert_eq!(rel_path(Path::new(""), Path::new("x.txt")), PathBuf::from("x.txt"));
+        assert_eq!(
+            rel_path(Utf8UnixPath::new("a"), Utf8UnixPath::new("a/t.txt")),
+            Utf8UnixPathBuf::from("t.txt")
+        );
+        assert_eq!(
+            rel_path(Utf8UnixPath::new("a/b"), Utf8UnixPath::new("a/c.txt")),
+            Utf8UnixPathBuf::from("../c.txt")
+        );
+        assert_eq!(
+            rel_path(Utf8UnixPath::new("a/b"), Utf8UnixPath::new("d/e.txt")),
+            Utf8UnixPathBuf::from("../../d/e.txt")
+        );
+        assert_eq!(
+            rel_path(Utf8UnixPath::new("a"), Utf8UnixPath::new("a")),
+            Utf8UnixPathBuf::from(".")
+        );
+        assert_eq!(
+            rel_path(Utf8UnixPath::new(""), Utf8UnixPath::new("x.txt")),
+            Utf8UnixPathBuf::from("x.txt")
+        );
     }
 
     #[test]

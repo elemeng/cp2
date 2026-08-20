@@ -4,6 +4,8 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 
+use typed_path::Utf8UnixPathBuf;
+
 use crate::protocol::{FileKind, LinkKind, FileMeta, Frame};
 use crate::sync::scanner::{FileEntry, Manifest};
 use crate::{Error, Result};
@@ -31,9 +33,19 @@ pub(crate) fn mtime_from_wire(mtime: u64) -> i64 {
 
 /// Convert a lossy string path to its wire form ('/' separators on every
 /// OS), for paths that arrive as strings rather than `Path` (see [`wire_rel`]).
+///
+/// The '/' contract is a type-level property: each `\`-separated host segment
+/// (a Windows-style path) is pushed onto a [`Utf8UnixPathBuf`] and rendered
+/// back through the Unix encoding, so the result is unambiguously Unix-syntax
+/// on every compilation target — while the '/' structure (including a leading
+/// root slash on absolute targets) passes through verbatim.
 #[must_use]
 pub(crate) fn wire_str(s: &str) -> String {
-    s.replace('\\', "/")
+    let mut out = Utf8UnixPathBuf::new();
+    for part in s.split('\\') {
+        out.push(part);
+    }
+    out.to_string()
 }
 
 /// Convert a scanned entry into its wire form.
@@ -104,9 +116,10 @@ pub(crate) fn manifest_from_file_meta(metas: &[FileMeta]) -> Manifest {
 /// The scanner produces '/'-separated manifests; paths that round-trip through
 /// `PathBuf` (e.g. the planner's) must be re-normalized before they go on the
 /// wire, or a Windows sender would emit '\\' and a Unix receiver would treat
-/// it as a literal filename character.
+/// it as a literal filename character. Delegates to [`wire_str`] for the
+/// Unix-semantic round-trip.
 pub(crate) fn wire_rel(path: &std::path::Path) -> String {
-    path.to_string_lossy().replace('\\', "/")
+    wire_str(&path.to_string_lossy())
 }
 
 /// Convert a frame received from the peer, mapping its `Frame::Error`

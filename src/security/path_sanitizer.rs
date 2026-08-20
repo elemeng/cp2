@@ -2,6 +2,8 @@
 
 use std::path::{Component, Path, PathBuf};
 
+use soft_canonicalize::soft_canonicalize;
+
 use super::error::{SecurityError, SecurityResult};
 
 /// Validate the components of a peer-supplied relative path: reject empty,
@@ -49,7 +51,7 @@ impl PathSanitizer {
     ///
     /// Returns an I/O error if the root cannot be canonicalized.
     pub fn new(root: impl AsRef<Path>) -> std::io::Result<Self> {
-        let root = root.as_ref().canonicalize()?;
+        let root = soft_canonicalize(root)?;
         Ok(PathSanitizer { root })
     }
 
@@ -100,25 +102,16 @@ impl PathSanitizer {
     /// the sanitizer root, so symlinks inside the tree cannot escape it.
     ///
     /// Runs on every join — no caching (see the struct docs: the receiver's
-    /// own mutations can make a cached result stale).
+    /// own mutations can make a cached result stale). `soft_canonicalize`
+    /// resolves the deepest existing prefix (symlinks, `..`, cycles, all
+    /// `MAX_SYMLINK_DEPTH`-bounded) and appends the non-existing tail, so the
+    /// containment decision below compares real paths on both sides.
     fn ensure_within_root(&self, path: &Path) -> SecurityResult<()> {
-        let mut current = path.to_path_buf();
-        loop {
-            match std::fs::canonicalize(&current) {
-                Ok(real) => {
-                    if !real.starts_with(&self.root) {
-                        return Err(SecurityError::TraversalAttempt);
-                    }
-                    return Ok(());
-                }
-                Err(_) => match current.parent() {
-                    Some(parent) => current = parent.to_path_buf(),
-                    // No parent above the root; the root always exists, so
-                    // this only happens for malformed paths.
-                    None => return Err(SecurityError::TraversalAttempt),
-                },
-            }
+        let real = soft_canonicalize(path).map_err(|_| SecurityError::TraversalAttempt)?;
+        if !real.starts_with(&self.root) {
+            return Err(SecurityError::TraversalAttempt);
         }
+        Ok(())
     }
 }
 

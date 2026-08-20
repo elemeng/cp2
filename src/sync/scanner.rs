@@ -7,6 +7,8 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
+use typed_path::Utf8UnixPathBuf;
+
 use crate::Result;
 use crate::protocol::{FileKind, LinkKind, TargetOs};
 use crate::sync::filter::FilterSet;
@@ -355,9 +357,15 @@ impl Scanner {
         let root = if self.options.include_root_component
             && let Some(dir_name) = canonical.file_name()
         {
+            // Re-home the entries under a `{name}/` prefix. Built through a
+            // `Utf8UnixPathBuf` push so the '/'-join is Unix-semantic on every
+            // host (the wire form is '/' regardless of the build target).
             let prefix = dir_name.to_string_lossy().into_owned();
             for entry in &mut entries {
-                entry.relative_path = format!("{prefix}/{}", entry.relative_path);
+                let mut wire = Utf8UnixPathBuf::new();
+                wire.push(&prefix);
+                wire.push(&entry.relative_path);
+                entry.relative_path = wire.to_string();
             }
             canonical
                 .parent()
