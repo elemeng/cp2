@@ -31,6 +31,12 @@ fn main() {
         }
         if let Ok(bytes) = fs::read(file) {
             for byte in bytes {
+                // Keep the fingerprint stable across checkouts with different
+                // line endings (git autocrlf makes Windows trees CRLF, Unix
+                // LF), so both sides of a sync hash the same committed bytes.
+                if byte == b'\r' {
+                    continue;
+                }
                 hash ^= u64::from(byte);
                 hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
             }
