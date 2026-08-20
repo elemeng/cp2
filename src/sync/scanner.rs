@@ -1399,7 +1399,7 @@ fn special_kind(_meta: &std::fs::Metadata) -> Option<FileKind> {
 //
 // `Option` is the portable contract: on any single platform this is always
 // `Some` (unix) or always `None` (elsewhere), so the wrap is cfg-dependent.
-#[expect(clippy::unnecessary_wraps)]
+#[allow(clippy::unnecessary_wraps)]
 fn inode_of(meta: &std::fs::Metadata) -> Option<u64> {
     #[cfg(unix)]
     {
@@ -1445,7 +1445,7 @@ fn atime_nsecs(meta: &std::fs::Metadata) -> u32 {
 
 /// The file's owner uid (Unix); `None` where ownership does not exist
 /// (Windows) — `-a` restores it with a best-effort `chown`.
-#[expect(clippy::unnecessary_wraps)]
+#[allow(clippy::unnecessary_wraps)]
 fn uid_of(meta: &std::fs::Metadata) -> Option<u32> {
     #[cfg(unix)]
     {
@@ -1460,7 +1460,7 @@ fn uid_of(meta: &std::fs::Metadata) -> Option<u32> {
 }
 
 /// The file's owner gid (Unix); `None` on Windows. See [`uid_of`].
-#[expect(clippy::unnecessary_wraps)]
+#[allow(clippy::unnecessary_wraps)]
 fn gid_of(meta: &std::fs::Metadata) -> Option<u32> {
     #[cfg(unix)]
     {

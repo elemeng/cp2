@@ -1737,7 +1737,7 @@ mod tests {
     }
 
     /// Set a file's mtime to a whole-second value (via `utimensat`).
-    #[expect(clippy::cast_possible_wrap, reason = "test helper: mtimes are whole-second values far below i64::MAX")]
+    #[allow(clippy::cast_possible_wrap)]
     fn filetime_set(path: &std::path::Path, mtime: u64) -> std::io::Result<()> {
         #[cfg(unix)]
         {
