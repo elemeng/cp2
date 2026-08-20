@@ -390,6 +390,8 @@ dependencies = [
 [[package]]
 name = "chunkrs"
 version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c4a3e913c3b173cfbe58693b1272e2a68e519e2aac0cffe92326df3c5234fa76"
 dependencies = [
  "blake3",
  "bytes",

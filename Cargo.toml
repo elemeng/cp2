@@ -33,7 +33,7 @@ notify = "8.2"
 
 blake3 = { version = "1.8", features = ["rayon"] }
 lz4_flex = { version = "0.14", default-features = false, features = ["std"] }
-chunkrs = { path = "../chunkrs", features = ["hash-parallel"] }
+chunkrs = { version = "0.9", features = ["hash-parallel"] }
 glob = "0.3"
 jwalk = "0.9"
 # Windows Shell Link (.lnk) parsing + generation for the link policy (spec
