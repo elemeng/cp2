@@ -571,8 +571,14 @@ semantics: `--skip-links` skips every symlink entirely and overrides
 ## Conventions
 
 - `cargo test` runs lib + integration tests; keep the e2e push and pull tests
-  passing (`tests/e2e_sync.rs`, which run the protocol against a spawned
-  `cp2 --server` child over pipes — no sshd needed in CI).
+  passing (`tests/e2e_{transfer,links,meta,features}.rs` share the helpers in
+  `tests/common/mod.rs` and run the protocol against a spawned `cp2 --server`
+  child over pipes — no sshd needed in CI).
+- The benchmarks live in `bench/` (sourced from `bench/lib.sh`):
+  `bench/mixed-tree.sh` (≈10 GiB / 100 K-file fresh/second/edit + integrity,
+  cp2 vs rsync) and `bench/single-file.sh` (single-file/small-tree delta
+  scenarios, `MODE=large|small`); `bench/compare_test.sh` is the older
+  cross-tool (cp2/rsync/scp/sy) run. All take `CP2_BIN`/`HOST`/`WORK` env.
 - `cargo clippy` must be clean.
 - Delta types are `serde`-serialized over the wire via `postcard`.
 - The platform layer (`src/platform/`) is portable and dependency-free

@@ -1172,7 +1172,7 @@ fn install_progress(options: &mut ExecutorOptions) {
             // alone costs seconds, and the batch path reports whole batches
             // at once anyway.
             let completed = st.completed;
-            let _ = write!(st.pending, "[{completed}/{files_total}] {path}\n");
+            let _ = writeln!(st.pending, "[{completed}/{files_total}] {path}");
             let now = std::time::Instant::now();
             if st.pending.len() >= PROGRESS_BATCH_BYTES
                 || now.duration_since(st.last_flush) >= PROGRESS_BATCH_AGE
