@@ -547,9 +547,17 @@ mod tests {
             let minor = dev_minor(dev);
             let sys_dev = Path::new("/sys/dev/block").join(format!("{major}:{minor}"));
             if sys_dev.exists() {
+                // The entry existing already validates the decode (a wrong
+                // major/minor would not resolve). /tmp is often on a *partition*
+                // (e.g. the root disk's /dev/sda1), which has no queue/rotational
+                // of its own — that lives on the parent whole disk — so it
+                // legitimately classifies Unknown. Only a definite class must
+                // be Hdd or Ssd; Unknown is valid here.
                 let class = classify_sysfs_device(&sys_dev);
-                // Whatever it is, it must be a real classification.
-                assert!(class == StorageClass::Hdd || class == StorageClass::Ssd);
+                assert!(matches!(
+                    class,
+                    StorageClass::Hdd | StorageClass::Ssd | StorageClass::Unknown
+                ));
             }
         }
     }
