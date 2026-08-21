@@ -32,8 +32,11 @@ already have.
   frees the source disk only after the copy is hash-verified, fsynced, and
   re-checked — safe for clearing an instrument's storage.
 - **rsync semantics, minus the setup** — `-a`, `--delete`, `--backup`,
-  `--no-*` opt-outs, include/exclude globs, exit code 23. If you know rsync,
-  you know cp2.
+  `--exclude-from`/`--include-from`, itemize/stat/reporting flags, `--no-*`
+  opt-outs, exit code 23. If you know rsync, you know cp2. For scripting and
+  auditing, `-i/--itemize-changes` prints per-file change lines, `--stats` a
+  post-run block, and `--list-only` a source listing without touching the
+  destination.
 - **Realtime watch** — `-W` syncs changes as they happen (event-driven push,
   server-driven pull), with a duration cap built in.
 - **Cross-platform, embeddable** — any combination of Linux, macOS, and
@@ -102,6 +105,16 @@ cp2 --verify --remove-source-files /data user@host:storage
 
 # Keep watching a folder for 12 hours
 cp2 -W=12h ./data user@host:backup
+
+# What changed? per-file itemize lines, then a stats block
+cp2 -i --stats ./data user@host:backup
+#     cd+++++++++ sub                 new directory
+#     .f.......... a.txt              already in sync
+#     >f.s.......  a.txt              updated
+#     *deleting    stale.txt          removed (with --delete)
+
+# List the source without transferring (local sources)
+cp2 --list-only ./data ./here
 ```
 
 ### Paths
