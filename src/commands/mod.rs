@@ -7,6 +7,7 @@ use crate::protocol::TargetOs;
 use crate::sync::ExecutorOptions;
 use crate::sync::SyncStats;
 use anyhow::Result;
+use std::path::Path;
 
 /// Print any skipped files after a sync summary line, so files that could
 /// not be applied (locked by another process, path too long, reserved
@@ -80,10 +81,23 @@ fn warn_on_decision_flag_conflicts(cli: &Cli) {
 }
 
 /// Build executor options from the CLI flags.
-pub(crate) fn options_from_cli(cli: &Cli) -> ExecutorOptions {
+///
+/// # Errors
+///
+/// Returns an error when a `--exclude-from` / `--include-from` list file
+/// cannot be read.
+pub(crate) fn options_from_cli(cli: &Cli) -> anyhow::Result<ExecutorOptions> {
     warn_on_link_flag_conflicts(cli);
     warn_on_decision_flag_conflicts(cli);
-    ExecutorOptions {
+    let mut exclude = cli.exclude.clone();
+    let mut include = cli.include.clone();
+    if let Some(f) = &cli.exclude_from {
+        exclude.extend(read_pattern_file(f, "--exclude-from")?);
+    }
+    if let Some(f) = &cli.include_from {
+        include.extend(read_pattern_file(f, "--include-from")?);
+    }
+    Ok(ExecutorOptions {
         checksum: cli.checksum,
         delete: cli.delete,
         update_only: cli.update,
@@ -96,8 +110,9 @@ pub(crate) fn options_from_cli(cli: &Cli) -> ExecutorOptions {
         storage: cli.storage,
         compress: cli.compress,
         bwlimit: cli.bwlimit.flatten(),
-        exclude: cli.exclude.clone(),
-        include: cli.include.clone(),
+        exclude,
+        include,
+        itemize: cli.itemize_changes,
         fsync: cli.fsync,
         // Empty = the serve root; the CLI overrides this from `user@host:path`
         // when either side is remote.
@@ -129,7 +144,26 @@ pub(crate) fn options_from_cli(cli: &Cli) -> ExecutorOptions {
         // Overridden per direction by `sync::execute` (trailing-slash
         // semantics for the local source) or by the pull frame (server side).
         include_root_component: false,
-    }
+    })
+}
+
+/// Read a rsync-style pattern list file (`--exclude-from` / `--include-from`):
+/// one pattern per line, with blank lines and `#`/`;` comments ignored and
+/// leading whitespace stripped.
+///
+/// # Errors
+///
+/// Returns an error if `path` cannot be read.
+fn read_pattern_file(path: &Path, flag: &str) -> anyhow::Result<Vec<String>> {
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| anyhow::anyhow!("failed to read {flag} list {}: {e}", path.display()))?;
+    let patterns = content
+        .lines()
+        .map(str::trim_start)
+        .filter(|line| !line.is_empty() && !line.starts_with('#') && !line.starts_with(';'))
+        .map(str::to_string)
+        .collect();
+    Ok(patterns)
 }
 
 /// Dispatch to server mode or the sync CLI based on the parsed arguments.
@@ -139,9 +173,38 @@ pub(crate) fn options_from_cli(cli: &Cli) -> ExecutorOptions {
 /// Returns an error if the sync, the server session, or the ssh child fails.
 pub async fn dispatch(mut cli: Cli) -> Result<()> {
     if cli.server {
-        let options = options_from_cli(&cli);
+        let options = options_from_cli(&cli)?;
         server::execute(&options).await
     } else {
         Box::pin(sync::execute(&mut cli)).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::read_pattern_file;
+    use std::path::PathBuf;
+
+    #[test]
+    fn pattern_file_parses_rsync_style() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("exclude.txt");
+        std::fs::write(
+            &f,
+            "# build artifacts\n*.tmp\n  node_modules\n\n; keep\n/target\nsrc/generated\n",
+        )
+        .unwrap();
+        let patterns = read_pattern_file(&f, "--exclude-from").unwrap();
+        assert_eq!(
+            patterns,
+            vec!["*.tmp", "node_modules", "/target", "src/generated"]
+        );
+    }
+
+    #[test]
+    fn pattern_file_missing_is_an_error() {
+        assert!(
+            read_pattern_file(&PathBuf::from("/nonexistent/exclude.txt"), "--exclude-from").is_err()
+        );
     }
 }

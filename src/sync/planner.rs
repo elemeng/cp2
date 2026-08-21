@@ -10,6 +10,8 @@ use std::path::PathBuf;
 
 use crate::protocol::{FileKind, LinkKind};
 use crate::sync::scanner::{FileEntry, Manifest};
+use crate::sync::stats::{ItemizeAction, ItemizeEntry};
+use crate::sync::wire::wire_rel;
 
 /// What to do with a file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,6 +76,40 @@ impl SyncPlan {
     /// separately by the receiver.
     pub fn tasks(&self) -> impl Iterator<Item = &SyncTask> {
         self.creates.iter().chain(self.updates.iter())
+    }
+
+    /// Per-file change entries for `--itemize-changes` (`-i`): the creates,
+    /// updates, and in-sync skips. Deletes are appended by the caller once its
+    /// `--delete` policy filter has decided which paths actually go (the plan's
+    /// deletes include ones the sender drops as policy-skipped).
+    #[must_use]
+    pub fn itemize(&self) -> Vec<ItemizeEntry> {
+        let mut v =
+            Vec::with_capacity(self.creates.len() + self.updates.len() + self.skips.len());
+        v.extend(self.creates.iter().map(|t| itemize_entry(ItemizeAction::Create, t)));
+        v.extend(self.updates.iter().map(|t| itemize_entry(ItemizeAction::Update, t)));
+        v.extend(self.skips.iter().map(|t| itemize_entry(ItemizeAction::Skip, t)));
+        v
+    }
+}
+
+/// Itemize entry for one planned task: its rsync file-type letter plus the
+/// relative wire path.
+fn itemize_entry(action: ItemizeAction, task: &SyncTask) -> ItemizeEntry {
+    ItemizeEntry::new(action, wire_rel(&task.relative_path), task_kind(task))
+}
+
+/// rsync-file-type letter for an itemize line: `d` directory, `L` symlink,
+/// `S` special file, `f` ordinary file.
+fn task_kind(task: &SyncTask) -> char {
+    if task.is_dir {
+        'd'
+    } else if task.link_target.is_some() {
+        'L'
+    } else if task.special.is_some() {
+        'S'
+    } else {
+        'f'
     }
 }
 

@@ -21,7 +21,7 @@ pub use executor::{Executor, ExecutorOptions, ProgressFn};
 pub use filter::FilterSet;
 pub use planner::{Planner, PlannerConfig, SyncAction, SyncPlan, SyncTask};
 pub use scanner::{FileEntry, Manifest, ScanOptions, Scanner};
-pub use stats::SyncStats;
+pub use stats::{ItemizeAction, ItemizeEntry, SyncStats};
 pub use strategy::{
     FileClass, TransferStrategy, classify_file_size, determine_strategy,
 };

@@ -14,6 +14,7 @@ use crate::platform::storage::{StorageClass, StoragePreference};
 use crate::protocol::{FileMeta, Frame, TargetOs, stream};
 use crate::security::PathSanitizer;
 use crate::sync::handshake;
+use crate::sync::planner::{Planner, PlannerConfig};
 use crate::sync::receiver::Receiver;
 use crate::sync::scanner::{Manifest, ScanOptions, Scanner};
 use crate::sync::sender::Sender;
@@ -132,6 +133,10 @@ pub struct ExecutorOptions {
     pub exclude: Vec<String>,
     /// Include paths matching these globs, overriding `exclude`.
     pub include: Vec<String>,
+    /// Collect per-file change entries (`--itemize-changes` / `-i`) for the
+    /// run summary. Off by default so a plain run does not allocate a
+    /// manifest-scale list it never prints.
+    pub itemize: bool,
     /// fsync every received file before it is renamed into place (receiver side).
     pub fsync: bool,
     /// Remote target path: empty = the serve root (account home), a leading
@@ -311,6 +316,7 @@ impl Default for ExecutorOptions {
             bwlimit: None,
             exclude: Vec::new(),
             include: Vec::new(),
+            itemize: false,
             fsync: false,
             remote_path: String::new(),
             partial: true,
@@ -426,6 +432,7 @@ pub async fn push_multi(
             resolve_apply_jobs(options, source_root),
             options.remove_source_files || options.verify,
             options.rollsum,
+            options.itemize,
         );
         let stats = sender
             .send(
@@ -473,15 +480,37 @@ pub async fn push_multi(
 
         // We are the receiver: scan our destination and apply the recipes.
         let dest_manifest = scan_dest(local, options, &source_files).await?;
+        // `--itemize-changes` on a pull: the sender runs on the peer, so its
+        // plan is not in this process. The inputs are — the received file
+        // list and our destination scan — so reproduce the same plan to
+        // derive the change entries (deletes are best-effort; the sender
+        // applies its own `--delete` policy filter that this copy cannot
+        // fully mirror without the source's skipped-set).
+        let changes = if options.itemize {
+            let planner = Planner::new(PlannerConfig {
+                checksum: options.checksum,
+                delete: options.delete,
+                update_only: options.update_only,
+                ignore_existing: options.ignore_existing,
+                existing: options.existing,
+                ignore_times: options.ignore_times,
+                size_only: !options.preserve_times,
+            });
+            let source_manifest = manifest_from_file_meta(&source_files);
+            planner.plan(&source_manifest, &dest_manifest).itemize()
+        } else {
+            Vec::new()
+        };
         let receiver = Receiver::new(
             local,
             options,
             resolve_apply_jobs(options, local),
             verify,
         )?;
-        let stats = receiver
+        let mut stats = receiver
             .receive(&mut ctrl_send, &mut ctrl_recv, source_files, &dest_manifest)
             .await?;
+        stats.changes = changes;
         tracing::info!(
             "pull complete: {} files, {} bytes in {:?}",
             stats.files_received,
@@ -687,6 +716,10 @@ pub async fn push_multi(
                     resolve_apply_jobs(&pull_options, &source_root),
                     pull_options.remove_source_files || pull_options.verify,
                     pull_options.rollsum,
+                    // The pull sender runs on the serve side; its stats (and
+                    // plan) are not the client's — the client reproduces the
+                    // itemize entries from the file list it receives.
+                    false,
                 );
                 // Read source files against *the manifest's* root, not the
                 // literal serve path: with `include_root` (a no-slash remote
@@ -723,7 +756,7 @@ pub async fn push_multi(
 /// side of a transfer, never on the destination scan. It doubles as the
 /// source/destination marker: the permission matrix (spec §2.2) is applied
 /// only to source scans.
-async fn scan_tree(root: &Path, options: &ExecutorOptions, apply_filter: bool) -> Result<Manifest> {
+pub(crate) async fn scan_tree(root: &Path, options: &ExecutorOptions, apply_filter: bool) -> Result<Manifest> {
     let filter = if apply_filter {
         Some(crate::sync::FilterSet {
             includes: options.include.clone(),
@@ -875,6 +908,8 @@ async fn serve_watch_pull<W: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
             resolve_apply_jobs(options, source_root),
             options.remove_source_files || options.verify,
             options.rollsum,
+            // Serve-side pull sender: its itemize never reaches the client.
+            false,
         );
         let stats = sender
             .send(

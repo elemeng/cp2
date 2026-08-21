@@ -643,6 +643,7 @@ fn test_stats() -> SyncStats {
         files_received: 0,
         bytes_transferred: N.fetch_add(1, Ordering::SeqCst),
         duration: Duration::ZERO,
+        changes: Vec::new(),
         skipped: Vec::new(),
     }
 }

@@ -61,6 +61,20 @@ pub struct Cli {
     #[arg(short = 'q', long, help_heading = "Transfer")]
     pub quiet: bool,
 
+    /// List the source files without transferring (rsync --list-only).
+    /// Local sources only in this version; SRC is listed, DST is unused.
+    #[arg(long, help_heading = "Transfer")]
+    pub list_only: bool,
+
+    /// Print a detailed transfer statistics block after the sync (rsync --stats)
+    #[arg(long, help_heading = "Transfer")]
+    pub stats: bool,
+
+    /// Print a per-file change line (rsync -i): `>f` new, `*deleting`,
+    /// `.f` in-sync
+    #[arg(short = 'i', long, help_heading = "Transfer")]
+    pub itemize_changes: bool,
+
     /// Skip the per-file listing/progress, keep the summary
     #[arg(long, help_heading = "Transfer")]
     pub no_progress: bool,
@@ -80,6 +94,14 @@ pub struct Cli {
     /// Include paths matching GLOB, overriding excludes (repeatable)
     #[arg(long, help_heading = "Selection")]
     pub include: Vec<String>,
+
+    /// Read additional exclude patterns from FILE (one per line)
+    #[arg(long, value_name = "FILE", help_heading = "Selection")]
+    pub exclude_from: Option<PathBuf>,
+
+    /// Read additional include patterns from FILE (one per line)
+    #[arg(long, value_name = "FILE", help_heading = "Selection")]
+    pub include_from: Option<PathBuf>,
 
     /// Skip files where the destination is newer (rsync -u)
     #[arg(short = 'u', long, help_heading = "Selection")]

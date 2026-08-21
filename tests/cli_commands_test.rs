@@ -54,6 +54,11 @@ async fn test_sync_command_dry_run() {
         no_times: false,
         no_recursive: false,
         files_from: None,
+        exclude_from: None,
+        include_from: None,
+        itemize_changes: false,
+        stats: false,
+        list_only: false,
     };
     let result = cp2::commands::sync::execute(&mut cli).await;
     assert!(result.is_ok());

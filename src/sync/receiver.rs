@@ -138,6 +138,9 @@ impl Receiver {
             files_received,
             bytes_transferred: bytes,
             duration: start.elapsed(),
+            // The receiver records no change entries itself; on a pull the
+            // executor derives them from the reproduced plan (`options.itemize`).
+            changes: Vec::new(),
             skipped,
         })
     }

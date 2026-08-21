@@ -216,6 +216,11 @@ checksum.
 | `--files-from FILE` | `--files-from` | Sync only the listed **absolute** paths (one per line, Unix or Windows line endings), mirrored under DST; relative entries rejected; SRC not used (`cp2 --files-from FILE DST`) |
 | `--exclude GLOB` | `--exclude` | Exclude matching paths (repeatable) |
 | `--include GLOB` | `--include` | Include matching paths (repeatable) |
+| `--exclude-from FILE` | `--exclude-from` | Read additional exclude patterns from FILE (one per line; blank lines and `#`/`;` comments ignored) |
+| `--include-from FILE` | `--include-from` | Read additional include patterns from FILE (same format) |
+| `-i, --itemize-changes` | `-i` | Print a per-file change line: `>f`/`cd` new, `>f.s` updated, `*deleting` removed, `.f` in-sync (rsync `-i`; covers push/local out of the plan, pull from the reproduced plan) |
+| `--stats` | `--stats` | Print a detailed statistics block (files, bytes, time, skipped) after the summary |
+| `--list-only` | `--list-only` | List the source files without transferring (local sources; remote needs the manifest round-trip and is not yet wired) |
 | `-j, --jobs N` | — | Parallel transfer + hash workers; omitted = auto-tuned from the target storage class |
 | `--storage auto\|hdd\|ssd` | — | Storage class for auto-tuning: detect on Linux/Windows/macOS (default), or force HDD/SSD |
 | `-z, --compress` | `-z` | Compress the data stream (lz4) |

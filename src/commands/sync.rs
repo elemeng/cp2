@@ -6,6 +6,7 @@ use super::{exit_if_partial, options_from_cli, print_skipped, watch};
 use crate::cli::Cli;
 use crate::protocol::{BUILD_FINGERPRINT, TargetOs};
 use crate::sync::SyncStats;
+use crate::sync::{ItemizeAction, ItemizeEntry};
 use crate::sync::{Executor, ExecutorOptions};
 use crate::target::{Location, RemoteTarget};
 use crate::transport::ssh::{default_remote_path, local_platform, sidecar_candidates, sidecar_path};
@@ -145,7 +146,7 @@ pub async fn execute(cli: &mut Cli) -> Result<()> {
         }
     }
 
-    let mut options = options_from_cli(cli);
+    let mut options = options_from_cli(cli)?;
     if !cli.quiet && !cli.no_progress {
         install_progress(&mut options);
     }
@@ -189,6 +190,35 @@ pub async fn execute(cli: &mut Cli) -> Result<()> {
             options.remote_path = r.path.clone();
         }
         _ => {}
+    }
+
+    // `--list-only`: print the source listing without transferring. The
+    // destination is parsed (the CLI mirrors rsync, which also takes one) but
+    // unused; only a local source is supported — a remote listing needs the
+    // server's manifest round-trip, which is the remote-side expansion gap.
+    if cli.list_only {
+        return match src {
+            Location::Local(src_path) => {
+                let manifest = crate::sync::executor::scan_tree(&src_path, &options, true).await?;
+                if !cli.quiet {
+                    println!("Listing {}:", src_path.display());
+                }
+                for f in &manifest.files {
+                    let kind = if f.is_dir {
+                        'd'
+                    } else if f.link_target.is_some() {
+                        'L'
+                    } else {
+                        'f'
+                    };
+                    println!("{kind} {:>12} {}", f.size, f.relative_path);
+                }
+                Ok(())
+            }
+            Location::Remote(_) => Err(anyhow::anyhow!(
+                "--list-only on a remote source is not supported yet; it needs the server's manifest round-trip"
+            )),
+        };
     }
 
     match (src, dst) {
@@ -243,6 +273,12 @@ pub async fn execute(cli: &mut Cli) -> Result<()> {
                     "Done: {} files, {} bytes transferred",
                     stats.files_sent, stats.bytes_transferred
                 );
+                if cli.stats {
+                    print_stats(&stats, stats.files_sent);
+                }
+                if cli.itemize_changes {
+                    print_itemize(&stats);
+                }
             }
             exit_if_partial(print_skipped(&stats));
             Ok(())
@@ -281,6 +317,12 @@ pub async fn execute(cli: &mut Cli) -> Result<()> {
                     "Done: {} files, {} bytes transferred",
                     stats.files_received, stats.bytes_transferred
                 );
+                if cli.stats {
+                    print_stats(&stats, stats.files_received);
+                }
+                if cli.itemize_changes {
+                    print_itemize(&stats);
+                }
             }
             exit_if_partial(print_skipped(&stats));
             Ok(())
@@ -319,6 +361,12 @@ pub async fn execute(cli: &mut Cli) -> Result<()> {
                     "Done: {} files, {} bytes transferred",
                     stats.files_sent, stats.bytes_transferred
                 );
+                if cli.stats {
+                    print_stats(&stats, stats.files_sent);
+                }
+                if cli.itemize_changes {
+                    print_itemize(&stats);
+                }
             }
             exit_if_partial(print_skipped(&stats));
             Ok(())
@@ -1153,6 +1201,38 @@ fn find_sidecar(candidates: &[&str], binaries_dir: Option<&Path>) -> Option<Path
     })
 }
 
+/// Print the `--stats` block after the summary line: transfer totals, skip
+/// count, and the run duration.
+fn print_stats(stats: &SyncStats, transferred_files: usize) {
+    println!("Statistics:");
+    println!("  files transferred: {transferred_files}");
+    println!("  bytes transferred: {}", stats.bytes_transferred);
+    println!("  files skipped:     {}", stats.skipped.len());
+    let secs = stats.duration.as_secs_f64();
+    println!("  total time:        {secs:.2}s");
+}
+
+/// rsync-style `-i` flag string for one change entry.
+fn itemize_flag(entry: &ItemizeEntry) -> String {
+    let k = entry.kind;
+    match entry.action {
+        ItemizeAction::Create => format!("c{k}+++++++++"),
+        // An update means the size/content (and therefore typically mtime)
+        // differs; `>f.s.......` is rsync's size-changed file code.
+        ItemizeAction::Update => format!(">{k}.s......."),
+        ItemizeAction::Delete => "*deleting   ".to_string(),
+        ItemizeAction::Skip => format!(".{k}.........."),
+    }
+}
+
+/// Print the `--itemize-changes` (`-i`) lines: one per changed or scanned
+/// file, in rsync's flag-string format.
+fn print_itemize(stats: &SyncStats) {
+    for e in &stats.changes {
+        println!("{} {}", itemize_flag(e), e.path);
+    }
+}
+
 /// Install the default per-file progress reporter (rsync `-aP`-style):
 /// every transferred file gets a listing line on stdout, and on a terminal
 /// an in-place percentage is shown while the file is in flight.
@@ -1328,6 +1408,17 @@ fn human_bytes(n: u64) -> String {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn itemize_flags_match_rsync_shape() {
+        let e = |action, kind| ItemizeEntry::new(action, "p".to_string(), kind);
+        assert_eq!(itemize_flag(&e(ItemizeAction::Create, 'f')), "cf+++++++++");
+        assert_eq!(itemize_flag(&e(ItemizeAction::Create, 'd')), "cd+++++++++");
+        assert_eq!(itemize_flag(&e(ItemizeAction::Create, 'L')), "cL+++++++++");
+        assert_eq!(itemize_flag(&e(ItemizeAction::Update, 'f')), ">f.s.......");
+        assert_eq!(itemize_flag(&e(ItemizeAction::Delete, 'd')), "*deleting   ");
+        assert_eq!(itemize_flag(&e(ItemizeAction::Skip, 'f')), ".f..........");
+    }
 
     #[test]
     fn server_args_flags_and_values_are_separate_tokens() {

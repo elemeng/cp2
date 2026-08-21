@@ -19,6 +19,7 @@ use crate::protocol::{
 use crate::sync::executor::{ExecutorOptions, ProgressFn};
 use crate::sync::filter::FilterSet;
 use crate::sync::planner::{Planner, PlannerConfig, SyncAction, SyncPlan, SyncTask};
+use crate::sync::stats::{ItemizeAction, ItemizeEntry};
 use crate::sync::scanner::Manifest;
 use crate::sync::stats::SyncStats;
 use crate::sync::strategy::{FileClass, TransferStrategy, classify_file_size, determine_strategy};
@@ -86,6 +87,9 @@ pub(crate) struct Sender {
     /// rsync-style rollsum delta engine (fixed blocks + byte-sliding scan)
     /// instead of `FastCDC`.
     rollsum: bool,
+    /// Collect per-file change entries (`--itemize-changes` / `-i`) from the
+    /// plan for the returned stats. Off for a plain run.
+    itemize: bool,
 }
 
 impl Sender {
@@ -99,6 +103,7 @@ impl Sender {
         compute_jobs: usize,
         verify_hash: bool,
         rollsum: bool,
+        itemize: bool,
     ) -> Self {
         Self {
             limiter: bwlimit_bytes.map(|b| Arc::new(BandwidthLimiter::new(b))),
@@ -106,6 +111,7 @@ impl Sender {
             compute_jobs: compute_jobs.max(1),
             verify_hash,
             rollsum,
+            itemize,
         }
     }
 
@@ -172,6 +178,10 @@ impl Sender {
             plan.skips.len()
         );
 
+        // `--itemize-changes`: record the planned create/update/skip entries;
+        // deletes are appended once the policy-filtered delete set is decided.
+        let mut changes = if self.itemize { plan.itemize() } else { Vec::new() };
+
         let (bytes, files, transferred, send_skipped) = self
             .apply_plan(ctrl_send, ctrl_recv, &plan, source_root, options)
             .await?;
@@ -213,8 +223,14 @@ impl Sender {
             }
             // Remove children before parents.
             dir_deletes.sort_by(|a, b| b.cmp(a));
-            let paths: Vec<String> = file_deletes.into_iter().chain(dir_deletes).collect();
-            if !paths.is_empty() {
+            if !file_deletes.is_empty() || !dir_deletes.is_empty() {
+                if self.itemize {
+                    // Record each delete from its bucket's kind so the
+                    // itemize line distinguishes `*deleting dir/` from
+                    // `*deleting file`.
+                    changes.extend(recorded_deletes(&file_deletes, &dir_deletes));
+                }
+                let paths: Vec<String> = file_deletes.into_iter().chain(dir_deletes).collect();
                 stream::send_frame(ctrl_send, &Frame::DeleteRequest { paths }).await?;
             }
         }
@@ -336,6 +352,7 @@ impl Sender {
             files_received: 0,
             bytes_transferred: bytes,
             duration: start.elapsed(),
+            changes,
             skipped,
         })
     }
@@ -1263,6 +1280,22 @@ fn source_changed(rel: &str, skipped: &mut Vec<SkippedFile>) {
         rel.to_string(),
         "source changed during transfer; not removed".to_string(),
     ));
+}
+
+/// Itemize entries for a `--delete` pass: one `*deleting` per actual delete,
+/// with the dir/file kind from the bucket it came from (the caller merged
+/// the two into `paths`, losing the kind).
+fn recorded_deletes(file_deletes: &[String], dir_deletes: &[String]) -> Vec<ItemizeEntry> {
+    file_deletes
+        .iter()
+        .map(|p| ItemizeEntry::new(ItemizeAction::Delete, p.clone(), 'f'))
+        .chain(
+            dir_deletes
+                .iter()
+                .rev()
+                .map(|p| ItemizeEntry::new(ItemizeAction::Delete, p.clone(), 'd')),
+        )
+        .collect()
 }
 
 /// Whether `rel` is a policy-skipped source path or lies under one (the
