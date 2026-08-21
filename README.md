@@ -349,8 +349,22 @@ and the receiver's atomic-apply pipeline — lives in
 
 ## Performance comparison
 
+The `bench/` directory holds the benchmark suite. Shared helpers live in
+`bench/lib.sh` (takes `CP2_BIN`, `HOST`, `WORK`, `KEEP_WORK=1`); scenario
+scripts source it. Requires the release build (`cargo build --release`) and
+ssh key auth to `HOST`.
+
+| Script | What it measures |
+|--------|------------------|
+| `mixed-tree.sh` | ≈10 GiB / 100 K files (70 K small 1-16 KiB, 27 K medium 64-384 KiB, 3 K large 1-2 MiB), cp2 vs rsync over ssh: `fresh` / `second` / `edit` / `integrity` phases |
+| `single-file.sh` | the delta engine's value, cp2 vs rsync: `MODE=large` (one 1 GiB file: fresh / edit A+B / insert / idle) or `MODE=small` (8192 files: fresh / edit / idle) |
+| `compare_test.sh` | cross-tool localhost push (cp2 vs rsync vs scp vs [sy](https://crates.io/crates/sy)) across four scenarios, reproducible in CI-like conditions |
+| `compare_remote.sh` | cp2 vs rsync push to a **real** remote (gitignored — it holds a personal host address): fresh / idle / edit |
+
+### Cross-tool localhost (`compare_test.sh`)
+
 `bench/compare_test.sh` pushes the same trees over ssh with cp2, rsync, scp,
-and [sy](https://crates.io/crates/sy), across four scenarios:
+and sy, across four scenarios:
 
 | Scenario | Source | What it measures |
 |----------|--------|------------------|
@@ -396,6 +410,9 @@ Reading the numbers honestly:
 
 Run it yourself: `bench/compare_test.sh` (needs ssh key auth to the target;
 `--remote user@host`, `--small-src DIR`, `--large-mb N` to adjust).
+`bench/mixed-tree.sh` and `bench/single-file.sh` (sourced from `bench/lib.sh`)
+cover the large-tree and delta scenarios; `bench/compare_remote.sh REMOTE`
+repeats the daily flows against a real link.
 
 ## Build & roadmap
 
