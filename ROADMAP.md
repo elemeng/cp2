@@ -75,6 +75,8 @@ side propagate to the other, with no fixed source/destination roles.
 
 ### Candidates (known gaps, not yet committed)
 
-- Metadata-only updates: re-apply the permission matrix to already-in-sync
-  files (mode/mtime are currently applied to transferred files only).
-- Remote-side expansion for globs and `--files-from` on pull.
+- Content-addressed dedup is the v0.2 headline above; bidirectional sync the
+  v0.3 headline. The previous candidates (metadata-only updates; remote-side
+  expansion for globs and `--files-from` on pull) are done — see the released
+  list: attr-only re-apply for drifted perms/times, remote `--list-only`,
+  server-expanded globs on pull, and remote `--files-from`.

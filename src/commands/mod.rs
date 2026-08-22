@@ -117,6 +117,7 @@ pub(crate) fn options_from_cli(cli: &Cli) -> anyhow::Result<ExecutorOptions> {
         // Empty = the serve root; the CLI overrides this from `user@host:path`
         // when either side is remote.
         remote_path: String::new(),
+        remote_paths: Vec::new(),
         partial: true,
         remove_source_files: cli.remove_source_files,
         verify: cli.verify,

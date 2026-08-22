@@ -594,3 +594,101 @@ async fn pull_ignores_local_decoys_without_delete() {
     );
 }
 
+
+#[tokio::test]
+async fn remote_list_only_returns_the_tree() {
+    // `--list-only` on a remote source: a ListRequest round-trip returns the
+    // scanned entries (paths, sizes, kinds) without transferring.
+    let serve = tempfile::tempdir().unwrap();
+    tokio::fs::write(serve.path().join("a.txt"), b"aaa")
+        .await
+        .unwrap();
+    tokio::fs::create_dir_all(serve.path().join("sub"))
+        .await
+        .unwrap();
+    tokio::fs::write(serve.path().join("sub/b.txt"), b"bbb")
+        .await
+        .unwrap();
+
+    let stats = list_tree(serve.path(), "", &default_options()).await;
+    let paths: Vec<&str> = stats.changes.iter().map(|e| e.path.as_str()).collect();
+    assert!(paths.contains(&"a.txt"), "listing must include a.txt: {paths:?}");
+    assert!(
+        paths.contains(&"sub/b.txt"),
+        "listing must include sub/b.txt: {paths:?}"
+    );
+    let a = stats.changes.iter().find(|e| e.path == "a.txt").unwrap();
+    assert_eq!(a.kind, 'f');
+    assert_eq!(a.size, 3);
+    let b = stats.changes.iter().find(|e| e.path == "sub/b.txt").unwrap();
+    assert_eq!(b.kind, 'f');
+    assert_eq!(b.size, 3);
+}
+
+#[tokio::test]
+async fn remote_glob_pull_expands_server_side() {
+    // A remote pull whose path has glob metacharacters is expanded on the
+    // server and merged under the pattern's static prefix.
+    let serve = tempfile::tempdir().unwrap();
+    tokio::fs::create_dir_all(serve.path().join("sub"))
+        .await
+        .unwrap();
+    tokio::fs::write(serve.path().join("sub/a.rs"), b"a")
+        .await
+        .unwrap();
+    tokio::fs::write(serve.path().join("sub/b.rs"), b"bb")
+        .await
+        .unwrap();
+    tokio::fs::write(serve.path().join("sub/c.txt"), b"ccc")
+        .await
+        .unwrap();
+
+    let restore = tempfile::tempdir().unwrap();
+    let mut options = default_options();
+    options.remote_path = "sub/*.rs".to_string();
+    let stats = pull_tree(serve.path(), restore.path(), &options).await;
+    assert_eq!(stats.files_received, 2);
+    assert_eq!(std::fs::read(restore.path().join("a.rs")).unwrap(), b"a");
+    assert_eq!(std::fs::read(restore.path().join("b.rs")).unwrap(), b"bb");
+    assert!(!restore.path().join("c.txt").exists());
+}
+
+#[tokio::test]
+async fn remote_files_from_pull_merges_absolute_paths() {
+    // Remote `--files-from`: the client sends absolute server paths; the
+    // server merges them under the filesystem root, so each file mirrors
+    // into the destination at its full absolute path (local files-from
+    // layout).
+    let serve = tempfile::tempdir().unwrap();
+    let d1 = serve.path().join("d1");
+    let d2 = serve.path().join("d2");
+    tokio::fs::create_dir_all(&d1).await.unwrap();
+    tokio::fs::create_dir_all(&d2).await.unwrap();
+    tokio::fs::write(d1.join("a.txt"), b"a").await.unwrap();
+    tokio::fs::write(d2.join("b.txt"), b"bb").await.unwrap();
+
+    let restore = tempfile::tempdir().unwrap();
+    let mut options = default_options();
+    options.remote_paths = vec![
+        d1.join("a.txt").to_string_lossy().into_owned(),
+        d2.join("b.txt").to_string_lossy().into_owned(),
+    ];
+    let stats = pull_tree(serve.path(), restore.path(), &options).await;
+    assert_eq!(stats.files_received, 2);
+    // Mirrored at the absolute path minus the leading `/`.
+    let abs1 = d1.join("a.txt");
+    let abs2 = d2.join("b.txt");
+    let rel1 = abs1.strip_prefix("/").unwrap();
+    let rel2 = abs2.strip_prefix("/").unwrap();
+    assert_eq!(
+        std::fs::read(restore.path().join(rel1)).unwrap(),
+        b"a",
+        "{} must land at {}",
+        d1.join("a.txt").display(),
+        restore.path().join(rel1).display()
+    );
+    assert_eq!(
+        std::fs::read(restore.path().join(rel2)).unwrap(),
+        b"bb"
+    );
+}

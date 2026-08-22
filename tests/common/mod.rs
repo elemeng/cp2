@@ -79,6 +79,18 @@ pub async fn pull_tree(serve_root: &Path, dst: &Path, options: &ExecutorOptions)
     stats
 }
 
+/// Run a remote `--list-only` session against a spawned server child rooted
+/// at `serve_root`, listing `path` (serve-root-relative or absolute).
+pub async fn list_tree(serve_root: &Path, path: &str, options: &ExecutorOptions) -> SyncStats {
+    let (mut child, send, recv) = spawn_server(serve_root);
+    let mut executor = Executor::new(send, recv);
+    let stats = executor.list(path, options).await.expect("list failed");
+    drop(executor);
+    let exit_status = child.wait().await.expect("wait server");
+    assert!(exit_status.success(), "server exited with {exit_status}");
+    stats
+}
+
 pub fn default_options() -> ExecutorOptions {
     ExecutorOptions::default()
 }

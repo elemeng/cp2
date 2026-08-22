@@ -192,10 +192,39 @@ pub async fn execute(cli: &mut Cli) -> Result<()> {
         _ => {}
     }
 
+    // Remote `--files-from` pull: the listed entries are absolute paths on the
+    // server (mirroring the local files-from layout). The client cannot see
+    // the remote filesystem — it sends the entries as the pull's `paths` and
+    // the server scans each, merged under the destination from the
+    // filesystem root.
+    if matches!(src, Location::Remote(_))
+        && let Some(list_file) = &cli.files_from
+    {
+        let content = std::fs::read_to_string(list_file).map_err(|e| {
+            anyhow::anyhow!(
+                "failed to read --files-from list {}: {e}",
+                list_file.display()
+            )
+        })?;
+        let mut paths = Vec::new();
+        for entry in parse_file_list(&content) {
+            // Wire-slash check (server paths are Unix-absolute): the client's
+            // own Path::is_absolute would apply local drive rules instead.
+            if !entry.starts_with('/') {
+                anyhow::bail!("remote --files-from entries must be absolute paths, got '{entry}'");
+            }
+            paths.push(entry);
+        }
+        if paths.is_empty() {
+            anyhow::bail!("--files-from list is empty");
+        }
+        options.remote_paths = paths;
+    }
+
     // `--list-only`: print the source listing without transferring. The
     // destination is parsed (the CLI mirrors rsync, which also takes one) but
-    // unused; only a local source is supported — a remote listing needs the
-    // server's manifest round-trip, which is the remote-side expansion gap.
+    // unused. A local source scans in place; a remote source rides a
+    // `ListRequest` round-trip over the same transport the pull uses.
     if cli.list_only {
         return match src {
             Location::Local(src_path) => {
@@ -215,9 +244,27 @@ pub async fn execute(cli: &mut Cli) -> Result<()> {
                 }
                 Ok(())
             }
-            Location::Remote(_) => Err(anyhow::anyhow!(
-                "--list-only on a remote source is not supported yet; it needs the server's manifest round-trip"
-            )),
+            Location::Remote(remote) => {
+                let stats = list_via_ssh(
+                    &remote,
+                    &options.remote_path,
+                    &options,
+                    cli.remote_path.as_deref(),
+                    cli.binaries_dir.as_deref(),
+                    !cli.no_auto_install,
+                    cli.quiet,
+                    &mut client,
+                    jump.as_ref(),
+                )
+                .await?;
+                if !cli.quiet {
+                    println!("Listing {}:", &remote);
+                }
+                for e in &stats.changes {
+                    println!("{} {:>12} {}", e.kind, e.size, e.path);
+                }
+                Ok(())
+            }
         };
     }
 
@@ -892,6 +939,95 @@ pub(crate) async fn pull_over_ssh(
         .map_err(anyhow::Error::new);
     drop(executor);
     handle.finish(result).await
+}
+
+/// List over the chosen transport to an already-resolved remote (platform
+/// probed, binary ensured).
+pub(crate) async fn list_over_ssh(
+    remote: &RemoteTarget,
+    remote_path: &str,
+    options: &ExecutorOptions,
+    os: &str,
+    client: &mut RemoteClient,
+    jump: Option<&JumpHost>,
+) -> anyhow::Result<SyncStats> {
+    let session = client.open_session(remote, remote_path, os, &server_args(options).join(" "), jump).await?;
+    let (send, recv, mut handle) = session.into_parts();
+    let mut executor = Executor::new(send, recv);
+
+    let result = executor
+        .list(remote_path, options)
+        .await
+        .map_err(anyhow::Error::new);
+    drop(executor);
+    handle.finish(result).await
+}
+
+/// Ensure the server has a matching `cp2` binary (unless disabled), then list
+/// a remote path without transferring (`--list-only` on a remote source).
+#[expect(clippy::too_many_arguments)]
+async fn list_via_ssh(
+    remote: &RemoteTarget,
+    remote_path: &str,
+    options: &ExecutorOptions,
+    user_remote_path: Option<&str>,
+    binaries_dir: Option<&Path>,
+    auto_install: bool,
+    quiet: bool,
+    client: &mut RemoteClient,
+    jump: Option<&JumpHost>,
+) -> anyhow::Result<SyncStats> {
+    let server_args = server_args(options).join(" ");
+    match ensure_and_open(
+        remote,
+        user_remote_path,
+        binaries_dir,
+        auto_install,
+        quiet,
+        &server_args,
+        client,
+        jump,
+    )
+    .await?
+    {
+        Ensured::Merged {
+            os,
+            arch,
+            remote_path,
+            session,
+        } => {
+            run_session_with_deploy(
+                session,
+                &server_args,
+                auto_install,
+                quiet,
+                remote,
+                &os,
+                &arch,
+                &remote_path,
+                binaries_dir,
+                client,
+                jump,
+                |send, recv| {
+                    let remote_path = remote_path.clone();
+                    let options = options.clone();
+                    async move {
+                        let mut executor = Executor::new(send, recv);
+                        let result = executor
+                            .list(&remote_path, &options)
+                            .await
+                            .map_err(anyhow::Error::new);
+                        drop(executor);
+                        result
+                    }
+                },
+            )
+            .await
+        }
+        Ensured::Classic { os, .. } => {
+            list_over_ssh(remote, remote_path, options, &os, client, jump).await
+        }
+    }
 }
 
 /// Detect the remote platform and the remote binary's version in a single

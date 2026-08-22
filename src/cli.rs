@@ -62,7 +62,7 @@ pub struct Cli {
     pub quiet: bool,
 
     /// List the source files without transferring (rsync --list-only).
-    /// Local sources only in this version; SRC is listed, DST is unused.
+    /// Works for local and remote sources; SRC is listed, DST is unused.
     #[arg(long, help_heading = "Transfer")]
     pub list_only: bool,
 

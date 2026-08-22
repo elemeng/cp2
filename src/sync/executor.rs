@@ -18,9 +18,9 @@ use crate::sync::planner::{Planner, PlannerConfig};
 use crate::sync::receiver::Receiver;
 use crate::sync::scanner::{Manifest, ScanOptions, Scanner};
 use crate::sync::sender::Sender;
-use crate::sync::stats::SyncStats;
+use crate::sync::stats::{ItemizeAction, ItemizeEntry, SyncStats};
 use crate::sync::strategy::optimal_thread_count;
-use crate::sync::wire::{from_peer, manifest_from_file_meta};
+use crate::sync::wire::{file_meta_from_entry, from_peer, manifest_from_file_meta};
 use crate::{Error, Result};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 
@@ -143,6 +143,10 @@ pub struct ExecutorOptions {
     /// `/` = absolute, otherwise relative to the serve root. Set by the CLI
     /// from the `path` in `user@host:path`.
     pub remote_path: String,
+    /// Multiple remote paths for a `--files-from` pull (each an absolute
+    /// server path, mirroring the local files-from layout). Empty for a
+    /// normal single-path pull.
+    pub remote_paths: Vec<String>,
     /// Keep partial files at the destination when a transfer aborts
     /// (rsync `-P`); the next run delta-resumes against them.
     pub partial: bool,
@@ -276,8 +280,17 @@ fn scanner_options(
 /// The pull-request frame for the run options; `watch`/`watch_delay_ms` are
 /// the only fields the one-shot and server-driven watch pulls differ on.
 fn pull_request(options: &ExecutorOptions, watch: bool, watch_delay_ms: u32) -> Frame {
+    // A `--files-from` pull carries multiple absolute paths (mirrored under
+    // the destination from the filesystem root); a normal pull sends the one
+    // `user@host:path` (with its trailing-slash `include_root` flag). Globs
+    // in a single path are expanded by the server.
+    let (paths, include_root) = if options.remote_paths.is_empty() {
+        (vec![options.remote_path.clone()], crate::sync::scanner::include_root_component(&options.remote_path))
+    } else {
+        (options.remote_paths.clone(), false)
+    };
     Frame::PullRequest {
-        path: options.remote_path.clone(),
+        paths,
         excludes: options.exclude.clone(),
         includes: options.include.clone(),
         checksum: options.checksum,
@@ -291,10 +304,7 @@ fn pull_request(options: &ExecutorOptions, watch: bool, watch_delay_ms: u32) -> 
         compress: options.compress,
         bwlimit: options.bwlimit,
         client_os: options.target_os,
-        // rsync trailing-slash semantics for the remote source: a no-slash
-        // path (`user@host:dir`) recreates `dir` at the client's destination;
-        // a trailing slash (`user@host:dir/`) takes the contents only.
-        include_root: crate::sync::scanner::include_root_component(&options.remote_path),
+        include_root,
     }
 }
 
@@ -319,6 +329,7 @@ impl Default for ExecutorOptions {
             itemize: false,
             fsync: false,
             remote_path: String::new(),
+            remote_paths: Vec::new(),
             partial: true,
             rollsum: false,
             quiet: false,
@@ -495,6 +506,8 @@ pub async fn push_multi(
                 existing: options.existing,
                 ignore_times: options.ignore_times,
                 size_only: !options.preserve_times,
+                preserve_perms: options.preserve_perms,
+                preserve_times: options.preserve_times,
             });
             let source_manifest = manifest_from_file_meta(&source_files);
             planner.plan(&source_manifest, &dest_manifest).itemize()
@@ -519,6 +532,57 @@ pub async fn push_multi(
         );
 
         Ok(stats)
+    }
+
+    /// List a remote path without transferring (`--list-only` on a remote
+    /// source): handshake, send a [`Frame::ListRequest`], and return the
+    /// server's listing as change entries (a `Skip` itemize line per entry,
+    /// with the file size attached, so the report path and storage work
+    /// unchanged).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on transport, I/O, or protocol failure.
+    pub async fn list(
+        &mut self,
+        remote_path: &str,
+        options: &ExecutorOptions,
+    ) -> Result<SyncStats> {
+        let start = Instant::now();
+        let mut ctrl_send = self.send.as_mut();
+        let mut ctrl_recv = self.recv.as_mut();
+        handshake::client(&mut ctrl_send, &mut ctrl_recv).await?;
+
+        stream::send_frame(
+            &mut ctrl_send,
+            &Frame::ListRequest {
+                path: remote_path.to_string(),
+                excludes: options.exclude.clone(),
+                includes: options.include.clone(),
+            },
+        )
+        .await?;
+
+        let file_list = match stream::receive_frame(&mut ctrl_recv).await? {
+            Frame::ListResponse { file_list } => file_list,
+            Frame::Error { message } => return Err(Error::Other(format!("Peer error: {message}"))),
+            other => return Err(Error::Other(format!("Expected ListResponse, got {other:?}"))),
+        };
+        let changes = file_list
+            .iter()
+            .map(|m| {
+                let kind = crate::sync::stats::kind_letter(m.kind, m.link_target.is_some());
+                ItemizeEntry::new(ItemizeAction::Skip, m.path.clone(), kind).with_size(m.size)
+            })
+            .collect::<Vec<_>>();
+        Ok(SyncStats {
+            files_sent: 0,
+            files_received: 0,
+            bytes_transferred: 0,
+            duration: start.elapsed(),
+            changes,
+            skipped: Vec::new(),
+        })
     }
 
     /// Pull repeatedly over one session, driven by the server: the server
@@ -652,7 +716,7 @@ pub async fn push_multi(
             }
             // Pull: the peer asks for a tree; we are the sender.
             Frame::PullRequest {
-                path,
+                paths,
                 excludes,
                 includes,
                 checksum,
@@ -668,7 +732,6 @@ pub async fn push_multi(
                 client_os,
                 include_root,
             } => {
-                let source_root = resolve_serve_path(root, &path)?;
                 // The client's options (filters, decision flags, compression,
                 // bandwidth) apply to the tree we send. Struct-update keeps
                 // the frame-owned exclude/include lists instead of cloning the
@@ -690,11 +753,18 @@ pub async fn push_multi(
                     include_root_component: include_root,
                     ..options.clone()
                 };
+                // A single non-glob path keeps the classic single-root scan
+                // (its trailing-slash `include_root` semantics travel in the
+                // frame). Multiple paths (remote `--files-from`) and globs
+                // are expanded and merged under a base, like the source side
+                // of `push_multi`.
+                let classic = paths.len() == 1 && !remote_glob_needs_expansion(root, &paths[0])?;
                 if watch {
                     // Server-driven pull-watch: watch the source tree and run
                     // an incremental cycle per change burst until the client
                     // disconnects.
                     let delay = Duration::from_millis(u64::from(watch_delay_ms));
+                    let source_root = resolve_serve_path(root, &paths[0])?;
                     return serve_watch_pull(
                         &mut ctrl_send,
                         &mut ctrl_recv,
@@ -704,16 +774,41 @@ pub async fn push_multi(
                     )
                     .await;
                 }
-                let source_manifest = scan_tree(&source_root, &pull_options, true).await?;
-                tracing::info!(
-                    "serve pull: {} files from {}",
-                    source_manifest.len(),
-                    source_root.display()
-                );
+                let (source_manifest, manifest_root) = if classic {
+                    let source_root = resolve_serve_path(root, &paths[0])?;
+                    tracing::info!(
+                        "serve pull: {} from {}",
+                        if source_root.is_dir() { "dir" } else { "path" },
+                        source_root.display()
+                    );
+                    let manifest = scan_tree(&source_root, &pull_options, true).await?;
+                    (manifest, source_root)
+                } else {
+                    let (base, roots) = resolve_pull_roots(root, &paths)?;
+                    tracing::info!(
+                        "serve pull: {} roots under {}",
+                        roots.len(),
+                        base.display()
+                    );
+                    let filter = Some(crate::sync::FilterSet {
+                        includes: pull_options.include.clone(),
+                        excludes: pull_options.exclude.clone(),
+                    });
+                    let scanner = Scanner::new(scanner_options(
+                        &pull_options,
+                        &base,
+                        filter,
+                        true,
+                        !pull_options.preserve_perms,
+                        None,
+                    ));
+                    let manifest = scanner.scan_multi(&base, &roots).await?;
+                    (manifest, base)
+                };
                 let sender = Sender::new(
                     pull_options.bwlimit,
                     options.progress.clone(),
-                    resolve_apply_jobs(&pull_options, &source_root),
+                    resolve_apply_jobs(&pull_options, &manifest_root),
                     pull_options.remove_source_files || pull_options.verify,
                     pull_options.rollsum,
                     // The pull sender runs on the serve side; its stats (and
@@ -721,10 +816,10 @@ pub async fn push_multi(
                     // itemize entries from the file list it receives.
                     false,
                 );
-                // Read source files against *the manifest's* root, not the
-                // literal serve path: with `include_root` (a no-slash remote
-                // path) the scanner re-homes entries under the parent, so
-                // joining against `source_root` would double the directory.
+                // Read source files against *the manifest's* root, not a
+                // literal path: with `include_root` (a no-slash remote path)
+                // the scanner re-homes entries under the parent, and a merged
+                // multi-root scan names entries relative to its base.
                 let mut stats = sender
                     .send(
                         &mut ctrl_send,
@@ -737,10 +832,35 @@ pub async fn push_multi(
                 stats.duration = start.elapsed();
                 stats
             }
+            // Remote `--list-only`: scan the requested path (with the client's
+            // filters) and reply with the listing; no transfer.
+            Frame::ListRequest {
+                path,
+                excludes,
+                includes,
+            } => {
+                let source_root = resolve_serve_path(root, &path)?;
+                let list_options = ExecutorOptions {
+                    exclude: excludes,
+                    include: includes,
+                    ..options.clone()
+                };
+                let manifest = scan_tree(&source_root, &list_options, true).await?;
+                let file_list = manifest
+                    .files
+                    .iter()
+                    .map(file_meta_from_entry)
+                    .collect::<Vec<_>>();
+                stream::send_frame(&mut ctrl_send, &Frame::ListResponse { file_list }).await?;
+                SyncStats {
+                    duration: start.elapsed(),
+                    ..SyncStats::default()
+                }
+            }
             Frame::Error { message } => return Err(Error::Other(format!("Peer error: {message}"))),
             other => {
                 return Err(Error::Other(format!(
-                    "Expected IndexRequest or PullRequest, got {other:?}"
+                    "Expected IndexRequest, PullRequest, or ListRequest, got {other:?}"
                 )));
             }
         };
@@ -1044,6 +1164,108 @@ fn sanitize_join(root: &Path, rel: &str) -> Result<std::path::PathBuf> {
     sanitizer
         .join(rel)
         .map_err(|e| Error::Other(format!("Unsafe path '{rel}': {e}")))
+}
+
+/// Whether `s` contains a glob metacharacter (`*`, `?`, or `[`).
+fn has_glob_metachars(s: &str) -> bool {
+    s.contains(['*', '?', '['])
+}
+
+/// Whether a remote pull path must be glob-expanded server-side: it contains
+/// metacharacters and the literal resolved path does not exist (a literal
+/// path always wins — the escape hatch for names that contain `*`/`?`/`[`,
+/// mirroring the source-side `expand_source`).
+fn remote_glob_needs_expansion(root: &Path, pattern: &str) -> Result<bool> {
+    if !has_glob_metachars(pattern) {
+        return Ok(false);
+    }
+    let literal = resolve_serve_path(root, pattern)?;
+    Ok(!literal.exists())
+}
+
+/// Resolve a multi-path pull (`--files-from`, or a glob) into `(base, roots)`
+/// for a merged `scan_multi` scan.
+///
+/// - A single glob expands against the serve root (or its absolute prefix),
+///   exactly like the source side: the static prefix before the first
+///   metacharacter is the base, matches are named relative to it.
+/// - Multiple paths must be absolute server paths (mirroring the local
+///   `--files-from` layout) and share one filesystem root; entries are
+///   mirrored under the destination from that root.
+fn resolve_pull_roots(root: &Path, paths: &[String]) -> Result<(PathBuf, Vec<PathBuf>)> {
+    if paths.len() == 1 {
+        let (base, matches) = expand_remote_glob(root, &paths[0])?.ok_or_else(|| {
+            Error::Other(format!("no files match remote source pattern '{}'", paths[0]))
+        })?;
+        return Ok((base, matches));
+    }
+    let mut roots = Vec::with_capacity(paths.len());
+    for p in paths {
+        if !p.starts_with('/') {
+            return Err(Error::Other(
+                "remote --files-from entries must be absolute paths on the server".to_string(),
+            ));
+        }
+        roots.push(resolve_serve_path(root, p)?);
+    }
+    // All entries must live under one filesystem root (the local
+    // `--files-from` rule), so the merged plan has a single base.
+    let base = path_root(&roots[0]);
+    if roots.iter().any(|r| !r.starts_with(&base)) {
+        return Err(Error::Other(
+            "remote --files-from entries must be on the same filesystem root".to_string(),
+        ));
+    }
+    Ok((base, roots))
+}
+
+/// The filesystem root of an absolute path: `/` on Unix, the drive root
+/// (`C:\`) on Windows.
+fn path_root(path: &Path) -> PathBuf {
+    path.ancestors()
+        .last()
+        .map_or_else(|| PathBuf::from("/"), Path::to_path_buf)
+}
+
+/// Expand a remote glob pattern (serve-root-relative or absolute) into
+/// `(base, matches)` — the server mirror of the source-side `expand_source`.
+///
+/// Returns `Ok(None)` when the pattern has no metacharacters or names a path
+/// that literally exists (the caller then treats it as a plain single path).
+fn expand_remote_glob(root: &Path, pattern: &str) -> Result<Option<(PathBuf, Vec<PathBuf>)>> {
+    if !has_glob_metachars(pattern) {
+        return Ok(None);
+    }
+    let literal = resolve_serve_path(root, pattern)?;
+    if literal.exists() {
+        return Ok(None);
+    }
+    // The base: the text before the first metachar, up to the last separator.
+    let meta_at = pattern.find(['*', '?', '[']).unwrap_or(pattern.len());
+    let prefix = &pattern[..meta_at];
+    let base_str = match prefix.rfind(['/', '\\']) {
+        Some(idx) => &prefix[..idx],
+        None => "",
+    };
+    let base_path = if base_str.is_empty() || base_str == "." {
+        root.to_path_buf()
+    } else if base_str.starts_with('/') {
+        PathBuf::from(base_str)
+    } else {
+        sanitize_join(root, base_str)?
+    };
+    // The glob fragment relative to the base (from the first metachar on).
+    let joined = base_path.join(&pattern[meta_at..]);
+    let matches = glob::glob(&joined.to_string_lossy())
+        .map_err(|e| Error::Other(format!("invalid glob pattern '{pattern}': {e}")))?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|e| Error::Other(format!("glob error for '{pattern}': {e}")))?;
+    if matches.is_empty() {
+        return Ok(None);
+    }
+    let mut matches = matches;
+    matches.sort();
+    Ok(Some((base_path, matches)))
 }
 
 #[cfg(test)]

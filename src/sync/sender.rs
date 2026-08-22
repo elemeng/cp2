@@ -168,6 +168,8 @@ impl Sender {
             // `--no-times`: mtimes are not preserved, so the size+mtime quick
             // check would never agree — fall back to size-only (rsync).
             size_only: !options.preserve_times,
+            preserve_perms: options.preserve_perms,
+            preserve_times: options.preserve_times,
         });
         let plan = planner.plan(source_manifest, &dest_manifest);
         tracing::info!(
@@ -235,7 +237,27 @@ impl Sender {
             }
         }
 
-        stream::send_frame(ctrl_send, &Frame::Done { files, bytes }).await?;
+        // Metadata-only updates: content-matched files whose attributes
+        // drifted — the receiver re-applies the source mode/mtime/owner from
+        // the manifest it already holds (no bytes move).
+        let meta_paths: Vec<String> = plan
+            .meta
+            .iter()
+            .map(|task| wire_rel(&task.relative_path))
+            .collect();
+        if !meta_paths.is_empty() {
+            stream::send_frame(ctrl_send, &Frame::ApplyMeta { paths: meta_paths }).await?;
+        }
+        // `--verify`/`--remove-source-files` hash every applied file, so a
+        // metadata-only apply counts as transferred for the totals, but its
+        // bytes are zero (usize → u64 is lossless on any real sync).
+        let meta_count = plan.meta.len() as u64;
+
+        stream::send_frame(ctrl_send, &Frame::Done {
+            files: files + meta_count,
+            bytes,
+        })
+        .await?;
 
         // Wait for the receiver to acknowledge before the transfer can end.
         let (recv_skipped, recv_hashes) = match from_peer(stream::receive_frame(ctrl_recv).await?)? {
@@ -346,7 +368,7 @@ impl Sender {
 
         // Counts cannot exceed usize on any real sync.
         #[expect(clippy::cast_possible_truncation)]
-        let files_sent = files as usize;
+        let files_sent = (files + meta_count) as usize;
         Ok(SyncStats {
             files_sent,
             files_received: 0,

@@ -226,14 +226,14 @@ checksum.
 | `--backup` | `--backup` | Keep the replaced destination as `<name>~` |
 | `--remove-source-files` | `--remove-source-files` | Delete source files only after the destination is **hash-verified and fsynced** (BLAKE3 compare, per-file fsync, size+mtime re-checks both sides; move-off workflows; directories and symlinks are kept) |
 | `--verify` | — | Verify the destination bytes match the source after the transfer (BLAKE3 on the fly, no re-reads; mismatches → exit 23, nothing deleted) |
-| `--files-from FILE` | `--files-from` | Sync only the listed **absolute** paths (one per line, Unix or Windows line endings), mirrored under DST; relative entries rejected; SRC not used (`cp2 --files-from FILE DST`) |
+| `--files-from FILE` | `--files-from` | Sync only the listed **absolute** paths (one per line, Unix or Windows line endings), mirrored under DST; relative entries rejected; SRC not used (`cp2 --files-from FILE DST`). On a remote pull the entries are server-absolute paths |
 | `--exclude GLOB` | `--exclude` | Exclude matching paths (repeatable) |
 | `--include GLOB` | `--include` | Include matching paths (repeatable) |
 | `--exclude-from FILE` | `--exclude-from` | Read additional exclude patterns from FILE (one per line; blank lines and `#`/`;` comments ignored) |
 | `--include-from FILE` | `--include-from` | Read additional include patterns from FILE (same format) |
-| `-i, --itemize-changes` | `-i` | Print a per-file change line: `>f`/`cd` new, `>f.s` updated, `*deleting` removed, `.f` in-sync (rsync `-i`; covers push/local out of the plan, pull from the reproduced plan) |
+| `-i, --itemize-changes` | `-i` | Print a per-file change line: `>f`/`cd` new, `>f.s` updated, `*deleting` removed, `.f` in-sync (rsync `-i`; covers push/local out of the plan, pull from the reproduced plan). A chmod'ed in-sync file is re-applied as an attribute-only update and shows as `>f.s` with zero bytes |
 | `--stats` | `--stats` | Print a detailed statistics block (files, bytes, time, skipped) after the summary |
-| `--list-only` | `--list-only` | List the source files without transferring (local sources; remote needs the manifest round-trip and is not yet wired) |
+| `--list-only` | `--list-only` | List the source files without transferring (local and remote sources) |
 | `-j, --jobs N` | — | Parallel transfer + hash workers; omitted = auto-tuned from the target storage class |
 | `--storage auto\|hdd\|ssd` | — | Storage class for auto-tuning: detect on Linux/Windows/macOS (default), or force HDD/SSD |
 | `-z, --compress` | `-z` | Compress the data stream (lz4) |

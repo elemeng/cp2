@@ -24,6 +24,9 @@ pub enum SyncAction {
     Update,
     /// File exists in destination but not source.
     Delete,
+    /// Content is in sync but the metadata (mode, mtime) drifted — re-apply
+    /// the source attributes without transferring anything.
+    MetaOnly,
 }
 
 /// A single planned operation.
@@ -68,6 +71,9 @@ pub struct SyncPlan {
     pub deletes: Vec<SyncTask>,
     /// Files that are already in sync.
     pub skips: Vec<SyncTask>,
+    /// Content in sync but metadata drifted (mode/mtime): the sender re-applies
+    /// the source attributes without transferring content.
+    pub meta: Vec<SyncTask>,
 }
 
 impl SyncPlan {
@@ -79,15 +85,19 @@ impl SyncPlan {
     }
 
     /// Per-file change entries for `--itemize-changes` (`-i`): the creates,
-    /// updates, and in-sync skips. Deletes are appended by the caller once its
-    /// `--delete` policy filter has decided which paths actually go (the plan's
-    /// deletes include ones the sender drops as policy-skipped).
+    /// updates, metadata-only re-applies, and in-sync skips. Deletes are
+    /// appended by the caller once its `--delete` policy filter has decided
+    /// which paths actually go (the plan's deletes include ones the sender
+    /// drops as policy-skipped).
     #[must_use]
     pub fn itemize(&self) -> Vec<ItemizeEntry> {
-        let mut v =
-            Vec::with_capacity(self.creates.len() + self.updates.len() + self.skips.len());
+        let mut v = Vec::with_capacity(
+            self.creates.len() + self.updates.len() + self.meta.len() + self.skips.len(),
+        );
         v.extend(self.creates.iter().map(|t| itemize_entry(ItemizeAction::Create, t)));
         v.extend(self.updates.iter().map(|t| itemize_entry(ItemizeAction::Update, t)));
+        // A metadata-only re-apply is an update in the itemize sense.
+        v.extend(self.meta.iter().map(|t| itemize_entry(ItemizeAction::Update, t)));
         v.extend(self.skips.iter().map(|t| itemize_entry(ItemizeAction::Skip, t)));
         v
     }
@@ -139,6 +149,12 @@ pub struct PlannerConfig {
     pub ignore_times: bool,
     /// Remove destination files not present in source.
     pub delete: bool,
+    /// Re-apply permission bits to already-in-sync files whose mode drifted
+    /// (the `rlpt` core is on by default; off with `--no-perms`).
+    pub preserve_perms: bool,
+    /// Re-apply mtimes to already-in-sync files whose time drifted (off with
+    /// `--no-times`, which also flips `size_only`).
+    pub preserve_times: bool,
 }
 
 /// Pure planner: source manifest × destination manifest → [`SyncPlan`].
@@ -224,7 +240,22 @@ impl Planner {
                     let action = self.compare(src, dst_entry);
                     match action {
                         SyncAction::Skip => {
-                            plan.skips.push(Self::task_for(src, SyncAction::Skip));
+                            // Content in sync: a drift in the preserved
+                            // attributes still needs a metadata-only pass
+                            // (rsync's attr-only transfer — a `chmod` or
+                            // `--checksum`-matched time drift on an otherwise
+                            // identical file). Regular content files only:
+                            // dirs are existence-only, links' mtime is part of
+                            // their compare, specials are contentless.
+                            if !src.is_dir
+                                && src.link_target.is_none()
+                                && !Self::is_special(src.kind)
+                                && self.attrs_differ(src, dst_entry)
+                            {
+                                plan.meta.push(Self::task_for(src, SyncAction::MetaOnly));
+                            } else {
+                                plan.skips.push(Self::task_for(src, SyncAction::Skip));
+                            }
                         }
                         SyncAction::Update => {
                             let task = Self::task_for(src, SyncAction::Update);
@@ -314,6 +345,18 @@ impl Planner {
     /// drift means the file changed.
     fn times_match(src: &FileEntry, dst: &FileEntry) -> bool {
         src.mtime_sec == dst.mtime_sec && src.mtime_nsec == dst.mtime_nsec
+    }
+
+    /// Whether a content-matched file still needs a metadata-only update: the
+    /// permission bits drift (under `--perms`) or the mtime drifts (under
+    /// `--times` — reachable when the quick check used `--checksum`).
+    fn attrs_differ(&self, src: &FileEntry, dst: &FileEntry) -> bool {
+        // Permission bits only: the destination scan records the raw `st_mode`
+        // (file-type bits included), the source scan the permission bits.
+        const PERM: u32 = 0o7777;
+        let perms = self.config.preserve_perms && (src.mode & PERM) != (dst.mode & PERM);
+        let times = self.config.preserve_times && !Self::times_match(src, dst);
+        perms || times
     }
 
     /// Whether the destination entry already holds the source's content — the
@@ -479,6 +522,67 @@ mod tests {
         let dst = manifest(vec![entry("a.txt", 10, 100, None)]);
         let plan = Planner::default().plan(&src, &dst);
         assert_eq!(plan.updates.len(), 1);
+    }
+
+    #[test]
+    fn meta_only_on_mode_drift() {
+        // Content in sync (size+mtime match) but the destination's perms
+        // drifted — the planner must emit a metadata-only task, not a skip.
+        let mut dst = entry("a.txt", 10, 100, None);
+        dst.mode = 0o600 | 0o100_000; // raw st_mode with file-type bits
+        let src = manifest(vec![entry("a.txt", 10, 100, None)]);
+        let dst_manifest = manifest(vec![dst]);
+        let plan = Planner::new(PlannerConfig {
+            delete: true,
+            preserve_perms: true,
+            preserve_times: true,
+            ..PlannerConfig::default()
+        })
+        .plan(&src, &dst_manifest);
+        assert_eq!(plan.meta.len(), 1, "mode drift must be a meta task: {plan:?}");
+        assert_eq!(plan.skips.len(), 0);
+        assert_eq!(plan.meta[0].action, SyncAction::MetaOnly);
+        // File-type bits in the raw st_mode must not count as a drift.
+        let mut same = dst_manifest.clone();
+        same.files[0].mode = 0o644 | 0o100_000;
+        let plan2 = Planner::new(PlannerConfig {
+            preserve_perms: true,
+            ..PlannerConfig::default()
+        })
+        .plan(&src, &same);
+        assert_eq!(plan2.meta.len(), 0, "type bits are not a perm drift");
+        assert_eq!(plan2.skips.len(), 1);
+    }
+
+    #[test]
+    fn no_meta_without_preserve_perms() {
+        // `--no-perms`: a mode drift is deliberately ignored.
+        let mut dst = entry("a.txt", 10, 100, None);
+        dst.mode = 0o600;
+        let src = manifest(vec![entry("a.txt", 10, 100, None)]);
+        let dst_manifest = manifest(vec![dst]);
+        let plan = Planner::default().plan(&src, &dst_manifest);
+        assert!(plan.meta.is_empty());
+        assert_eq!(plan.skips.len(), 1);
+    }
+
+    #[test]
+    fn meta_only_on_checksum_time_drift() {
+        // `--checksum` with equal hashes but a drifted mtime: content matches,
+        // times preserved — a metadata-only task (rsync re-applies the time).
+        let h = Some([7u8; 32]);
+        let mut dst = entry("a.txt", 10, 200, h);
+        dst.mtime_nsec = 5;
+        let src = manifest(vec![entry("a.txt", 10, 100, h)]);
+        let dst_manifest = manifest(vec![dst]);
+        let plan = Planner::new(PlannerConfig {
+            checksum: true,
+            preserve_times: true,
+            ..PlannerConfig::default()
+        })
+        .plan(&src, &dst_manifest);
+        assert_eq!(plan.meta.len(), 1);
+        assert!(plan.updates.is_empty(), "content matches — no transfer");
     }
 
     #[test]

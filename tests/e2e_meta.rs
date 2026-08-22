@@ -500,3 +500,46 @@ async fn nanosecond_mtime_preserved_by_default_and_archive() {
     assert_eq!(stats.files_sent, 0, "a second default run must skip the file");
 }
 
+
+#[tokio::test]
+async fn metadata_only_update_applies_drifted_mode() {
+    // rsync's attr-only transfer: an in-sync file whose perms were chmod'ed
+    // gets its mode re-applied without any content bytes moving, and an
+    // unchanged third run is a clean skip (no churn).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        tokio::fs::write(src.path().join("doc.txt"), b"v1")
+            .await
+            .unwrap();
+        push_tree(src.path(), dst.path(), &default_options()).await;
+        let before = std::fs::metadata(dst.path().join("doc.txt"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+
+        // Drift the source's perms; the re-sync must re-apply them.
+        std::fs::set_permissions(
+            src.path().join("doc.txt"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        let stats = push_tree(src.path(), dst.path(), &default_options()).await;
+        assert_eq!(stats.files_sent, 1, "chmod'ed in-sync file re-applied");
+        assert_eq!(stats.bytes_transferred, 0, "no content bytes moved");
+        let after = std::fs::metadata(dst.path().join("doc.txt"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(after, 0o600, "mode must be re-applied from the source");
+        assert_ne!(after, before);
+
+        // No churn: an unchanged run transfers nothing.
+        let stats = push_tree(src.path(), dst.path(), &default_options()).await;
+        assert_eq!(stats.files_sent, 0, "unchanged run must not re-apply");
+    }
+}

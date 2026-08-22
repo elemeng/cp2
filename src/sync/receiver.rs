@@ -235,6 +235,9 @@ impl Receiver {
                         Frame::DeleteRequest { paths } => {
                             self.handle_delete_request(&mut state, paths).await?;
                         }
+                        Frame::ApplyMeta { paths } => {
+                            self.handle_apply_meta(&mut state, paths).await?;
+                        }
                         Frame::Done { files, bytes } => {
                             if self
                                 .handle_done(&mut state, ctrl_send, files, bytes)
@@ -833,6 +836,54 @@ impl Receiver {
                     tracing::warn!("skipping hard link {display_path}: {e}");
                     state.skipped.push(SkippedFile::new(rel.clone(), e.to_string()));
                 }
+            }
+        }
+        Ok(())
+    }
+
+    /// Apply a metadata-only update (`ApplyMeta`): re-apply each listed path's
+    /// source metadata (mode, mtime, owner, xattrs) from the manifest already
+    /// held, without rewriting content. A missing manifest entry or a missing/
+    /// unwritable destination skips the file like any other apply failure.
+    async fn handle_apply_meta(&self, state: &mut ApplyState, paths: Vec<String>) -> Result<()> {
+        // In-flight applies are joined like the delete path: a metadata apply
+        // must see settled files, not a staged temp still awaiting rename.
+        drain_applies(state).await?;
+        let cfg = self.apply_cfg();
+        for rel in paths {
+            let path = match self.safe_join(&rel) {
+                Ok(p) => p,
+                Err(e) => {
+                    state
+                        .skipped
+                        .push(SkippedFile::new(rel.clone(), e.to_string()));
+                    continue;
+                }
+            };
+            let Some(meta) = state.meta_map.get(&rel).cloned() else {
+                state.skipped.push(SkippedFile::new(
+                    rel.clone(),
+                    "no source metadata for metadata-only update".to_string(),
+                ));
+                continue;
+            };
+            let p = path.clone();
+            match tokio::task::spawn_blocking(move || apply_source_meta_sync(&p, &meta, cfg))
+                .await
+            {
+                Ok(Ok(())) => {
+                    state.files_received += 1;
+                    // The renamed-dirs sync pass only tracks content renames;
+                    // a metadata apply dirties no new directory entry, so
+                    // `renamed_dirs` is left untouched.
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!("skipping metadata update {}: {e}", path.display());
+                    state
+                        .skipped
+                        .push(SkippedFile::new(rel.clone(), e.to_string()));
+                }
+                Err(e) => return Err(Error::Other(format!("Meta task panicked: {e}"))),
             }
         }
         Ok(())

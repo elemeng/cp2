@@ -125,8 +125,11 @@ pub enum Frame {
     /// The client asks the server to send the directory at `path`; the server
     /// then plays the "sender" role (`IndexRequest` → `IndexResponse` → recipes).
     PullRequest {
-        /// Remote path to send (must be under the server's root).
-        path: String,
+        /// Remote path(s) to send (each must be under the server's root, or
+        /// an absolute server path). A single non-glob path behaves exactly
+        /// like the former `path` field; multiple paths (remote `--files-from`)
+        /// or a glob are expanded and merged by the server.
+        paths: Vec<String>,
         /// Client-side exclude globs, applied by the server to its source scan.
         excludes: Vec<String>,
         /// Client-side include globs, overriding `excludes`.
@@ -163,6 +166,21 @@ pub enum Frame {
         /// its contents taken only (`user@host:dir/` → `DST/*`).
         include_root: bool,
     },
+
+    /// List a remote path without transferring (`--list-only` on a remote
+    /// source): the server scans the resolved path (with the client's
+    /// include/exclude filters) and replies with [`Frame::ListResponse`].
+    ListRequest {
+        /// Remote path to list (serve-root-relative or absolute).
+        path: String,
+        /// Client-side exclude globs applied to the listing scan.
+        excludes: Vec<String>,
+        /// Client-side include globs overriding `excludes`.
+        includes: Vec<String>,
+    },
+    /// The server's listing for a [`Frame::ListRequest`]: the scanned entries
+    /// (paths relative to the scan root, with sizes and kinds).
+    ListResponse { file_list: Vec<FileMeta> },
 
     /// A delta recipe for one file. The delta carries literal bytes inline,
     /// so no separate data stream is needed.
@@ -251,6 +269,12 @@ pub enum Frame {
         /// Relative paths to remove.
         paths: Vec<String>,
     },
+
+    /// Metadata-only update: re-apply the source metadata (mode, mtime,
+    /// owner, xattrs) of the listed paths from the manifest the receiver
+    /// already holds. The content is in sync — nothing is transferred or
+    /// rewritten on disk (rsync's attribute-only transfer).
+    ApplyMeta { paths: Vec<String> },
 
     /// Sender signals completion.
     Done {
@@ -557,7 +581,7 @@ mod tests {
                 paths: vec!["a.bin".to_string()],
             },
             Frame::PullRequest {
-                path: "/backup".to_string(),
+                paths: vec!["/backup".to_string()],
                 excludes: vec![],
                 includes: vec![],
                 checksum: false,
@@ -573,6 +597,12 @@ mod tests {
                 client_os: TargetOs::Unix,
                 include_root: true,
             },
+            Frame::ListRequest {
+                path: "/backup".to_string(),
+                excludes: vec!["*.tmp".to_string()],
+                includes: vec![],
+            },
+            Frame::ListResponse { file_list: Vec::new() },
             Frame::CreateLinks {
                 links: vec![LinkSpec {
                     path: "link.txt".to_string(),

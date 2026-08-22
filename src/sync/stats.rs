@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use crate::protocol::SkippedFile;
+use crate::protocol::{FileKind, SkippedFile};
 
 /// What happened to one file, for `--itemize-changes` (`-i`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,6 +26,8 @@ pub struct ItemizeEntry {
     pub path: String,
     /// rsync file-type letter: `f` file, `d` dir, `L` symlink, `S` special.
     pub kind: char,
+    /// File size in bytes (remote listings set it; itemize lines leave 0).
+    pub size: u64,
 }
 
 impl ItemizeEntry {
@@ -33,7 +35,34 @@ impl ItemizeEntry {
     /// caller.
     #[must_use]
     pub fn new(action: ItemizeAction, path: String, kind: char) -> Self {
-        Self { action, path, kind }
+        Self {
+            action,
+            path,
+            kind,
+            size: 0,
+        }
+    }
+
+    /// Attach the file size (used by `--list-only` listings).
+    #[must_use]
+    pub fn with_size(mut self, size: u64) -> Self {
+        self.size = size;
+        self
+    }
+}
+
+/// rsync file-type letter for a [`FileMeta`]-shaped entry: `L` for links,
+/// `d` for directories, `S` for specials, `f` for regular files.
+pub(crate) fn kind_letter(kind: FileKind, is_link: bool) -> char {
+    if is_link {
+        'L'
+    } else {
+        match kind {
+            FileKind::Dir => 'd',
+            FileKind::File => 'f',
+            FileKind::Symlink => 'L',
+            _ => 'S',
+        }
     }
 }
 
