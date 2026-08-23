@@ -431,8 +431,7 @@ The **distribution tarball** (all platforms + `install.sh`) is built by the
 GitHub Actions workflow on a `v*` tag; `scripts/build-release.sh` does the
 same locally. See `scripts/` and `.github/workflows/release.yml`.
 
-Planned work lives in [`ROADMAP.md`](ROADMAP.md): v0.2 content-addressed
-dedup (`--dedup-host-ref`), v0.3 bidirectional sync.
+Planned work lives in [`ROADMAP.md`](ROADMAP.md).
 
 ## Changelog
 
