@@ -43,7 +43,7 @@ jwalk = "0.9"
 # sites).
 lnk = { version = "0.6", features = ["binwrite", "unstable-save"] }
 
-clap = { version = "4.6", features = ["derive", "cargo", "env"] }
+clap = { version = "4.6", features = ["derive"] }
 
 bytes = { version = "1.12", features = ["serde"] }
 base64 = "0.23"
@@ -70,9 +70,8 @@ windows-sys = { version = "0.61", features = [
 ] }
 # The russh transport (pure-Rust SSH client) replaces the system `ssh`
 # process on Windows, where OpenSSH's ControlMaster multiplexing is broken
-# (`getsockname failed: Not a socket` — every session dies). It is also the
-# transport mobile embeddings (iOS/Android) will use; those targets extend
-# this gate when they are built. Unix keeps the battle-tested system ssh.
+# (`getsockname failed: Not a socket` — every session dies). Unix keeps the
+# battle-tested system ssh.
 # The aws-lc-rs crypto backend is C-based: native Windows builds need the
 # MSVC C toolchain, and cross-building the windows-gnu sidecar needs a
 # mingw-w64 C compiler.
