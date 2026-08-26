@@ -313,23 +313,28 @@ over ssh at all**:
 
 The four-scenario results (1 GiB fresh/edit + 8192-file tree; destination
 bytes verified against each tool's edited source for the successful rows;
-per-tool runs bounded by a 300s timeout, rc recorded):
+per-tool runs bounded by a 300s timeout, rc recorded; re-run 2026-08-26
+after the delta-overlap work, which is why cp2's large-edit dropped from
+the earlier 2.53s):
 
 ```
 tool      large-first   large-edit  small-first   small-idle
-cp2             1.86s        2.53s        1.34s        0.65s
-rsync           2.07s        1.47s        1.61s        0.72s
-sy              2.49s        4.34s       12.14s        0.70s
-pxs             6.32s        1.17s        2.87s        1.50s
-ripsync         1.35s        1.35s        3.31s        0.71s  rc!=0: large-first, large-edit
+cp2             1.94s        1.78s        1.85s        0.64s
+rsync           2.08s        1.46s        1.67s        0.85s
+sy              2.42s        4.42s       12.21s        0.72s
+pxs             6.40s        0.97s        2.90s        1.54s
+ripsync         1.34s        1.36s        3.27s        0.71s  rc!=0: large-first, large-edit
 ```
 
-Reading them honestly: cp2 leads the small-file scenarios (1.34s/0.65s vs
-rsync 1.61s/0.72s); pxs has the fastest delta edit (1.17s, its integrity
-hashing makes it the slowest fresh transfer at 6.32s — 3.4x cp2); sy trails
-everywhere, 7-9x slower than cp2 on many small files. Localhost runs vary
-~±30% between runs even for the same tool — compare tools within a run, not
-across runs.
+Reading them honestly: cp2 leads the idle re-sync (0.64s vs rsync 0.85s)
+and stays within ~11% of rsync on the small-file first sync; the large-edit
+gap to rsync's rolling-checksum delta is down to ~22% (cp2's source
+chunking overlaps the basis signing). pxs has the fastest delta edit
+(0.97s, its integrity hashing makes it the slowest fresh transfer at 6.40s
+— 3.3x cp2); sy trails everywhere, ~6.6x slower than cp2 on many small
+files; ripsync cannot handle a >512 MiB file at all and is ~1.8x slower
+than cp2 on the small tree. Localhost runs vary ~±30% between runs even
+for the same tool — compare tools within a run, not across runs.
 
 The full benchmark suite — scripts, generated trees, and how to run it — is
 documented in [`ARCHITECTURE.md`](ARCHITECTURE.md).
