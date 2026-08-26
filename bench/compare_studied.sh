@@ -3,13 +3,13 @@
 # four-scenario harness as compare_test.sh (identical trees, warm cache,
 # per-tool logs, single host).
 #
-# Participants (from the README acknowledgments): sy, pxs, ripsync — the
-# only studied crates that actually sync over ssh. msy installs the `sy`
+# Participants (from the README acknowledgments): sy and pxs — the only
+# studied crates that actually sync over ssh. msy installs the `sy`
 # binary itself (same lineage, already on the list); sparsync needs a
 # serve/enroll/auth mesh; syncz wraps the system rsync; zsync-rs is an HTTP
-# delta client; robosync and rusync accept `user@host:path` but open no ssh
-# connection and deliver nothing (rc=0); copia is a library. cp2 and rsync
-# are the reference rows, measured in the same run.
+# delta client; robosync and rusync do not parse `user@host:path` (they copy
+# into a literal local directory of that name); copia is a library. cp2
+# and rsync are the reference rows, measured in the same run.
 #
 # Usage: bench/compare_studied.sh [--remote user@host] [--small-src DIR]
 #                                 [--large-mb 1024]
@@ -27,7 +27,7 @@ WORK="${WORK:-$(mktemp -d "$HOME/.cache/cp2-bench-studied.XXXXXX")}"
 # A studied tool that hangs (or a stale absolute path) must not stall the
 # whole harness: every run is bounded and its rc recorded.
 RUN_TIMEOUT="${RUN_TIMEOUT:-300}"
-read -r -a TOOLS <<< "${TOOLS:-cp2 rsync sy pxs ripsync}"
+read -r -a TOOLS <<< "${TOOLS:-cp2 rsync sy pxs}"
 # The exported `push_impl` runs in a `bash -c` child (bounded by `timeout`),
 # which does not see plain shell variables — the ones the dispatcher reads
 # must cross the process boundary explicitly.
@@ -38,7 +38,7 @@ if [ ! -x "$REPO/target/release/cp2" ]; then
 fi
 
 echo "== compare_studied: push over ssh to $REMOTE =="
-for t in sy pxs ripsync; do
+for t in sy pxs; do
     command -v "$t" >/dev/null || { echo "missing tool: $t (cargo install $t)" >&2; exit 1; }
 done
 
@@ -87,7 +87,6 @@ push_impl() { # tool src remote_dest
         rsync)   rsync -rlt "$src/" "$REMOTE:$rd/" ;;
         sy)      sy "$src" "$REMOTE:$rd" ;;
         pxs)     pxs sync "$src" "$REMOTE:$rd" ;;
-        ripsync) ripsync "$src" "$REMOTE:$rd" ;;
     esac
 }
 

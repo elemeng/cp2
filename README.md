@@ -297,12 +297,11 @@ investigation.)
 
 The sibling crates cp2's design was informed by were put through the same
 harness (`bench/compare_studied.sh`, same host and same run, 2026-08-26).
-The participation audit comes first — of the eight crates, **three can sync
+The participation audit comes first — of the eight crates, **two can sync
 over ssh at all**:
 
 | Tool | Verdict |
 |------|---------|
-| ripsync | syncs over ssh, but its protocol rejects frames ≥ 512 MiB — **fails (rc=1) on any single file that large**; only the small-tree rows below are valid |
 | pxs | syncs over ssh (integrity-first), no limits found |
 | sy | syncs over ssh; **msy ships the same `sy` binary** (plus `sy-scan`/`sy-remote`/`sy-bench-gen`) — the two are the same tool, already on the list |
 | syncz | goes over ssh but is a **wrapper around the system rsync** — benchmarking it is benchmarking rsync again |
@@ -323,7 +322,6 @@ cp2             1.94s        1.78s        1.85s        0.64s
 rsync           2.08s        1.46s        1.67s        0.85s
 sy              2.42s        4.42s       12.21s        0.72s
 pxs             6.40s        0.97s        2.90s        1.54s
-ripsync         1.34s        1.36s        3.27s        0.71s  rc!=0: large-first, large-edit
 ```
 
 Reading them honestly: cp2 leads the idle re-sync (0.64s vs rsync 0.85s)
@@ -332,9 +330,8 @@ gap to rsync's rolling-checksum delta is down to ~22% (cp2's source
 chunking overlaps the basis signing). pxs has the fastest delta edit
 (0.97s, its integrity hashing makes it the slowest fresh transfer at 6.40s
 — 3.3x cp2); sy trails everywhere, ~6.6x slower than cp2 on many small
-files; ripsync cannot handle a >512 MiB file at all and is ~1.8x slower
-than cp2 on the small tree. Localhost runs vary ~±30% between runs even
-for the same tool — compare tools within a run, not across runs.
+files. Localhost runs vary ~±30% between runs even for the same tool —
+compare tools within a run, not across runs.
 
 The full benchmark suite — scripts, generated trees, and how to run it — is
 documented in [`ARCHITECTURE.md`](ARCHITECTURE.md).
@@ -371,7 +368,6 @@ source headers, and their retained copyright lines live in [`NOTICE`](NOTICE).
 | librsync | MIT/Apache-2.0 | Delta-algorithm background (studied) |
 | rusync | BSD-3-Clause | rsync-style CLI/protocol study |
 | zsync-rs | MIT | rsync-compatible delta study |
-| ripsync | MIT OR Apache-2.0 | rsync-compatible sync study |
 | msy | MIT | Sync-pipeline study |
 | syncz | MIT | Sync-protocol study |
 
