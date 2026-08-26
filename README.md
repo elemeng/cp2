@@ -254,9 +254,7 @@ all platforms.
 
 Measured on a native Fedora 44 (x86_64, NVMe) machine, pushing over
 `ssh localhost` (1 MiB pipes on both ends; page cache warmed before each
-tool), from `bench/compare_test.sh` — cp2 vs rsync vs scp vs sy
-(2026-08-26). The 2026-07 numbers were measured on a WSL2 (Fedora 42) host,
-so compare scenarios across runs, not raw seconds:
+tool), from `bench/compare_test.sh` — cp2 vs rsync vs scp vs sy:
 
 ```
 tool      large-first   large-edit  small-first   small-idle
@@ -266,72 +264,30 @@ scp             2.26s        2.26s        3.98s        4.01s
 sy              2.59s        4.73s       14.29s        0.89s
 ```
 
-Reading the numbers honestly:
+### Mixed tree (≈10 GiB, 100 K files)
 
-- **Large first sync:** all three tools cluster within ~13% — scp 2.26s,
-  rsync 2.39s, cp2 2.55s — pinned near the machine's ssh-layer ceiling
-  (≈475 MB/s on this host).
-- **Large edit:** rsync's rolling-checksum delta still wins on localhost
-  (cp2's CDC delta re-reads the basis for signature and compute; on this
-  fast host hashing, not the wire, dominates the edit time — cp2's 2.54s
-  barely beats its own fresh 2.55s, while rsync drops 2.39s → 1.51s). On a
-  real 1 GbE/10 GbE link the delta's wire savings (1 MiB vs 1 GiB) flip this
-  in cp2's favor — the same reason rsync beats scp on real networks.
-- **Many small files:** on this host cp2 beats rsync on both the first sync
-  (1.78s vs 2.03s) and the idle re-sync (0.65s vs 0.80s) — parallel scan and
-  batch hashing overtake rsync's serial walk on a fast NVMe; the stored-file
-  guarantees that favored rsync on the old WSL2 host no longer show here.
-  scp re-copies everything and pays ~2.2x on the first sync and ~6x on the
-  idle re-sync.
-- **sy 0.4.0** trails on every scenario, including the idle scan (0.89s vs
-  cp2's 0.65s).
+`bench/mixed-tree.sh` — 70 K small 1-16 KiB, 27 K medium 64-384 KiB, 3 K
+large 1-2 MiB files, phases over unchanged sources (2026-08-26, same host;
+cp2 used the russh transport):
+
+| Phase | cp2 | rsync |
+|-------|-----|-------|
+| fresh (11.4 GB) | 47.96s | 51.56s |
+| second (no-op quick check) | 2.18s | 1.48s |
+| edit (1 K appends + 0.8 K rewrites + 200 new + 100 deleted) | 54.82s | 10.21s |
+
+Both destinations end byte-identical to the edited source (`rsync -rltc`
+dry-run: 0 differing files on each side). cp2 wins the 100 K-file fresh
+push; the edit phase favors rsync on localhost — cp2 sends only ~22 MB of
+changed bytes but pays the basis signature and compute re-reads across
+100 K files, the same hashing-bound profile as the large-edit scenario
+above. (The first attempt of this run used the system-ssh transport and
+deadlocked in OpenSSH's ControlMaster mux on a server-side stderr write —
+25 min with no progress; the same phase over the russh transport completed
+in 55s. The system-ssh path is under investigation.)
 
 The full benchmark suite — scripts, generated trees, and how to run it — is
 documented in [`ARCHITECTURE.md`](ARCHITECTURE.md).
-
-## Changelog
-
-### v0.1.1
-
-- **Windows install fix**: `cargo install cp2` no longer requires NASM — the
-  manifest enables aws-lc-sys's `prebuilt-nasm` feature, so its shipped
-  prebuilt objects are used whenever NASM is not on PATH (a Windows machine
-  with just the MSVC C toolchain builds fine).
-- **Data-loss fix on pull**: `--verify` no longer implies
-  `--remove-source-files`. The two flags were coupled in the remote server
-  invocation, so a *pull* with only `--verify` deleted every verified file on
-  the remote; a verified-only pull now deletes nothing.
-- **Windows build fix**: the `--password` path compiled an undeclared
-  identifier in a Windows-only branch; the crate builds cleanly on Windows
-  again.
-- **SSH transport hardening** (system ssh and the pure-Rust russh client):
-  - `--password` against a host with an unknown host key no longer hangs
-    forever — host-key prompts are answered `no` (fail-closed; keys are never
-    auto-accepted), and every ssh sub-step (probe, version check, deploy,
-    password-prompted spawn) is bounded by a timeout.
-  - `--password`/`--jump-password` are scrubbed from memory on **every** exit
-    path, including connection failures (previously the value could linger in
-    heap memory when a connect attempt failed early).
-  - Authentication/network failures during the platform probe now fail the
-    run with a clear error instead of being masked as "unknown platform" and
-    surfacing later as a confusing deploy failure.
-  - `--remote-path` is shell-quoted on Unix remotes (spaces and shell
-    metacharacters are safe, `~` still expands); deploy is atomic (stream to
-    a temp file, then rename), so an interrupted deploy never leaves a
-    truncated binary at the destination.
-  - The russh client follows OpenSSH `known_hosts` semantics: rotated or
-    duplicate keys are accepted when **any** entry matches, malformed lines
-    are skipped with a warning, `@revoked` entries are honored, host
-    certificates must pass critical-option checks, and hosts match by name
-    and resolved address.
-- **Parsing fixes**: `--jump-host` accepts bracketed IPv6 (`user@[::1]:2222`)
-  and rejects malformed ports; remote targets parse rsync-style first-colon
-  paths (`host:a:b`), treat `@`-containing local paths as local, and reject
-  empty user/host up front.
-- **Watch fix**: Ctrl-C during the initial-sync retry backoff stops the
-  session cleanly instead of starting the watcher.
-- **Local copy fix**: `-j`, `--max-delete`, and `--storage` are passed to the
-  local `cp2 --server` child as proper arguments again.
 
 ## Contributing
 
