@@ -175,19 +175,6 @@ partial files kept at the destination when a transfer is interrupted (the
 next run delta-resumes against them). Compression is opt-in via `-z`; the
 listing and progress are silenced by `-q`.
 
-## How the delta engine works
-
-Files are split into chunks at **content-defined boundaries** (FastCDC) —
-boundaries computed from the bytes themselves, so they don't move when you
-edit. Each chunk is identified by a BLAKE3 hash.
-
-When syncing, cp2 asks the destination for the chunk signature of the old
-file, then sends only the chunks whose hash isn't there. Because boundaries
-are content-defined, a 1-byte insertion near the start of a 50 GB file
-shifts nothing — only the chunk or two around the edit crosses the wire.
-The receiver reconstructs the file and verifies it against the delta's
-checksum.
-
 ## Options
 
 | Flag | rsync equivalent | Meaning |
@@ -245,136 +232,34 @@ checksum.
 `cp2 --server` is the sshd-invoked server mode (like rsync's `--server`): it
 reads the protocol from stdin and writes to stdout. Not for direct use.
 
-## How the server works
-
-By default every sync **deploys itself**: the platform is read from the
-sync session's in-band preamble and the remote binary's freshness is
-verified by the Hello handshake on that same session. When the binary is
-missing or stale, the client streams a matching build to the remote and
-`exec`s it as the server **on the same session** — the deploy session is the
-sync session, the Hello verifies the deploy, and the whole stale/missing
-case costs two ssh sessions (the failed attempt + the deploy-and-serve). The
-first `cp2 ./data user@host/backup` against a fresh account just works.
-Disable with `--no-auto-install` (e.g. for a managed server install).
-
-**Platform portability:** the deployed binary must match the server. The
-client prefers a prebuilt **sidecar** named `cp2-<triple>` (e.g.
-`cp2-x86_64-unknown-linux-musl` for a Linux server) — a Linux sidecar is a
-statically linked musl build that runs on any remote glibc — found in
-`--binaries-dir` or next to the client binary. Without a sidecar, a
-same-platform remote gets the running binary (which needs the local glibc —
-a remote with an older one fails at load time, GLIBC_2.xx not found). The
-platform is detected from the session's preamble (`uname -s -m`, falling
-back to `cmd /c echo %PROCESSOR_ARCHITECTURE%` on Windows). Nothing is
-downloaded at sync time — if a cross-platform sidecar is missing, cp2 tells
-you to fetch it from the [GitHub releases page](https://github.com/elemeng/cp2/releases)
-and drop it in one of those two places (or pass `--no-auto-install`).
-
-Build Linux sidecars with a static libc (the default glibc build only runs on
-glibc systems):
-
-```bash
-rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
-cargo build --release --target x86_64-unknown-linux-musl
-cargo build --release --target aarch64-unknown-linux-musl
-# copy target/<triple>/release/cp2 → cp2-<triple> (next to the client or in --binaries-dir)
-```
-
-Supported triples: `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`,
-`x86_64-apple-darwin`, `aarch64-apple-darwin`, `x86_64-pc-windows-gnu`,
-`aarch64-pc-windows-gnu`. Windows clients bundle the pure-Rust russh
-transport, whose aws-lc-rs crypto backend is C-based: cross-building the
-Windows sidecars from Linux needs a mingw-w64 C compiler for the target
-(`gcc-mingw-w64-x86-64`, and `gcc-mingw-w64` on newer distros for aarch64).
-NASM is never required: cp2's manifest enables aws-lc-sys's `prebuilt-nasm`
-feature, so the crate's shipped prebuilt objects are used whenever NASM is
-not on PATH (native `cargo install cp2` on Windows needs only the MSVC C
-toolchain; a found NASM is used if present, never demanded). Windows
-sidecars ship as `cp2-<triple>.exe` and are found under either name when
-auto-deploying.
-
-**Windows remotes** get a PowerShell + `certutil` deploy (base64 over stdin —
-Windows' 32 KB command-line limit rules out inline base64) and a
-`cmd /c`-wrapped server command so `%USERPROFILE%` paths expand under any
-sshd default shell; the default remote path is
-`%USERPROFILE%\.local\bin\cp2.exe`. The platform probe is instant and
-locale-independent.
-
-**Authentication** is your SSH setup, untouched: keys, agent, or password —
-whatever sshd accepts (PAM on Linux/macOS, LogonUser/keys on Windows
-OpenSSH). Access is scoped exactly like SSH: you reach what your account can
-reach, and the remote `cp2 --server` runs as you.
-
-**Transport** — on Unix the system `ssh` process carries the protocol
-(rsync's model): all of cp2's ssh sessions (platform probe, deploy, sync)
-multiplex over one master connection, so with password auth you type your
-password **once per run** — and not again for a later run within a minute.
-On Windows, where OpenSSH's `ControlMaster` socket is unusable
-(`getsockname failed: Not a socket`), cp2 uses its own pure-Rust SSH client
-(russh): one connection, one authentication, and one channel per session
-(no multiplexing machinery at all). The russh transport covers keys
-(including encrypted keys and OpenSSH user certificates), the SSH agent
-(Windows named pipe / Pageant), keyboard-interactive, and password; host
-keys follow OpenSSH semantics (`~/.ssh/known_hosts` with trust-on-first-use
-and `@cert-authority` host-certificate verification). GSSAPI and FIDO
-security keys are system-ssh-only. `--jump-host user@host[:port]` tunnels
-through a jump host on the russh transport (OpenSSH `ProxyJump` semantics);
-system ssh reads `ProxyJump` from `~/.ssh/config` instead.
-
 ## How it works
 
-The sync pipeline separates pure decision logic from async I/O orchestration:
+A sync deploys the server binary if needed, exchanges file manifests, plans
+create/update/delete, and sends only the changed bytes — FastCDC
+content-defined chunks plus BLAKE3, so a 1-byte edit near the start of a 50 GB
+file transfers kilobytes, not gigabytes. The full pipeline, the module map,
+the deployment mechanics, the security model, and the benchmark suite live in
+[`ARCHITECTURE.md`](ARCHITECTURE.md); building and testing are documented
+there too.
 
-```
-scanner → Manifest → planner → SyncPlan → strategy → executor → verify
-```
-
-| Module | Role |
-|--------|------|
-| `delta/` | Pure FastCDC engine: content-defined chunks, hash-index signature, `compute_delta`, `apply_patch` |
-| `sync/scanner` | Walk a directory into a serializable `Manifest` (streaming hashes, include/exclude filters) |
-| `sync/filter` | Pure rsync-style include/exclude glob matching |
-| `sync/planner` | Pure: manifest × manifest → `SyncPlan` (create/update/delete/skip) |
-| `sync/strategy` | Pure: file size → transfer strategy (copy/delta) |
-| `sync/sender` | Async sender role: manifest exchange, batching, delta recipes |
-| `sync/receiver` | Async receiver role: staged atomic apply, on-demand signatures |
-| `sync/executor` | Orchestrates push/pull/serve over one byte stream (the ssh channel) |
-| `transport/ssh` | Spawns `ssh -p PORT user@host cp2 --server` (rsync's model) |
-| `platform/staging` | `StagedFile`: seeded, preallocated temp file + atomic commit |
-| `protocol/` | Frame wire format with a version-only Hello handshake |
-
-A deeper walkthrough — the full push/pull session diagram, the delta engine,
-and the receiver's atomic-apply pipeline — lives in
-[`ARCHITECTURE.md`](ARCHITECTURE.md).
+The client machine needs the `ssh` client (default on Linux, macOS, and
+modern Windows). On the first sync the remote `cp2 --server` is
+**auto-deployed** — disable with `--no-auto-install`, or prebuilt
+`cp2-<triple>` sidecars (e.g. `cp2-x86_64-unknown-linux-musl`) can be dropped
+in `--binaries-dir` or next to the client; the [GitHub releases
+page](https://github.com/elemeng/cp2/releases) carries prebuilt binaries for
+all platforms.
 
 ## Performance comparison
 
-The `bench/` directory holds the benchmark suite. Shared helpers live in
-`bench/lib.sh` (takes `CP2_BIN`, `HOST`, `WORK`, `KEEP_WORK=1`); scenario
-scripts source it. Requires the release build (`cargo build --release`) and
-ssh key auth to `HOST`.
-
-| Script | What it measures |
-|--------|------------------|
-| `mixed-tree.sh` | ≈10 GiB / 100 K files (70 K small 1-16 KiB, 27 K medium 64-384 KiB, 3 K large 1-2 MiB), cp2 vs rsync over ssh: `fresh` / `second` / `edit` / `integrity` phases |
-| `single-file.sh` | the delta engine's value, cp2 vs rsync: `MODE=large` (one 1 GiB file: fresh / edit A+B / insert / idle) or `MODE=small` (8192 files: fresh / edit / idle) |
-| `compare_test.sh` | cross-tool localhost push (cp2 vs rsync vs scp vs [sy](https://crates.io/crates/sy)) across four scenarios, reproducible in CI-like conditions |
-| `compare_remote.sh` | cp2 vs rsync push to a **real** remote (gitignored — it holds a personal host address): fresh / idle / edit |
-
-### Cross-tool localhost (`compare_test.sh`)
-
-`bench/compare_test.sh` pushes the same trees over ssh with cp2, rsync, scp,
-and sy, across four scenarios:
-
-| Scenario | Source | What it measures |
-|----------|--------|------------------|
-| large-first | 1 GiB (2 × 512 MiB, generated) | raw transfer throughput, fresh destination |
-| large-edit | same tree, 1 MiB overwritten mid-file | delta/incremental behavior on a changed large file |
-| small-first | 8192 files, 1-64 KiB, 64 dirs (generated; `--small-src` to point at a real tree) | per-file overhead, fresh destination |
-| small-idle | unchanged tree | quick-check / scan overhead of a no-op sync |
-
-Measured on a WSL2 (Fedora 42) machine, pushing over `ssh localhost`
-(1 MiB pipes on both ends; page cache warmed before each tool):
+Measured on a WSL2 (Fedora 42) machine, pushing over `ssh localhost` (1 MiB
+pipes on both ends; page cache warmed before each tool), from
+`bench/compare_test.sh` — cp2 vs rsync vs scp vs sy. 2026-08 re-run after
+the pipeline work (this host was ~25% slower overall than the 2026-07
+baseline — scp's raw large-first copy went 2.18s → 2.71s — so compare
+scenarios, not raw seconds; the delta-path work shows up in **large-edit**:
+cp2 3.38s → 2.90s on a slower machine, closing the gap to rsync from ~2x to
+~1.1x):
 
 ```
 tool      large-first   large-edit  small-first   small-idle
@@ -383,13 +268,6 @@ rsync           3.48s        2.60s        1.55s        0.67s
 scp             2.71s        2.04s       14.20s       11.34s
 sy              5.74s       13.36s       54.56s        0.67s
 ```
-
-(2026-08 re-run after the pipeline work: phase-split CDC scan, parallel
-batch hashing, single-pass apply hashing, opt-in whole-file checksum. This
-run's host was ~25% slower overall than the 2026-07 baseline — scp's raw
-large-first copy went 2.18s → 2.71s — so compare scenarios, not raw
-seconds. The delta-path work shows up in **large-edit**: cp2 3.38s → 2.90s
-on a slower machine, closing the gap to rsync from ~2x to ~1.1x.)
 
 Reading the numbers honestly:
 
@@ -408,30 +286,8 @@ Reading the numbers honestly:
   quick check and re-copies everything).
 - **sy 0.4.0** trails on every scenario except the idle scan.
 
-Run it yourself: `bench/compare_test.sh` (needs ssh key auth to the target;
-`--remote user@host`, `--small-src DIR`, `--large-mb N` to adjust).
-`bench/mixed-tree.sh` and `bench/single-file.sh` (sourced from `bench/lib.sh`)
-cover the large-tree and delta scenarios; `bench/compare_remote.sh REMOTE`
-repeats the daily flows against a real link.
-
-## Build & roadmap
-
-```bash
-cargo build
-cargo test
-cargo clippy
-```
-
-Requires the `ssh` client on the machine running cp2 (installed by default on
-Linux, macOS, and modern Windows). Optionally pin the server as an sshd forced
-command in `~/.ssh/authorized_keys`:
-`command="cp2 --server",restrict ssh-ed25519 AAAA...`
-
-The **distribution tarball** (all platforms + `install.sh`) is built by the
-GitHub Actions workflow on a `v*` tag; `scripts/build-release.sh` does the
-same locally. See `scripts/` and `.github/workflows/release.yml`.
-
-Planned work lives in [`ROADMAP.md`](ROADMAP.md).
+The full benchmark suite — scripts, generated trees, and how to run it — is
+documented in [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
 ## Changelog
 
@@ -490,7 +346,7 @@ Issues and pull requests are welcome — open an
 - **Be honest about provenance**: the design adapts several MIT/BSD projects
   (attributed in the README table and [NOTICE](NOTICE)) — credit adaptations
   in the module headers, and don't import code from GPL projects.
-- **Larger features** get discussed in [ROADMAP.md](ROADMAP.md) first.
+- **Larger features** get discussed in an [issue](https://github.com/elemeng/cp2/issues) first.
 
 ## Acknowledgments
 

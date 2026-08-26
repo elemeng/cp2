@@ -55,6 +55,24 @@ boundaries so the engine runs over any byte stream — not just ssh.
 Dependency rule: arrows go **down** only — `sync` → `protocol` → nothing
 below it imports above; `transport` and `protocol` never import each other.
 
+### Module map
+
+| File | Role |
+|------|------|
+| `src/sync/scanner.rs` | Walk a directory into a serializable `Manifest` (streaming hashes, include/exclude filters) |
+| `src/sync/filter.rs` | Pure rsync-style include/exclude glob matching |
+| `src/sync/planner.rs` | Pure: manifest × manifest → `SyncPlan` (create/update/delete/skip/meta) |
+| `src/sync/strategy.rs` | Pure: file size → transfer tier (copy/delta) |
+| `src/sync/sender.rs` | Async sender role: manifest exchange, batching, delta recipes |
+| `src/sync/receiver.rs` | Async receiver role: staged atomic apply, on-demand signatures |
+| `src/sync/executor.rs` | Orchestrates push/pull/serve over one byte stream (the ssh channel) |
+| `src/sync/stats.rs` | Transfer statistics + itemize change lines (`-i`/`--stats`) |
+| `src/protocol/` | `Frame` wire types (postcard/serde) + length-prefixed codec with optional per-frame lz4 and the zero-copy raw chunk/batch layouts |
+| `src/delta/` | Pure FastCDC chunking (chunkrs) + BLAKE3: hash-index signature, `compute_delta`, `apply_patch` |
+| `src/transport/` | ssh spawner (Unix) / russh client (Windows) + bandwidth limiter |
+| `src/platform/` | Portable fs: staged-file sink, metadata application, storage-class probe |
+| `src/security/` | Path sanitizer (traversal + symlink-escape containment) |
+
 ## The sync session (push, end to end)
 
 ```
@@ -166,6 +184,74 @@ against it.
   / IOCTL / `diskutil`); an explicit `-j` always wins.
 - Hashing is SIMD-accelerated (blake3/rayon).
 
+## Deploy & transport
+
+The client **auto-deploys the server binary** on first sync: the remote
+binary's freshness is verified by the Hello handshake (build fingerprint) on
+the sync session itself. When the binary is missing or stale, the client
+streams a matching build to the remote and `exec`s it as the server on the
+same session — the deploy session is the sync session, the Hello verifies the
+deploy, and the whole stale/missing case costs two ssh sessions (the failed
+attempt + the deploy-and-serve). Disable with `--no-auto-install` (e.g. for a
+managed server install).
+
+**Platform portability:** the deployed binary must match the server. The
+client prefers a prebuilt **sidecar** named `cp2-<triple>` (e.g.
+`cp2-x86_64-unknown-linux-musl` for a Linux server) — a Linux sidecar is a
+statically linked musl build that runs on any remote glibc — found in
+`--binaries-dir` or next to the client binary. Without a sidecar, a
+same-platform remote gets the running binary (which needs the local glibc — a
+remote with an older one fails at load time, `GLIBC_2.xx not found`). The
+platform is detected from the session's preamble (`uname -s -m`, falling back
+to `cmd /c echo %PROCESSOR_ARCHITECTURE%` on Windows). Nothing is downloaded
+at sync time — if a cross-platform sidecar is missing, cp2 tells you to fetch
+it from the GitHub releases page and drop it in one of those two places.
+
+Build Linux sidecars with a static libc (the default glibc build only runs on
+glibc systems):
+
+```bash
+rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+cargo build --release --target x86_64-unknown-linux-musl
+cargo build --release --target aarch64-unknown-linux-musl
+# copy target/<triple>/release/cp2 → cp2-<triple> (next to the client or in --binaries-dir)
+```
+
+Supported triples: `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`,
+`x86_64-apple-darwin`, `aarch64-apple-darwin`, `x86_64-pc-windows-gnu`,
+`aarch64-pc-windows-gnu`. Windows clients bundle the pure-Rust russh
+transport, whose aws-lc-rs crypto backend is C-based: cross-building the
+Windows sidecars from Linux needs a mingw-w64 C compiler for the target
+(`gcc-mingw-w64-x86-64`, and `gcc-mingw-w64` on newer distros for aarch64).
+NASM is never required: the manifest enables aws-lc-sys's `prebuilt-nasm`
+feature, so the crate's shipped prebuilt objects are used whenever NASM is
+not on PATH (native `cargo install cp2` on Windows needs only the MSVC C
+toolchain; a found NASM is used if present, never demanded). Windows sidecars
+ship as `cp2-<triple>.exe` and are found under either name when
+auto-deploying.
+
+**Windows remotes** get a PowerShell + `certutil` deploy (base64 over stdin —
+Windows' 32 KB command-line limit rules out inline base64) and a
+`cmd /c`-wrapped server command so `%USERPROFILE%` paths expand under any
+sshd default shell; the default remote path is `%USERPROFILE%\.local\bin\cp2.exe`.
+The platform probe is instant and locale-independent.
+
+**Transport dispatch.** On Unix the system `ssh` process carries the protocol
+(rsync's model): all of cp2's ssh sessions (platform probe, deploy, sync)
+multiplex over one `ControlMaster` connection, so with password auth you type
+your password once per run — and not again for a later run within a minute.
+On Windows, where OpenSSH's `ControlMaster` socket is unusable
+(`getsockname failed: Not a socket`), cp2 uses its own pure-Rust SSH client
+(russh): one connection, one authentication, and one channel per session (no
+multiplexing machinery at all). The russh transport covers keys (including
+encrypted keys and OpenSSH user certificates), the SSH agent (Windows named
+pipe / Pageant), keyboard-interactive, and password; host keys follow OpenSSH
+semantics (`~/.ssh/known_hosts` with trust-on-first-use and `@cert-authority`
+host-certificate verification). GSSAPI and FIDO security keys are
+system-ssh-only. `--jump-host user@host[:port]` tunnels through a jump host
+on the russh transport (OpenSSH `ProxyJump` semantics); system ssh reads
+`ProxyJump` from `~/.ssh/config` instead.
+
 ## Security model
 
 cp2 has no auth code: sshd authenticates (PAM, LogonUser/keys) and enforces
@@ -183,3 +269,59 @@ multiplexing socket is unusable) cp2's own russh transport connects once,
 authenticates once, and runs each session on its own RFC 4254 channel, with
 OpenSSH host-key semantics (`known_hosts` + `@cert-authority` host
 certificates) and no GSSAPI/FIDO (system-ssh-only features).
+
+## Building, testing, releasing
+
+```bash
+cargo build
+cargo test
+cargo clippy --all-targets -- -D warnings
+```
+
+The `clippy` gate is part of CI (`-D warnings` promotes every warning to an
+error; `Cargo.toml` denies `clippy::all`, warns on `pedantic`). Lints that
+fire only on specific platforms carry `#[expect]`/`#[allow]` at the
+platform-gated call sites. The test suite runs `cargo test --all-targets` on
+Linux, macOS, and Windows in CI, plus an MSRV job that verifies the declared
+`rust-version` (1.93) still builds and passes.
+
+The client machine needs the `ssh` client (installed by default on Linux,
+macOS, and modern Windows). Optionally pin the server as an sshd forced
+command in `~/.ssh/authorized_keys`:
+`command="cp2 --server",restrict ssh-ed25519 AAAA...`.
+
+The **distribution tarball** (all platforms + `install.sh`) is built by the
+GitHub Actions workflow on a `v*` tag; `scripts/build-release.sh` does the
+same locally. See `scripts/` and `.github/workflows/release.yml`.
+
+## Performance benchmarks
+
+The `bench/` directory holds the benchmark suite. Shared helpers live in
+`bench/lib.sh` (takes `CP2_BIN`, `HOST`, `WORK`, `KEEP_WORK=1`); scenario
+scripts source it. Requires the release build (`cargo build --release`) and
+ssh key auth to `HOST`.
+
+| Script | What it measures |
+|--------|------------------|
+| `mixed-tree.sh` | ≈10 GiB / 100 K files (70 K small 1-16 KiB, 27 K medium 64-384 KiB, 3 K large 1-2 MiB), cp2 vs rsync over ssh: `fresh` / `second` / `edit` / `integrity` phases |
+| `single-file.sh` | the delta engine's value, cp2 vs rsync: `MODE=large` (one 1 GiB file: fresh / edit A+B / insert / idle) or `MODE=small` (8192 files: fresh / edit / idle) |
+| `compare_test.sh` | cross-tool localhost push (cp2 vs rsync vs scp vs [sy](https://crates.io/crates/sy)) across four scenarios, reproducible in CI-like conditions |
+| `compare_remote.sh` | cp2 vs rsync push to a **real** remote (gitignored — it holds a personal host address): fresh / idle / edit |
+
+### Cross-tool localhost (`compare_test.sh`)
+
+`bench/compare_test.sh` pushes the same trees over ssh with cp2, rsync, scp,
+and sy, across four scenarios:
+
+| Scenario | Source | What it measures |
+|----------|--------|------------------|
+| large-first | 1 GiB (2 × 512 MiB, generated) | raw transfer throughput, fresh destination |
+| large-edit | same tree, 1 MiB overwritten mid-file | delta/incremental behavior on a changed large file |
+| small-first | 8192 files, 1-64 KiB, 64 dirs (generated; `--small-src` to point at a real tree) | per-file overhead, fresh destination |
+| small-idle | unchanged tree | quick-check / scan overhead of a no-op sync |
+
+Run it yourself: `bench/compare_test.sh` (needs ssh key auth to the target;
+`--remote user@host`, `--small-src DIR`, `--large-mb N` to adjust).
+`bench/mixed-tree.sh` and `bench/single-file.sh` (sourced from `bench/lib.sh`)
+cover the large-tree and delta scenarios; `bench/compare_remote.sh REMOTE`
+repeats the daily flows against a real link.
