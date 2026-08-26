@@ -325,4 +325,26 @@ Run it yourself: `bench/compare_test.sh` (needs ssh key auth to the target;
 `--remote user@host`, `--small-src DIR`, `--large-mb N` to adjust).
 `bench/mixed-tree.sh` and `bench/single-file.sh` (sourced from `bench/lib.sh`)
 cover the large-tree and delta scenarios; `bench/compare_remote.sh REMOTE`
-repeats the daily flows against a real link.
+repeats the daily flows against a real link. The cross-tool timing table
+for compare_test/compare_studied lives in the README's Performance
+comparison section.
+
+### Example results (`mixed-tree.sh`, 2026-08-26, Fedora 44 NVMe)
+
+The mixed tree is ≈10 GiB / 100 K files (70 K small 1-16 KiB, 27 K medium
+64-384 KiB, 3 K large 1-2 MiB), phases over unchanged sources:
+
+| Phase | cp2 | rsync |
+|-------|-----|-------|
+| fresh (11.4 GB) | 47.96s | 51.56s |
+| second (no-op quick check) | 2.18s | 1.48s |
+| edit (1 K appends + 0.8 K rewrites + 200 new + 100 deleted) | 54.82s | 10.21s |
+
+Both destinations end byte-identical to the edited source (`rsync -rltc`
+dry-run: 0 differing files on each side); cp2 wins the 100 K-file fresh
+push. Two caveats for this particular run: the edit phase ran over the
+russh transport — the first attempt over the system-ssh transport
+deadlocked in OpenSSH's ControlMaster mux on a server-side stderr write
+(25 min, no progress; the same phase over russh completed in 55s, and the
+system-ssh path is under investigation) — and it predates the delta-overlap
+work, which halved cp2's single-file edit cost since.

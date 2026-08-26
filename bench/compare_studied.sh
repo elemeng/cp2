@@ -27,7 +27,7 @@ WORK="${WORK:-$(mktemp -d "$HOME/.cache/cp2-bench-studied.XXXXXX")}"
 # A studied tool that hangs (or a stale absolute path) must not stall the
 # whole harness: every run is bounded and its rc recorded.
 RUN_TIMEOUT="${RUN_TIMEOUT:-300}"
-read -r -a TOOLS <<< "${TOOLS:-cp2 rsync sy pxs}"
+read -r -a TOOLS <<< "${TOOLS:-cp2 rsync scp sy pxs}"
 # The exported `push_impl` runs in a `bash -c` child (bounded by `timeout`),
 # which does not see plain shell variables — the ones the dispatcher reads
 # must cross the process boundary explicitly.
@@ -38,7 +38,7 @@ if [ ! -x "$REPO/target/release/cp2" ]; then
 fi
 
 echo "== compare_studied: push over ssh to $REMOTE =="
-for t in sy pxs; do
+for t in sy pxs scp; do
     command -v "$t" >/dev/null || { echo "missing tool: $t (cargo install $t)" >&2; exit 1; }
 done
 
@@ -87,6 +87,7 @@ push_impl() { # tool src remote_dest
         rsync)   rsync -rlt "$src/" "$REMOTE:$rd/" ;;
         sy)      sy "$src" "$REMOTE:$rd" ;;
         pxs)     pxs sync "$src" "$REMOTE:$rd" ;;
+        scp)     scp -r -q "$src/." "$REMOTE:$rd/" ;;
     esac
 }
 

@@ -254,49 +254,53 @@ all platforms.
 
 Measured on a native Fedora 44 (x86_64, NVMe) machine, pushing over
 `ssh localhost` (1 MiB pipes on both ends; page cache warmed before each
-tool), from `bench/compare_test.sh` — cp2 vs rsync vs scp vs sy:
+tool), from `bench/compare_studied.sh` — all tools in one run, 2026-08-27
+(destination bytes verified against each tool's edited source; runs bounded
+by a 300s timeout, rc recorded):
 
 ```
 tool      large-first   large-edit  small-first   small-idle
-cp2             2.55s        2.54s        1.78s        0.65s
-rsync           2.39s        1.51s        2.03s        0.80s
-scp             2.26s        2.26s        3.98s        4.01s
-sy              2.59s        4.73s       14.29s        0.89s
+cp2             1.77s        1.83s        1.72s        0.60s
+rsync           1.95s        1.46s        1.59s        0.71s
+scp             1.87s        2.09s        4.09s        3.37s
+sy              2.49s        4.33s       14.34s        0.84s
+pxs             6.30s        0.98s        2.78s        1.46s
 ```
 
-(The cp2 rows predate the delta-overlap optimization described under the
-mixed-tree table: after it, cp2's large-edit re-measures at ≈1.8s vs
-rsync's ≈1.6s — see below.)
+Reading the numbers honestly:
 
-### Mixed tree (≈10 GiB, 100 K files)
+- **Large first sync:** cp2, scp, and rsync all land within 10% (1.77s /
+  1.87s / 1.95s), pinned near the machine's ssh-layer ceiling; sy is ~43%
+  behind; pxs pays 3.3x for staging and hashing everything (6.30s).
+- **Large edit (1 MiB overwritten mid-file):** pxs wins with a byte-compare
+  delta (0.98s — explained below); rsync's rolling checksum is next
+  (1.46s); cp2 is ~25% behind rsync (1.83s) — its source chunking already
+  overlaps the basis signing; the remainder is FastCDC+BLAKE3 vs rolling per
+  byte. scp re-copies the whole file (2.09s ≈ its fresh time); sy 4.33s.
+- **Many small files (8192 files, 1-64 KiB):** cp2 and rsync trade the first
+  sync within ~8% (1.72s vs 1.59s); cp2 leads the idle re-sync (0.60s vs
+  0.71s). scp re-copies everything both times (~4s); pxs pays per-file
+  staging and hashing (2.78s); sy trails ~8x (14.34s).
+- Localhost runs vary ~±30% between runs even for the same tool — compare
+  tools within a run, not across runs.
 
-`bench/mixed-tree.sh` — 70 K small 1-16 KiB, 27 K medium 64-384 KiB, 3 K
-large 1-2 MiB files, phases over unchanged sources (2026-08-26, same host;
-cp2 used the russh transport):
+Why pxs wins the edit but loses elsewhere: its "delta" is a byte-compare,
+not a hash delta — fixed 128 KiB blocks, mmap'd and compared in parallel
+(`src != dst`), only differing blocks written, and one full-file BLAKE3 for
+integrity at the end. For a same-size in-place overwrite (VM images,
+PGDATA) that is near the floor of possible work. The same design is its
+weakness: fresh transfers stage and hash everything (the 6.30s row), and a
+mid-file insertion shifts every later block so the whole tail re-sends —
+the exact case content-defined chunking exists for.
 
-| Phase | cp2 | rsync |
-|-------|-----|-------|
-| fresh (11.4 GB) | 47.96s | 51.56s |
-| second (no-op quick check) | 2.18s | 1.48s |
-| edit (1 K appends + 0.8 K rewrites + 200 new + 100 deleted) | 54.82s | 10.21s |
-
-Both destinations end byte-identical to the edited source (`rsync -rltc`
-dry-run: 0 differing files on each side). cp2 wins the 100 K-file fresh
-push; the edit phase favored rsync on localhost — cp2 sent only ~22 MB of
-changed bytes but the basis signature and the delta compute serialized
-across 100 K files. That serialization is gone since this run: the sender's
-source chunking now runs concurrently with the receiver's basis signing
-(the two full-file passes execute on different machines), which re-measures
-the single-file large-edit from 2.53s to ≈1.8s. (This run's first attempt
-used the system-ssh transport and deadlocked in OpenSSH's ControlMaster mux
-on a server-side stderr write — 25 min with no progress; the same phase
-over the russh transport completed in 55s. The system-ssh path is under
-investigation.)
+The mixed tree (≈10 GiB, 100 K files, cp2 vs rsync) and the full benchmark
+suite — scripts, generated trees, how to run it — are documented in
+[`ARCHITECTURE.md`](ARCHITECTURE.md).
 
 ### The studied crates, honestly
 
 The sibling crates cp2's design was informed by were put through the same
-harness (`bench/compare_studied.sh`, same host and same run, 2026-08-26).
+harness as the table above (`bench/compare_studied.sh`).
 The participation audit comes first — of the eight crates, **two can sync
 over ssh at all**:
 
@@ -310,41 +314,8 @@ over ssh at all**:
 | robosync, rusync | do **not parse** `user@host:path` at all — they copy into a literal local directory named `user@host:path` under the working directory (rc=0, "9 bytes transferred", no ssh connection — verified in sshd's journal) |
 | copia | library, no CLI |
 
-The four-scenario results (1 GiB fresh/edit + 8192-file tree; destination
-bytes verified against each tool's edited source for the successful rows;
-per-tool runs bounded by a 300s timeout, rc recorded; re-run 2026-08-26
-after the delta-overlap work, which is why cp2's large-edit dropped from
-the earlier 2.53s):
-
-```
-tool      large-first   large-edit  small-first   small-idle
-cp2             1.94s        1.78s        1.85s        0.64s
-rsync           2.08s        1.46s        1.67s        0.85s
-sy              2.42s        4.42s       12.21s        0.72s
-pxs             6.40s        0.97s        2.90s        1.54s
-```
-
-Reading them honestly: cp2 leads the idle re-sync (0.64s vs rsync 0.85s)
-and stays within ~11% of rsync on the small-file first sync; the large-edit
-gap to rsync's rolling-checksum delta is down to ~22% (cp2's source
-chunking overlaps the basis signing). pxs has the fastest delta edit
-(0.97s, its integrity hashing makes it the slowest fresh transfer at 6.40s
-— 3.3x cp2); sy trails everywhere, ~6.6x slower than cp2 on many small
-files. Localhost runs vary ~±30% between runs even for the same tool —
-compare tools within a run, not across runs.
-
-Why pxs wins the edit but loses elsewhere: its "delta" is a byte-compare,
-not a hash delta — fixed 128 KiB blocks, mmap'd and compared in parallel
-(`src != dst`), only differing blocks written, and one full-file BLAKE3 for
-integrity at the end. For a same-size in-place overwrite (VM images,
-PGDATA) that is near the floor of possible work, and it has no cheaper
-peer. The same design is its weakness: fresh transfers stage and hash
-everything (the 6.40s row), and a mid-file insertion shifts every later
-block so the whole tail re-sends — the exact case content-defined chunking
-exists for.
-
-The full benchmark suite — scripts, generated trees, and how to run it — is
-documented in [`ARCHITECTURE.md`](ARCHITECTURE.md).
+The timing table above is the single comparison across all ssh-capable
+tools, in one run.
 
 ## Contributing
 
