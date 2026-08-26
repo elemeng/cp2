@@ -306,7 +306,7 @@ ssh key auth to `HOST`.
 | `mixed-tree.sh` | ≈10 GiB / 100 K files (70 K small 1-16 KiB, 27 K medium 64-384 KiB, 3 K large 1-2 MiB), cp2 vs rsync over ssh: `fresh` / `second` / `edit` / `integrity` phases |
 | `single-file.sh` | the delta engine's value, cp2 vs rsync: `MODE=large` (one 1 GiB file: fresh / edit A+B / insert / idle) or `MODE=small` (8192 files: fresh / edit / idle) |
 | `compare_test.sh` | cross-tool localhost push (cp2 vs rsync vs scp vs [sy](https://crates.io/crates/sy)) across four scenarios, reproducible in CI-like conditions |
-| `compare_studied.sh` | the SSH-capable studied crates (sy, pxs) through the same four scenarios, with cp2 and rsync as reference rows; per-tool runs bounded by a timeout with rc recorded |
+| `compare_studied.sh` | cp2 vs rsync vs scp vs the ssh-capable studied crates (sy, pxs) through the same four scenarios, all in one run; per-tool runs bounded by a timeout with rc recorded |
 | `compare_remote.sh` | cp2 vs rsync push to a **real** remote (gitignored — it holds a personal host address): fresh / idle / edit |
 
 ### Cross-tool localhost (`compare_test.sh`)
@@ -348,3 +348,33 @@ deadlocked in OpenSSH's ControlMaster mux on a server-side stderr write
 (25 min, no progress; the same phase over russh completed in 55s, and the
 system-ssh path is under investigation) — and it predates the delta-overlap
 work, which halved cp2's single-file edit cost since.
+
+### The studied crates, honestly
+
+cp2's design was informed by sibling crates, so they were put through the
+same harness (`bench/compare_studied.sh`). The participation audit comes
+first — of the eight, **two can sync over ssh at all**:
+
+| Tool | Verdict |
+|------|---------|
+| pxs | syncs over ssh (integrity-first), no limits found |
+| sy | syncs over ssh; **msy ships the same `sy` binary** (plus `sy-scan`/`sy-remote`/`sy-bench-gen`) — the two are the same tool, already on the list |
+| syncz | goes over ssh but is a **wrapper around the system rsync** — benchmarking it is benchmarking rsync again |
+| sparsync | no drop-in ssh sync — needs a `serve`/`enroll`/auth mesh |
+| zsync-rs | HTTP delta client — no ssh at all |
+| robosync, rusync | do **not parse** `user@host:path` at all — they copy into a literal local directory named `user@host:path` under the working directory (rc=0, "9 bytes transferred", no ssh connection — verified in sshd's journal) |
+| copia | library, no CLI |
+
+Why pxs wins the large-edit scenario but loses elsewhere: its "delta" is a
+byte-compare, not a hash delta — fixed 128 KiB blocks, mmap'd and compared
+in parallel (`src != dst`), only differing blocks written, and one
+full-file BLAKE3 for integrity at the end. For a same-size in-place
+overwrite (VM images, PGDATA) that is near the floor of possible work. The
+same design is its weakness: fresh transfers stage and hash everything (the
+6.30s row in the README table), and a mid-file insertion shifts every later
+block so the whole tail re-sends — the exact case content-defined chunking
+exists for.
+
+sy trails everywhere, ~8x slower than cp2 on many small files. The single
+timing table across all ssh-capable tools (cp2, rsync, scp, sy, pxs in one
+run) lives in the README's Performance comparison section.

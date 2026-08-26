@@ -252,11 +252,12 @@ all platforms.
 
 ## Performance comparison
 
-Measured on a native Fedora 44 (x86_64, NVMe) machine, pushing over
-`ssh localhost` (1 MiB pipes on both ends; page cache warmed before each
-tool), from `bench/compare_studied.sh` — all tools in one run, 2026-08-27
-(destination bytes verified against each tool's edited source; runs bounded
-by a 300s timeout, rc recorded):
+All tools in one run, pushing over `ssh localhost` on a native Fedora 44
+(x86_64, NVMe); destination bytes verified against each tool's edited
+source, per-tool runs bounded by a 300s timeout (rc recorded). From
+`bench/compare_studied.sh`; sy and pxs are the two studied crates that sync
+over ssh at all (the full audit is in
+[`ARCHITECTURE.md`](ARCHITECTURE.md)).
 
 ```
 tool      large-first   large-edit  small-first   small-idle
@@ -269,53 +270,24 @@ pxs             6.30s        0.98s        2.78s        1.46s
 
 Reading the numbers honestly:
 
-- **Large first sync:** cp2, scp, and rsync all land within 10% (1.77s /
-  1.87s / 1.95s), pinned near the machine's ssh-layer ceiling; sy is ~43%
-  behind; pxs pays 3.3x for staging and hashing everything (6.30s).
-- **Large edit (1 MiB overwritten mid-file):** pxs wins with a byte-compare
-  delta (0.98s — explained below); rsync's rolling checksum is next
-  (1.46s); cp2 is ~25% behind rsync (1.83s) — its source chunking already
-  overlaps the basis signing; the remainder is FastCDC+BLAKE3 vs rolling per
-  byte. scp re-copies the whole file (2.09s ≈ its fresh time); sy 4.33s.
-- **Many small files (8192 files, 1-64 KiB):** cp2 and rsync trade the first
-  sync within ~8% (1.72s vs 1.59s); cp2 leads the idle re-sync (0.60s vs
-  0.71s). scp re-copies everything both times (~4s); pxs pays per-file
-  staging and hashing (2.78s); sy trails ~8x (14.34s).
+- **Fresh large transfer (1 GiB):** cp2, scp, and rsync land within 10%
+  (1.77s / 1.87s / 1.95s), pinned near the machine's ssh-layer ceiling —
+  raw throughput is a wash.
+- **One 1 MiB edit mid-file:** fastest is a byte-compare delta (pxs, 0.98s
+  — analyzed in [`ARCHITECTURE.md`](ARCHITECTURE.md)); rsync's rolling
+  checksum is next (1.46s); cp2 is ~25% behind rsync (1.83s) — its source
+  chunking already overlaps the basis signing; the remainder is
+  FastCDC+BLAKE3 vs rolling per byte. scp re-copies the whole file (2.09s,
+  ≈ its fresh time).
+- **8192 small files (1-64 KiB):** cp2 and rsync trade the first sync within
+  ~8% (1.72s vs 1.59s); cp2 leads the no-op re-sync (0.60s vs 0.71s). scp
+  re-copies everything both times (~4s); sy trails ~8x (14.34s).
 - Localhost runs vary ~±30% between runs even for the same tool — compare
   tools within a run, not across runs.
 
-Why pxs wins the edit but loses elsewhere: its "delta" is a byte-compare,
-not a hash delta — fixed 128 KiB blocks, mmap'd and compared in parallel
-(`src != dst`), only differing blocks written, and one full-file BLAKE3 for
-integrity at the end. For a same-size in-place overwrite (VM images,
-PGDATA) that is near the floor of possible work. The same design is its
-weakness: fresh transfers stage and hash everything (the 6.30s row), and a
-mid-file insertion shifts every later block so the whole tail re-sends —
-the exact case content-defined chunking exists for.
-
-The mixed tree (≈10 GiB, 100 K files, cp2 vs rsync) and the full benchmark
-suite — scripts, generated trees, how to run it — are documented in
+The mixed tree (≈10 GiB, 100 K files) and the full benchmark suite —
+scripts, generated trees, how to run it — are documented in
 [`ARCHITECTURE.md`](ARCHITECTURE.md).
-
-### The studied crates, honestly
-
-The sibling crates cp2's design was informed by were put through the same
-harness as the table above (`bench/compare_studied.sh`).
-The participation audit comes first — of the eight crates, **two can sync
-over ssh at all**:
-
-| Tool | Verdict |
-|------|---------|
-| pxs | syncs over ssh (integrity-first), no limits found |
-| sy | syncs over ssh; **msy ships the same `sy` binary** (plus `sy-scan`/`sy-remote`/`sy-bench-gen`) — the two are the same tool, already on the list |
-| syncz | goes over ssh but is a **wrapper around the system rsync** — benchmarking it is benchmarking rsync again |
-| sparsync | no drop-in ssh sync — needs a `serve`/`enroll`/auth mesh |
-| zsync-rs | HTTP delta client — no ssh at all |
-| robosync, rusync | do **not parse** `user@host:path` at all — they copy into a literal local directory named `user@host:path` under the working directory (rc=0, "9 bytes transferred", no ssh connection — verified in sshd's journal) |
-| copia | library, no CLI |
-
-The timing table above is the single comparison across all ssh-capable
-tools, in one run.
 
 ## Contributing
 
