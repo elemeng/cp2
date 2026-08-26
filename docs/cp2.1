@@ -1,0 +1,389 @@
+.TH CP2 1 "August 2026" "cp2 0.1.0" "User Commands"
+.SH NAME
+cp2 \- rsync-style copy and sync over SSH
+.SH SYNOPSIS
+.B cp2
+[\fIOPTIONS\fR] \fISRC\fR \fIDST\fR
+.br
+.B cp2 \-\-server
+.br
+.B cp2 \-\-list-only \fISRC\fR \fIDST\fR
+.SH DESCRIPTION
+.B cp2
+is a pure-Rust, high-performance copy and sync tool for local directories
+or over the network on Linux, macOS, and Windows. It copies files locally,
+or syncs two machines over SSH with rsync-style semantics, using a
+content-defined delta engine (FastCDC chunking + BLAKE3) that sends only
+the bytes that actually changed. One binary, no runtime dependencies
+beyond the
+.B ssh
+client you already have, and zero server setup: the server binary is
+auto-deployed to the remote on first sync.
+.PP
+A sync deploys the server binary if needed, exchanges file manifests,
+plans create/update/delete, and sends only the changed bytes \- a 1-byte
+edit near the start of a 50 GB file transfers kilobytes, not gigabytes.
+The quick check is size+mtime; \-\-checksum switches it to BLAKE3 hashes.
+.SH TARGETS
+A remote target is
+.BI user@host : path
+(ports are set with
+\fB\-\-port\fR,
+never parsed from the target string; a numeric suffix like
+.B host:2222
+is a path). The direction is inferred from which side is remote:
+.B cp2 SRC user@host:DEST
+pushes,
+.B cp2 user@host:SRC DEST
+pulls.
+.PP
+The remote
+.I :path
+follows rsync: a leading
+.B /
+(
+.BI user@host :/abs/path
+) is an absolute server path; anything else
+(
+.BI user@host :backup
+) is relative to the serve root (the account home); no path means the
+home itself. Traversal (
+.B ..
+) is rejected. The source
+.I SRC
+follows rsync's trailing-slash rule: with no trailing slash the last
+component of the source is recreated under the destination.
+.SH OPTIONS
+.TP
+\fB\-p, \--port PORT\fP
+SSH port (default 22). Ports are never parsed from the target string — a numeric suffix like \fBhost:2222\fP is a path
+.TP
+\fB\--jump-host USER@HOST[:PORT]\fP \fI(rsync ProxyJump)\fP
+Tunnel through a jump host (russh transport, the Windows default; system ssh reads \fBProxyJump\fP from \fB~/.ssh/config\fP instead)
+.TP
+\fB\--password PASSWORD\fP
+Supply the target ssh password directly instead of prompting. The russh transport (Windows) sends it once and scrubs it from memory immediately; the system-ssh transport (Unix) injects it natively into the master ssh spawn on a pty (the sshpass mechanism, no external tool; password auth is forced and the master uses a run-unique socket, so the injection always sees a prompt) and scrubs it right after. Visible in the process list and shell history while the run is active — prefer keys or the prompt
+.TP
+\fB\--jump-password PASSWORD\fP
+Password for the jump host (\fB--jump-host\fP) when it differs from \fB--password\fP; without it the jump reuses \fB--password\fP (or the prompted value). Same visibility and scrubbing caveats
+.TP
+\fB\--password-file FILE\fP
+Read the password from FILE (first line) instead of \fB--password\fP — only the file path rides the command line, so the secret never appears in the shell history or process list. Mutually exclusive with \fB--password\fP; keep the file \fBchmod 600\fP
+.TP
+\fB\--remote-path PATH\fP \fI(rsync \--rsync-path)\fP
+Path of \fBcp2\fP on the remote, used as the remote command (default \fB~/.cargo/bin/cp2\fP). Shell-quoted on Unix remotes — spaces and shell metacharacters work, \fB~\fP still expands; on Windows remotes it is interpolated into a cmd/PowerShell command, so keep it free of spaces, quotes, and metacharacters
+.TP
+\fB\--binaries-dir DIR\fP
+Directory holding prebuilt \fBcp2-<triple>\fP sidecars (checked before the directory next to this binary)
+.TP
+\fB\--no-auto-install\fP
+Don't check/deploy the server binary before syncing
+.TP
+\fB\-a, \--archive\fP \fI(rsync \-a)\fP
+Full archive (byte-identical): recursion + mode/mtime/symlinks/hard links (always on) plus special files (fifos, sockets, devices), owner/group (best-effort \fBchown\fP), SUID/SGID/Sticky, and \fB--literal-links\fP (literal link targets) — \fBUnix-like systems only\fP, silently skipped on Windows. Default (no \fB-a\fP) is 0-Root: permission bits only, owner is the SSH connection user
+.TP
+\fB\--literal-links\fP
+Keep links and shortcuts as they are (rsync \fB-l\fP): every symlink is recreated with its \fBliteral target string\fP (no DEST-relative rewrite, no external-link dereference/skip), and Windows-source \fB.lnk\fP shortcuts are copied as opaque files. On a Windows target a symlink still materializes as a \fB.lnk\fP, but the target stays literal. Implied by \fB-a\fP; overridden by \fB--skip-links\fP/\fB--follow-links\fP
+.TP
+\fB\--literal-internal-links\fP
+Keep \fIinternal\fP symlinks (targets resolving inside SRC) with their literal target instead of the DEST-relative rewrite; external links keep the default policy
+.TP
+\fB\--literal-external-file-links\fP
+Keep \fIexternal file-target\fP symlinks as links with their literal absolute target instead of dereferencing them (high risk: the destination must have the same absolute path). Ignored when the destination is Windows
+.TP
+\fB\--literal-external-dir-links\fP
+Keep \fIexternal directory-target\fP symlinks as links with their literal target instead of skipping them (high risk: the destination must have the same absolute path). Dangling external links are still skipped unless \fB--literal-links\fP
+.TP
+\fB\--follow-links\fP \fI(rsync \-L)\fP
+Dereference every symlink (rsync \fB-L\fP): the target's content is copied in the link's place — file targets as regular files, directory targets recursed (with loop detection), Windows-source \fB.lnk\fP shortcuts followed to their target. Overrides the \fB--literal-*\fP family
+.TP
+\fB\--skip-links\fP \fI(rsync \--no-l)\fP
+Skip every symlink and shortcut entirely: not synced, not followed (rsync \fB--no-l\fP). Highest priority — overrides all other link flags
+.TP
+\fB\--no-perms\fP \fI(rsync \--no-p)\fP
+Don't preserve permission bits: the destination gets explicit 0644/0755 defaults (files/dirs) and the Windows-source executable heuristic is disabled
+.TP
+\fB\-S, \--sparse\fP \fI(rsync \-S)\fP
+Write files sparsely on the receiver: runs of zeros ≥ 4096 bytes become holes instead of allocated blocks (VM images, database files). Content bytes are unchanged
+.TP
+\fB\-X, \--xattrs\fP \fI(rsync \-X)\fP
+Copy extended attributes for files and directories (best-effort: unsettable names warn and skip; symlinks not covered). On Linux, POSIX ACLs ride along as \fBsystem.posix_acl_*\fP attributes
+.TP
+\fB\-U, \--atimes\fP \fI(rsync \-U)\fP
+Restore the source's last-access time; without it the receiver's atime is left alone. Independent of \fB--no-times\fP; never part of the quick check
+.TP
+\fB\--no-times\fP \fI(rsync \--no-t)\fP
+Don't preserve mtimes (destination gets transfer time; quick check becomes size-only)
+.TP
+\fB\--no-recursive\fP \fI(rsync \--no-r)\fP
+Sync only the source root's direct files; skip subdirectories
+.TP
+\fB\-n, \--dry-run\fP \fI(rsync \-n)\fP
+Print the transfer direction and exit without connecting (a local preview — rsync's \fB-n\fP runs a full remote dry scan with a per-file change list; cp2's \fB-n\fP is intentionally lighter)
+.TP
+\fB\-W, \--watch[=DUR]\fP
+Watch SRC and sync changes continuously (push/local: event-driven; pull: server-driven); optional d/h/m/s duration (\fB-W=1h30m\fP), default 24h
+.TP
+\fB\--watch-delay MS\fP
+Debounce quiet window for \fB--watch\fP (default 1000)
+.TP
+\fB\--delete\fP \fI(rsync \--delete)\fP
+Remove destination files not present in source
+.TP
+\fB\--max-delete N\fP \fI(rsync \--max-delete)\fP
+Refuse to delete more than N files with \fB--delete\fP
+.TP
+\fB\-u, \--update\fP \fI(rsync \-u)\fP
+Skip files where destination is newer
+.TP
+\fB\-c, \--checksum\fP \fI(rsync \-c)\fP
+Compare BLAKE3 hashes instead of size+mtime
+.TP
+\fB\--ignore-existing\fP \fI(rsync \--ignore-existing)\fP
+Skip files that already exist
+.TP
+\fB\--existing\fP \fI(rsync \--existing)\fP
+Only update existing files; don't create new ones
+.TP
+\fB\--ignore-times\fP \fI(rsync \-I)\fP
+Transfer all files, ignoring the size+mtime quick check
+.TP
+\fB\--backup\fP \fI(rsync \--backup)\fP
+Keep the replaced destination as \fB<name>~\fP
+.TP
+\fB\--remove-source-files\fP \fI(rsync \--remove-source-files)\fP
+Delete source files only after the destination is \fBhash-verified and fsynced\fP (BLAKE3 compare, per-file fsync, size+mtime re-checks both sides; move-off workflows; directories and symlinks are kept)
+.TP
+\fB\--verify\fP
+Verify the destination bytes match the source after the transfer (BLAKE3 on the fly, no re-reads; mismatches → exit 23, nothing deleted)
+.TP
+\fB\--files-from FILE\fP \fI(rsync \--files-from)\fP
+Sync only the listed \fBabsolute\fP paths (one per line, Unix or Windows line endings), mirrored under DST; relative entries rejected; SRC not used (\fBcp2 --files-from FILE DST\fP). On a remote pull the entries are server-absolute paths
+.TP
+\fB\--exclude GLOB\fP \fI(rsync \--exclude)\fP
+Exclude matching paths (repeatable)
+.TP
+\fB\--include GLOB\fP \fI(rsync \--include)\fP
+Include matching paths (repeatable)
+.TP
+\fB\--exclude-from FILE\fP \fI(rsync \--exclude-from)\fP
+Read additional exclude patterns from FILE (one per line; blank lines and \fB#\fP/\fB;\fP comments ignored)
+.TP
+\fB\--include-from FILE\fP \fI(rsync \--include-from)\fP
+Read additional include patterns from FILE (same format)
+.TP
+\fB\-i, \--itemize-changes\fP \fI(rsync \-i)\fP
+Print a per-file change line: \fB>f\fP/\fBcd\fP new, \fB>f.s\fP updated, \fB*deleting\fP removed, \fB.f\fP in-sync (rsync \fB-i\fP; covers push/local out of the plan, pull from the reproduced plan). A chmod'ed in-sync file is re-applied as an attribute-only update and shows as \fB>f.s\fP with zero bytes
+.TP
+\fB\--stats\fP \fI(rsync \--stats)\fP
+Print a detailed statistics block (files, bytes, time, skipped) after the summary
+.TP
+\fB\--list-only\fP \fI(rsync \--list-only)\fP
+List the source files without transferring (local and remote sources)
+.TP
+\fB\-j, \--jobs N\fP
+Parallel transfer + hash workers; omitted = auto-tuned from the target storage class
+.TP
+\fB\--storage auto|hdd|ssd\fP
+Storage class for auto-tuning: detect on Linux/Windows/macOS (default), or force HDD/SSD
+.TP
+\fB\-z, \--compress\fP \fI(rsync \-z)\fP
+Compress the data stream (lz4)
+.TP
+\fB\--bwlimit SIZE\fP \fI(rsync \--bwlimit)\fP
+Limit transfer bandwidth (e.g. 10M, 100K)
+.TP
+\fB\--fsync\fP
+fsync every received file before it is renamed into place (durable but slower; off by default)
+.TP
+\fB\-v, \--verbose\fP \fI(rsync \-v)\fP
+Verbosity (repeat for more: -v, -vv, -vvv)
+.TP
+\fB\-q, \--quiet\fP \fI(rsync \-q)\fP
+Suppress the non-error output: no per-file listing, no transfer summary, no deploy/watch lines (errors and the skipped-file report still print).TP
+\fB`-p, \--port PORT`\fP
+SSH port (default 22). Ports are never parsed from the target string — a numeric suffix like \fBhost:2222\fP is a path
+.TP
+\fB`--jump-host USER@HOST[:PORT]`\fP \fI(rsync `ProxyJump`)\fP
+Tunnel through a jump host (russh transport, the Windows default; system ssh reads \fBProxyJump\fP from \fB~/.ssh/config\fP instead)
+.TP
+\fB`--password PASSWORD`\fP
+Supply the target ssh password directly instead of prompting. The russh transport (Windows) sends it once and scrubs it from memory immediately; the system-ssh transport (Unix) injects it natively into the master ssh spawn on a pty (the sshpass mechanism, no external tool; password auth is forced and the master uses a run-unique socket, so the injection always sees a prompt) and scrubs it right after. Visible in the process list and shell history while the run is active — prefer keys or the prompt
+.TP
+\fB`--jump-password PASSWORD`\fP
+Password for the jump host (\fB--jump-host\fP) when it differs from \fB--password\fP; without it the jump reuses \fB--password\fP (or the prompted value). Same visibility and scrubbing caveats
+.TP
+\fB`--password-file FILE`\fP
+Read the password from FILE (first line) instead of \fB--password\fP — only the file path rides the command line, so the secret never appears in the shell history or process list. Mutually exclusive with \fB--password\fP; keep the file \fBchmod 600\fP
+.TP
+\fB`--remote-path PATH`\fP \fI(rsync `--rsync-path`)\fP
+Path of \fBcp2\fP on the remote, used as the remote command (default \fB~/.cargo/bin/cp2\fP). Shell-quoted on Unix remotes — spaces and shell metacharacters work, \fB~\fP still expands; on Windows remotes it is interpolated into a cmd/PowerShell command, so keep it free of spaces, quotes, and metacharacters
+.TP
+\fB`--binaries-dir DIR`\fP
+Directory holding prebuilt \fBcp2-<triple>\fP sidecars (checked before the directory next to this binary)
+.TP
+\fB`--no-auto-install`\fP
+Don't check/deploy the server binary before syncing
+.TP
+\fB`-a, \--archive`\fP \fI(rsync `-a`)\fP
+Full archive (byte-identical): recursion + mode/mtime/symlinks/hard links (always on) plus special files (fifos, sockets, devices), owner/group (best-effort \fBchown\fP), SUID/SGID/Sticky, and \fB--literal-links\fP (literal link targets) — *\fIUnix-like systems only\fP\fI, silently skipped on Windows. Default (no \fB-a\fP) is 0-Root: permission bits only, owner is the SSH connection user
+.TP
+\fB`--literal-links`\fP
+Keep links and shortcuts as they are (rsync \fB-l\fP): every symlink is recreated with its \fP\fIliteral target string\fP* (no DEST-relative rewrite, no external-link dereference/skip), and Windows-source \fB.lnk\fP shortcuts are copied as opaque files. On a Windows target a symlink still materializes as a \fB.lnk\fP, but the target stays literal. Implied by \fB-a\fP; overridden by \fB--skip-links\fP/\fB--follow-links\fP
+.TP
+\fB`--literal-internal-links`\fP
+Keep \fIinternal\fP symlinks (targets resolving inside SRC) with their literal target instead of the DEST-relative rewrite; external links keep the default policy
+.TP
+\fB`--literal-external-file-links`\fP
+Keep \fIexternal file-target\fP symlinks as links with their literal absolute target instead of dereferencing them (high risk: the destination must have the same absolute path). Ignored when the destination is Windows
+.TP
+\fB`--literal-external-dir-links`\fP
+Keep \fIexternal directory-target\fP symlinks as links with their literal target instead of skipping them (high risk: the destination must have the same absolute path). Dangling external links are still skipped unless \fB--literal-links\fP
+.TP
+\fB`--follow-links`\fP \fI(rsync `-L`)\fP
+Dereference every symlink (rsync \fB-L\fP): the target's content is copied in the link's place — file targets as regular files, directory targets recursed (with loop detection), Windows-source \fB.lnk\fP shortcuts followed to their target. Overrides the \fB--literal-*\fP family
+.TP
+\fB`--skip-links`\fP \fI(rsync `--no-l`)\fP
+Skip every symlink and shortcut entirely: not synced, not followed (rsync \fB--no-l\fP). Highest priority — overrides all other link flags
+.TP
+\fB`--no-perms`\fP \fI(rsync `--no-p`)\fP
+Don't preserve permission bits: the destination gets explicit 0644/0755 defaults (files/dirs) and the Windows-source executable heuristic is disabled
+.TP
+\fB`-S, \--sparse`\fP \fI(rsync `-S`)\fP
+Write files sparsely on the receiver: runs of zeros ≥ 4096 bytes become holes instead of allocated blocks (VM images, database files). Content bytes are unchanged
+.TP
+\fB`-X, \--xattrs`\fP \fI(rsync `-X`)\fP
+Copy extended attributes for files and directories (best-effort: unsettable names warn and skip; symlinks not covered). On Linux, POSIX ACLs ride along as \fBsystem.posix_acl_*\fP attributes
+.TP
+\fB`-U, \--atimes`\fP \fI(rsync `-U`)\fP
+Restore the source's last-access time; without it the receiver's atime is left alone. Independent of \fB--no-times\fP; never part of the quick check
+.TP
+\fB`--no-times`\fP \fI(rsync `--no-t`)\fP
+Don't preserve mtimes (destination gets transfer time; quick check becomes size-only)
+.TP
+\fB`--no-recursive`\fP \fI(rsync `--no-r`)\fP
+Sync only the source root's direct files; skip subdirectories
+.TP
+\fB`-n, \--dry-run`\fP \fI(rsync `-n`)\fP
+Print the transfer direction and exit without connecting (a local preview — rsync's \fB-n\fP runs a full remote dry scan with a per-file change list; cp2's \fB-n\fP is intentionally lighter)
+.TP
+\fB`-W, \--watch[=DUR]`\fP
+Watch SRC and sync changes continuously (push/local: event-driven; pull: server-driven); optional d/h/m/s duration (\fB-W=1h30m\fP), default 24h
+.TP
+\fB`--watch-delay MS`\fP
+Debounce quiet window for \fB--watch\fP (default 1000)
+.TP
+\fB`--delete`\fP \fI(rsync `--delete`)\fP
+Remove destination files not present in source
+.TP
+\fB`--max-delete N`\fP \fI(rsync `--max-delete`)\fP
+Refuse to delete more than N files with \fB--delete\fP
+.TP
+\fB`-u, \--update`\fP \fI(rsync `-u`)\fP
+Skip files where destination is newer
+.TP
+\fB`-c, \--checksum`\fP \fI(rsync `-c`)\fP
+Compare BLAKE3 hashes instead of size+mtime
+.TP
+\fB`--ignore-existing`\fP \fI(rsync `--ignore-existing`)\fP
+Skip files that already exist
+.TP
+\fB`--existing`\fP \fI(rsync `--existing`)\fP
+Only update existing files; don't create new ones
+.TP
+\fB`--ignore-times`\fP \fI(rsync `-I`)\fP
+Transfer all files, ignoring the size+mtime quick check
+.TP
+\fB`--backup`\fP \fI(rsync `--backup`)\fP
+Keep the replaced destination as \fB<name>~\fP
+.TP
+\fB`--remove-source-files`\fP \fI(rsync `--remove-source-files`)\fP
+Delete source files only after the destination is *\fIhash-verified and fsynced\fP\fI (BLAKE3 compare, per-file fsync, size+mtime re-checks both sides; move-off workflows; directories and symlinks are kept)
+.TP
+\fB`--verify`\fP
+Verify the destination bytes match the source after the transfer (BLAKE3 on the fly, no re-reads; mismatches → exit 23, nothing deleted)
+.TP
+\fB`--files-from FILE`\fP \fI(rsync `--files-from`)\fP
+Sync only the listed \fP\fIabsolute\fP* paths (one per line, Unix or Windows line endings), mirrored under DST; relative entries rejected; SRC not used (\fBcp2 --files-from FILE DST\fP). On a remote pull the entries are server-absolute paths
+.TP
+\fB`--exclude GLOB`\fP \fI(rsync `--exclude`)\fP
+Exclude matching paths (repeatable)
+.TP
+\fB`--include GLOB`\fP \fI(rsync `--include`)\fP
+Include matching paths (repeatable)
+.TP
+\fB`--exclude-from FILE`\fP \fI(rsync `--exclude-from`)\fP
+Read additional exclude patterns from FILE (one per line; blank lines and \fB#\fP/\fB;\fP comments ignored)
+.TP
+\fB`--include-from FILE`\fP \fI(rsync `--include-from`)\fP
+Read additional include patterns from FILE (same format)
+.TP
+\fB`-i, \--itemize-changes`\fP \fI(rsync `-i`)\fP
+Print a per-file change line: \fB>f\fP/\fBcd\fP new, \fB>f.s\fP updated, \fB*deleting\fP removed, \fB.f\fP in-sync (rsync \fB-i\fP; covers push/local out of the plan, pull from the reproduced plan). A chmod'ed in-sync file is re-applied as an attribute-only update and shows as \fB>f.s\fP with zero bytes
+.TP
+\fB`--stats`\fP \fI(rsync `--stats`)\fP
+Print a detailed statistics block (files, bytes, time, skipped) after the summary
+.TP
+\fB`--list-only`\fP \fI(rsync `--list-only`)\fP
+List the source files without transferring (local and remote sources)
+.TP
+\fB`-j, \--jobs N`\fP
+Parallel transfer + hash workers; omitted = auto-tuned from the target storage class
+.TP
+\fB`--storage auto|hdd|ssd`\fP
+Storage class for auto-tuning: detect on Linux/Windows/macOS (default), or force HDD/SSD
+.TP
+\fB`-z, \--compress`\fP \fI(rsync `-z`)\fP
+Compress the data stream (lz4)
+.TP
+\fB`--bwlimit SIZE`\fP \fI(rsync `--bwlimit`)\fP
+Limit transfer bandwidth (e.g. 10M, 100K)
+.TP
+\fB`--fsync`\fP
+fsync every received file before it is renamed into place (durable but slower; off by default)
+.TP
+\fB`-v, \--verbose`\fP \fI(rsync `-v`)\fP
+Verbosity (repeat for more: -v, -vv, -vvv)
+.TP
+\fB`-q, \--quiet`\fP \fI(rsync `-q`)\fP
+Suppress the non-error output: no per-file listing, no transfer summary, no deploy/watch lines (errors and the skipped-file report still print)
+.SH EXIT STATUS
+.TP
+.B 0
+Success.
+.TP
+.B 1
+An error occurred (usage, connection, protocol, deploy).
+.TP
+.B 23
+Partial failure (rsync's convention): some files could not be
+transferred \- \-\-verify reports a mismatch, or a file failed mid-run.
+.SH EXAMPLES
+.nf
+# First sync: pushes ./photos to ~/backup on the server, deploying cp2 there
+cp2 ./photos user@server:backup
+
+# Restore: pull it back down
+cp2 user@server:backup ./restore
+
+# Custom SSH port
+cp2 \-p 2222 ./data user@host:backup
+
+# Preview first, then sync
+cp2 \-n ./data user@host:backup
+
+# Move data off a capture instrument, then free its disk
+cp2 \-\-verify \-\-remove-source-files /data user@host:storage
+
+# Keep watching a folder for 12 hours
+cp2 \-W=12h ./data user@host:backup
+
+# Quoted glob sources are expanded by cp2
+cp2 './src/*.rs' user@host:backup
+.fi
+.SH SEE ALSO
+.BR rsync (1),
+.BR ssh (1)
+.PP
+The full manual, benchmark comparisons, and architecture notes live in the
+repository README and ARCHITECTURE.

@@ -232,6 +232,8 @@ listing and progress are silenced by `-q`.
 `cp2 --server` is the sshd-invoked server mode (like rsync's `--server`): it
 reads the protocol from stdin and writes to stdout. Not for direct use.
 
+The same reference is available as a man page: `man ./docs/cp2.1`.
+
 ## How it works
 
 A sync deploys the server binary if needed, exchanges file manifests, plans
