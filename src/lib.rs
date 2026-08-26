@@ -93,6 +93,9 @@ pub mod sync;
 pub mod target;
 pub mod transport;
 
+#[cfg(test)]
+mod test_fuzz;
+
 pub use error::{Error, Result};
 pub use sync::{
     BandwidthLimiter, Executor, ExecutorOptions, FileEntry, FilterSet, Manifest, Planner, PlannerConfig, ScanOptions,

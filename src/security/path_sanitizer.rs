@@ -118,6 +118,7 @@ impl PathSanitizer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_fuzz::FuzzRng;
     use tempfile::TempDir;
 
     #[test]
@@ -176,6 +177,28 @@ mod tests {
             sanitizer.join(""),
             Err(SecurityError::AbsolutePathNotAllowed)
         ));
+    }
+
+    #[test]
+    fn fuzz_join_never_panics_and_stays_contained() {
+        // Arbitrary peer-supplied paths (traversal tokens, separators, glob
+        // metacharacters, unicode, NUL, ...) must never panic the sanitizer,
+        // and every accepted path must stay lexically under the root with no
+        // parent component.
+        let temp = TempDir::new().unwrap();
+        let sanitizer = PathSanitizer::new(temp.path()).unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let mut rng = FuzzRng::new(0x5A17_1E2E_0F0D_CAFE);
+        for _ in 0..2_000 {
+            let s = rng.string(48);
+            if let Ok(path) = sanitizer.join(&s) {
+                assert!(path.starts_with(&root), "join({s:?}) escaped: {path:?}");
+                assert!(
+                    !path.components().any(|c| matches!(c, Component::ParentDir)),
+                    "join({s:?}) introduced a parent component: {path:?}"
+                );
+            }
+        }
     }
 
     #[cfg(unix)]

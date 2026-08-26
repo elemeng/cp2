@@ -101,6 +101,22 @@ pub fn decode(prefix: [u8; 4], payload: &[u8]) -> Result<Frame> {
         ));
     }
     if len & (1 << 31) != 0 {
+        // The lz4 payload's first four bytes claim the decompressed size. A
+        // hostile peer controls that value, and `decompress_size_prepended`
+        // allocates the full claim up front — a ~100-byte frame could force
+        // a multi-gigabyte allocation. Cap the claim at the wire's own
+        // length bound: nothing an honest peer sends decompresses to more
+        // (bulk data rides the raw layouts, which never compress, and every
+        // postcard frame passes `encode`'s `MAX_LEN` check).
+        let claimed = payload
+            .get(0..4)
+            .ok_or_else(|| ProtocolError::Protocol("Truncated lz4 size header".to_string()))?;
+        let claimed = u32::from_le_bytes([claimed[0], claimed[1], claimed[2], claimed[3]]);
+        if claimed > MAX_LEN {
+            return Err(ProtocolError::Protocol(format!(
+                "Compressed frame claims {claimed} bytes, above the {MAX_LEN} cap"
+            )));
+        }
         let data = lz4_flex::block::decompress_size_prepended(payload)
             .map_err(|e| ProtocolError::Protocol(format!("Failed to decompress frame: {e}")))?;
         postcard::from_bytes(&data)
@@ -464,6 +480,7 @@ mod tests {
     use super::*;
     use crate::delta::Delta;
     use crate::protocol::{BatchFile, BatchItem, BUILD_FINGERPRINT};
+    use crate::test_fuzz::FuzzRng;
 
     fn small_frame() -> Frame {
         Frame::Hello {
@@ -620,6 +637,81 @@ mod tests {
             .block_on(async { receive_frame(&mut cursor).await })
             .unwrap_err();
         assert!(err.to_string().contains("Unknown raw-layout frame tag"));
+    }
+
+    #[test]
+    fn compressed_frame_size_claim_is_capped() {
+        // The lz4 size header is attacker-controlled; a claim above the wire
+        // cap must be rejected before any allocation happens (a tiny frame
+        // must not force a multi-gigabyte `Vec::with_capacity`).
+        let mut payload = vec![0u8; 16];
+        payload[0..4].copy_from_slice(&MAX_LEN.wrapping_add(1).to_le_bytes());
+        let prefix = (1u32 << 31).to_be_bytes();
+        let err = decode(prefix, &payload).unwrap_err();
+        assert!(err.to_string().contains("above the"), "{err}");
+        // The largest claim the guard allows still fails cleanly on garbage
+        // (no panic, no oversized allocation).
+        let mut payload = vec![0u8; 16];
+        payload[0..4].copy_from_slice(&MAX_LEN.to_le_bytes());
+        assert!(decode(prefix, &payload).is_err());
+    }
+
+    #[test]
+    fn fuzz_decode_never_panics_and_roundtrips() {
+        // Arbitrary wires off the postcard path: decode must never panic, and
+        // any frame it accepts must decode again identically after a plain
+        // re-encode (decode is a pure function; an Ok result implies a
+        // well-formed, stable frame). Compressed-flagged payloads get a small
+        // size claim so the loop stays allocation-bounded — the unbounded
+        // claim is exercised by `compressed_frame_size_claim_is_capped`.
+        let mut rng = FuzzRng::new(0xD3C0_DE5E_CAFE_F00D);
+        for _ in 0..2_000 {
+            let mut wire = rng.bytes(4096);
+            if wire.len() < 4 {
+                continue;
+            }
+            let prefix: [u8; 4] = wire[0..4].try_into().unwrap();
+            if u32::from_be_bytes(prefix) & (1 << 31) != 0 && wire.len() >= 8 {
+                let claim = u32::try_from(rng.below(16 * 1024)).unwrap_or(u32::MAX);
+                wire[4..8].copy_from_slice(&claim.to_le_bytes());
+            }
+            let payload = &wire[4..];
+            if let Ok(frame) = decode(prefix, payload) {
+                let wire2 = encode(&frame, false, 0).unwrap();
+                let (prefix2, payload2) = wire2.split_at(4);
+                let again = decode(prefix2.try_into().unwrap(), payload2).unwrap();
+                assert_eq!(format!("{frame:?}"), format!("{again:?}"));
+            }
+        }
+    }
+
+    #[test]
+    fn fuzz_receive_frame_never_panics() {
+        // The full receive path — length prefix, raw-layout tags (chunk and
+        // batch), count/path_len/data_len bounds, and the postcard decode —
+        // must never panic on arbitrary bytes. Same small-claim treatment as
+        // the decode fuzz for compressed-flagged prefixes.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .build()
+            .unwrap();
+        let mut rng = FuzzRng::new(0xDEAD_BEEF_0BAD_F00D);
+        for _ in 0..1_000 {
+            let mut wire = rng.bytes(4096);
+            if wire.len() < 4 {
+                continue;
+            }
+            if u32::from_be_bytes(wire[0..4].try_into().unwrap()) & (1 << 31) != 0
+                && wire.len() >= 8
+            {
+                let claim = u32::try_from(rng.below(16 * 1024)).unwrap_or(u32::MAX);
+                wire[4..8].copy_from_slice(&claim.to_le_bytes());
+            }
+            let mut cursor = std::io::Cursor::new(wire);
+            // Ok (a well-formed frame) or Err (EOF/parse) are both fine; a
+            // panic is the failure.
+            let _ = rt.block_on(async { receive_frame(&mut cursor).await });
+        }
     }
 
     #[tokio::test]

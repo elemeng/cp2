@@ -1271,6 +1271,7 @@ fn expand_remote_glob(root: &Path, pattern: &str) -> Result<Option<(PathBuf, Vec
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_fuzz::FuzzRng;
 
     fn options(jobs: Option<usize>, storage: StoragePreference) -> ExecutorOptions {
         ExecutorOptions {
@@ -1350,5 +1351,66 @@ mod tests {
         // `..` is still rejected in both forms.
         assert!(resolve_serve_path(root.path(), "..").is_err());
         assert!(resolve_serve_path(root.path(), "/home/user/../x").is_err());
+    }
+
+    #[test]
+    fn fuzz_pull_roots_and_remote_glob_never_panic() {
+        // Arbitrary remote source patterns (globs, traversal tokens,
+        // separators, unicode, NUL) must never panic the glob expansion or
+        // pull-root resolution, and every accepted plan must keep its roots
+        // under the returned base.
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("d1")).unwrap();
+        std::fs::write(root.path().join("d1/a.txt"), b"x").unwrap();
+        std::fs::write(root.path().join("d1/a.bin"), b"x").unwrap();
+
+        let mut rng = FuzzRng::new(0x6C08_5EC7_6C0B_5EED);
+        for _ in 0..1_000 {
+            let pattern = if rng.below(2) == 0 {
+                rng.pathish(4)
+            } else {
+                rng.string(32)
+            };
+
+            if let Ok(Some((base, matches))) = expand_remote_glob(root.path(), &pattern) {
+                assert!(
+                    matches.iter().all(|m| m.starts_with(&base)),
+                    "glob {pattern:?} escaped {base:?}: {matches:?}"
+                );
+            }
+            let _ = remote_glob_needs_expansion(root.path(), &pattern);
+
+            // Single-path resolution (the `--files-from`/glob branch): the
+            // plain-path cases return the "no files match" error by design —
+            // the classic single-path pull never reaches this function.
+            if let Ok((base, roots)) =
+                resolve_pull_roots(root.path(), std::slice::from_ref(&pattern))
+            {
+                assert!(!roots.is_empty());
+                assert!(
+                    roots.iter().all(|r| r.starts_with(&base)),
+                    "single-path {pattern:?} escaped {base:?}"
+                );
+            }
+
+            // Multi-path resolution with mixed absolute/relative/glob entries.
+            let n = 1 + rng.below(3);
+            let paths: Vec<String> = (0..n)
+                .map(|_| {
+                    if rng.below(2) == 0 {
+                        format!("/{}", rng.pathish(3))
+                    } else {
+                        rng.pathish(3)
+                    }
+                })
+                .collect();
+            if let Ok((base, roots)) = resolve_pull_roots(root.path(), &paths) {
+                assert!(!roots.is_empty());
+                assert!(
+                    roots.iter().all(|r| r.starts_with(&base)),
+                    "multi-path {paths:?} escaped {base:?}"
+                );
+            }
+        }
     }
 }
