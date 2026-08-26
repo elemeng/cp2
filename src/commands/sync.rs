@@ -258,7 +258,7 @@ pub async fn execute(cli: &mut Cli) -> Result<()> {
                 )
                 .await?;
                 if !cli.quiet {
-                    println!("Listing {}:", &remote);
+                    println!("Listing {remote}:");
                 }
                 for e in &stats.changes {
                     println!("{} {:>12} {}", e.kind, e.size, e.path);
