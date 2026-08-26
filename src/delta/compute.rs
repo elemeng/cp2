@@ -166,6 +166,102 @@ pub fn compute_delta_limited<R: Read>(
     Ok(delta)
 }
 
+/// Chunk and hash a whole source file, producing its chunk signature and,
+/// when `verify`, the whole-file BLAKE3 (the resulting delta's checksum).
+///
+/// This is the sender-side half of the delta computation, split from
+/// [`compute_delta_from_signatures`] so it can overlap the receiver's basis
+/// signing: the two full-file passes otherwise serialize the transfer (the
+/// signature needs no basis, and the matching needs no bytes beyond the
+/// chunk hashes already computed here).
+///
+/// # Errors
+///
+/// Returns an error if reading the source fails.
+pub fn sign_source<R: Read>(
+    source: &mut R,
+    verify: bool,
+) -> DeltaResult<(Signature, Option<[u8; 32]>)> {
+    let mut hasher = verify.then(blake3::Hasher::new);
+    let mut chunks = Vec::new();
+    let file_size = for_each_chunk(source, |chunk| {
+        let hash = chunk_hash(chunk)?;
+        let len = u32::try_from(chunk.len())
+            .map_err(|_| DeltaError::Chunking("chunk too large".to_string()))?;
+        // The emitted chunks cover the whole stream contiguously, so hashing
+        // them in order is hashing the stream.
+        if let Some(h) = &mut hasher {
+            h.update(&chunk.data);
+        }
+        chunks.push(ChunkSignature::from_parts(chunk.start(), len, hash));
+        Ok(())
+    })?;
+    Ok((
+        Signature {
+            file_size,
+            chunks,
+        },
+        hasher.map(|h| *h.finalize().as_bytes()),
+    ))
+}
+
+/// Match a pre-computed source signature against a basis signature, emitting
+/// the delta ops (the matching half of [`sign_source`]).
+///
+/// Literal bytes are re-read from the source in stream position — one
+/// bounded read per literal chunk — so the sender's fill pass touches just
+/// the literal bytes instead of a second full-file read, and the op order
+/// stays source-ordered (copies and literals interleave; a literal appended
+/// late would reconstruct the wrong byte stream). Chunk boundaries come from
+/// the same `FastCDC` pipeline as the basis signing, so the resulting ops
+/// are identical to a one-pass [`compute_delta_limited`].
+///
+/// # Errors
+///
+/// Returns an error if reading the source fails or the literal budget is
+/// exceeded.
+pub fn compute_delta_from_signatures<R: Read + Seek>(
+    source: &mut R,
+    basis: &Signature,
+    source_sig: &Signature,
+    max_literal: u64,
+) -> DeltaResult<Delta> {
+    let table = SignatureTable::from_signature(basis);
+    let mut delta = Delta::new(0, basis.file_size);
+    let mut literal_bytes: u64 = 0;
+    for chunk in &source_sig.chunks {
+        if let Some(sig) = table.find(&chunk.strong_hash) {
+            delta.push_copy(sig.offset, sig.len);
+        } else {
+            literal_bytes += u64::from(chunk.len);
+            if literal_bytes > max_literal {
+                return Err(DeltaError::LiteralBudgetExceeded { limit: max_literal });
+            }
+            // Chunks are bounded by the config's max size (64 KiB), so the
+            // usize cast is lossless on any real platform.
+            source.seek(SeekFrom::Start(chunk.offset)).map_err(|e| {
+                DeltaError::Chunking(format!("seek error: {e}"))
+            })?;
+            let size = usize::try_from(chunk.len)
+                .map_err(|_| DeltaError::Chunking("chunk too large".to_string()))?;
+            let mut buf = vec![0u8; size];
+            source.read_exact(&mut buf).map_err(|e| {
+                DeltaError::Chunking(format!("read error: {e}"))
+            })?;
+            delta.push_literal_owned(buf);
+        }
+    }
+    delta.source_size = source_sig.file_size;
+
+    debug_assert_eq!(
+        delta.bytes_matched() + delta.bytes_literal(),
+        delta.source_size,
+        "delta bytes must sum to source size"
+    );
+
+    Ok(delta)
+}
+
 /// Emit one op for a source chunk: a `Copy` of the matching basis chunk, or
 /// the chunk's bytes as a `Literal`. Returns the number of literal bytes
 /// pushed (0 for a copy), so callers can budget the in-memory literal
@@ -723,6 +819,78 @@ pub fn apply_patch<R: Read + Seek, W: Write>(
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    #[test]
+    fn delta_from_signatures_matches_one_pass() {
+        // The split engine (sign_source + compute_delta_from_signatures) must
+        // emit the same ops as the one-pass compute_delta_limited. The basis
+        // is pseudo-random and 1 MiB (dozens of chunks), so both copy-heavy
+        // and literal-heavy layouts interleave — a single-chunk file would
+        // not exercise the ordering (the ops must stay source-ordered).
+        let mut rng = 0x5EED_u64;
+        let mut rand_bytes = |n: usize| {
+            let mut v = Vec::with_capacity(n);
+            for _ in 0..n {
+                rng ^= rng << 13;
+                rng ^= rng >> 7;
+                rng ^= rng << 17;
+                v.push(u8::try_from(rng).unwrap_or(u8::MAX));
+            }
+            v
+        };
+        let basis = rand_bytes(1024 * 1024);
+        let all_literal = rand_bytes(700 * 1024);
+        let cases = [
+            // mid-file insertion (tail shifts: chunk boundaries move)
+            {
+                let mut s = basis.clone();
+                s.splice(500 * 1024..500 * 1024, rand_bytes(70000));
+                s
+            },
+            // mid-file overwrite
+            {
+                let mut s = basis.clone();
+                s[300 * 1024..300 * 1024 + 4096].copy_from_slice(&rand_bytes(4096));
+                s
+            },
+            // appended tail
+            {
+                let mut s = basis.clone();
+                s.extend_from_slice(&rand_bytes(123_456));
+                s
+            },
+            // completely different content (all literal)
+            all_literal.clone(),
+        ];
+        for (i, source) in cases.iter().enumerate() {
+            let basis_sig = Signature::generate(&mut Cursor::new(basis.as_slice())).unwrap();
+            let (src_sig, _) = sign_source(&mut Cursor::new(source.as_slice()), false).unwrap();
+            let split =
+                compute_delta_from_signatures(&mut Cursor::new(source.as_slice()), &basis_sig, &src_sig, u64::MAX)
+                    .unwrap();
+            let one_pass =
+                compute_delta_limited(&mut Cursor::new(source.as_slice()), &basis_sig, u64::MAX, false, None)
+                    .unwrap();
+
+            let mut out_split = Vec::new();
+            let mut out_one = Vec::new();
+            apply_patch(Cursor::new(&basis), &split, &mut out_split, None).unwrap();
+            apply_patch(Cursor::new(&basis), &one_pass, &mut out_one, None).unwrap();
+            assert_eq!(out_split, *source, "split engine must reconstruct the source");
+            assert_eq!(out_one, *source, "one-pass engine must reconstruct the source");
+            assert_eq!(out_split, out_one, "split and one-pass engines must agree");
+            // The literal payload is only what changed, not the whole file
+            // (the all-literal case legitimately resends everything).
+            if i < 3 {
+                assert!(
+                    split.bytes_literal() < source.len() as u64 / 2,
+                    "an edit must not resend the majority of the file ({} literal of {})",
+                    split.bytes_literal(),
+                    source.len()
+                );
+            }
+        }
+    }
 
     #[test]
     fn delta_identical_files() {

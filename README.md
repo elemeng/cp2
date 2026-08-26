@@ -264,6 +264,10 @@ scp             2.26s        2.26s        3.98s        4.01s
 sy              2.59s        4.73s       14.29s        0.89s
 ```
 
+(The cp2 rows predate the delta-overlap optimization described under the
+mixed-tree table: after it, cp2's large-edit re-measures at ≈1.8s vs
+rsync's ≈1.6s — see below.)
+
 ### Mixed tree (≈10 GiB, 100 K files)
 
 `bench/mixed-tree.sh` — 70 K small 1-16 KiB, 27 K medium 64-384 KiB, 3 K
@@ -278,13 +282,16 @@ cp2 used the russh transport):
 
 Both destinations end byte-identical to the edited source (`rsync -rltc`
 dry-run: 0 differing files on each side). cp2 wins the 100 K-file fresh
-push; the edit phase favors rsync on localhost — cp2 sends only ~22 MB of
-changed bytes but pays the basis signature and compute re-reads across
-100 K files, the same hashing-bound profile as the large-edit scenario
-above. (The first attempt of this run used the system-ssh transport and
-deadlocked in OpenSSH's ControlMaster mux on a server-side stderr write —
-25 min with no progress; the same phase over the russh transport completed
-in 55s. The system-ssh path is under investigation.)
+push; the edit phase favored rsync on localhost — cp2 sent only ~22 MB of
+changed bytes but the basis signature and the delta compute serialized
+across 100 K files. That serialization is gone since this run: the sender's
+source chunking now runs concurrently with the receiver's basis signing
+(the two full-file passes execute on different machines), which re-measures
+the single-file large-edit from 2.53s to ≈1.8s. (This run's first attempt
+used the system-ssh transport and deadlocked in OpenSSH's ControlMaster mux
+on a server-side stderr write — 25 min with no progress; the same phase
+over the russh transport completed in 55s. The system-ssh path is under
+investigation.)
 
 ### The studied crates, honestly
 

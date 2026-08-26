@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::delta::{Delta, DeltaError, Signature, compute_delta_limited, compute_delta_rollsum};
+use crate::delta::{Delta, DeltaError, Signature, compute_delta_from_signatures, compute_delta_limited, compute_delta_rollsum, sign_source};
 use crate::protocol::{
     BatchFile, BatchItem, FileMeta, Frame, LinkSpec, SignatureEntry, SkippedFile,
     stream,
@@ -387,8 +387,19 @@ impl Sender {
         ctrl_send: &mut W,
         ctrl_recv: &mut R,
         plan: &SyncPlan,
-    ) -> Result<HashMap<String, Arc<Signature>>> {
+        source_root: &Path,
+        files_total: u64,
+    ) -> Result<(
+        HashMap<String, Arc<Signature>>,
+        HashMap<String, std::sync::mpsc::Receiver<Result<SourceSig>>>,
+    )> {
         let mut need_sig: Vec<String> = Vec::new();
+        // Large files' source signing costs ~0.5s+ per pass; spawn it now —
+        // in parallel with the receiver's basis signing — instead of after
+        // the signature round trip (the passes even run on different
+        // machines). Medium updates stay windowed in the transfer loop.
+        let mut prefetch: HashMap<String, std::sync::mpsc::Receiver<Result<SourceSig>>> =
+            HashMap::new();
         for task in plan.tasks() {
             // Hard-link members are never delta-transferred (they become
             // `CreateLinks` entries), so their basis signatures are not needed.
@@ -397,11 +408,29 @@ impl Sender {
             }
             let dest_exists = task.action == SyncAction::Update;
             if determine_strategy(task.source_size, dest_exists) == TransferStrategy::Delta {
-                need_sig.push(wire_rel(&task.relative_path));
+                let rel = wire_rel(&task.relative_path);
+                need_sig.push(rel.clone());
+                if !self.rollsum && task.source_size >= BIG_DELTA_PREFETCH_MIN {
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    let full = task_source(source_root, task);
+                    let display = rel.clone();
+                    let progress = self.progress.clone();
+                    let verify_hash = self.verify_hash;
+                    tokio::task::spawn_blocking(move || {
+                        let _ = tx.send(sign_source_task(
+                            &full,
+                            display,
+                            progress,
+                            verify_hash,
+                            files_total,
+                        ));
+                    });
+                    prefetch.insert(rel, rx);
+                }
             }
         }
-        self.request_signatures(ctrl_send, ctrl_recv, &need_sig)
-            .await
+        let sigs = self.request_signatures(ctrl_send, ctrl_recv, &need_sig).await?;
+        Ok((sigs, prefetch))
     }
 
     /// Create (or replace) empty directories up front; files create their own
@@ -553,8 +582,8 @@ impl Sender {
         // First pass: request basis signatures for the files that will
         // delta-transfer, up front (in bounded groups — see
         // `request_signatures`).
-        let mut sig_map = self
-            .request_needed_signatures(ctrl_send, ctrl_recv, plan)
+        let (mut sig_map, mut prefetch_map) = self
+            .request_needed_signatures(ctrl_send, ctrl_recv, plan, source_root, files_total)
             .await?;
 
         // Sliding window over in-flight delta computations: each one streams
@@ -825,6 +854,31 @@ impl Sender {
                 let full_compute = full.clone();
                 let verify_hash = self.verify_hash;
                 let rollsum = self.rollsum;
+                // Large files were prefetched with the signature requests
+                // (`request_needed_signatures`); medium updates spawn their
+                // source signing here. Either way the delta job only waits
+                // on a channel, never re-chunks the source after the basis
+                // arrives.
+                let source_sig_rx = if rollsum {
+                    None
+                } else if let Some(rx) = prefetch_map.remove(&rel_display) {
+                    Some(rx)
+                } else {
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    let sign_full = full_compute.clone();
+                    let sign_display = display.clone();
+                    let sign_progress = progress.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let _ = tx.send(sign_source_task(
+                            &sign_full,
+                            sign_display,
+                            sign_progress,
+                            verify_hash,
+                            files_total,
+                        ));
+                    });
+                    Some(rx)
+                };
                 // A delta-path reference's source signature (the free
                 // byproduct) feeds its cross-file dependents; a medium
                 // whole-literal reference has no byproduct, so a signature
@@ -848,6 +902,7 @@ impl Sender {
                             compute_delta_job(
                                 &full_compute,
                                 sig,
+                                source_sig_rx,
                                 display,
                                 progress.as_ref(),
                                 verify_hash,
@@ -1427,14 +1482,53 @@ fn read_whole_delta(
     Ok(PreparedDelta::Delta(delta, None, None))
 }
 
-/// Compute a delta for one file on a blocking thread: stream the source
-/// through the budgeted engine. A missing or empty basis means the whole file
-/// would be one in-memory literal — [`PreparedDelta::ChunkedFallback`] lets
-/// the caller stream it instead. `verify_hash` requests the whole-file
-/// checksum (consumed by the post-transfer comparison).
+/// Chunk and hash a whole source file on a blocking thread, producing its
+/// chunk signature and, under verification, the whole-file checksum.
+///
+/// The sender runs this concurrently with the basis-signature wait: chunking
+/// needs no basis, and the two full-file passes otherwise serialize on the
+/// signature round trip (they even run on different machines). The matching
+/// half ([`compute_delta_from_signatures`]) then needs only the changed
+/// regions' bytes re-read from the source.
+fn sign_source_task(
+    full: &Path,
+    display: String,
+    progress: Option<ProgressFn>,
+    verify_hash: bool,
+    files_total: u64,
+) -> Result<(Signature, Option<[u8; 32]>)> {
+    let file = std::fs::File::open(full).map_err(Error::Io)?;
+    let len = file.metadata().map_err(Error::Io)?.len();
+    let mut source: Box<dyn std::io::Read> = match progress {
+        Some(report) => Box::new(crate::sync::executor::ProgressStream::new(
+            file,
+            display,
+            len,
+            files_total,
+            report,
+        )),
+        None => Box::new(file),
+    };
+    sign_source(&mut source, verify_hash).map_err(Error::from)
+}
+
+/// Compute a delta for one file on a blocking thread: match the basis
+/// signature (already awaited) against the source signature the sender
+/// prefetched ([`sign_source_task`]) and re-read just the literal regions.
+/// A missing or empty basis means the whole file would be one in-memory
+/// literal — [`PreparedDelta::ChunkedFallback`] lets the caller stream it
+/// instead. `verify_hash` requests the whole-file checksum (consumed by the
+/// post-transfer comparison).
+/// A prefetched source signature: the chunk table (and, under
+/// verification, the whole-file checksum) the sender computes concurrently
+/// with the basis-signature wait (see [`sign_source_task`]).
+type SourceSig = (Signature, Option<[u8; 32]>);
+
+#[expect(clippy::too_many_arguments, reason = "job context: path, basis, prefetch channel, display, progress, flags")]
 fn compute_delta_job(
     full: &Path,
     sig: Option<Arc<Signature>>,
+    source_sig_rx: Option<std::sync::mpsc::Receiver<Result<SourceSig>>>,
     display: String,
     progress: Option<&ProgressFn>,
     verify_hash: bool,
@@ -1449,27 +1543,31 @@ fn compute_delta_job(
         // front so a large source never becomes one in-memory literal.
         return Ok(PreparedDelta::ChunkedFallback);
     }
-    let file = std::fs::File::open(full).map_err(Error::Io)?;
-    let len = file.metadata().map_err(Error::Io)?.len();
-    let mut source: Box<dyn std::io::Read> = match progress {
-        Some(report) => {
-            Box::new(crate::sync::executor::ProgressStream::new(
+    // The rollsum engine (rsync-style): fixed blocks + byte-sliding scan.
+    // The signature format differs (weak checksums present), the delta op
+    // format is identical, and there is no chunk-signature byproduct (the
+    // sigCache stays a CDC feature on this branch). No source prefetch —
+    // the engine reads the source itself, as before.
+    if rollsum {
+        let file = std::fs::File::open(full).map_err(Error::Io)?;
+        let len = file.metadata().map_err(Error::Io)?.len();
+        let mut source: Box<dyn std::io::Read> = match progress {
+            Some(report) => Box::new(crate::sync::executor::ProgressStream::new(
                 file,
                 display,
                 len,
                 files_total,
                 Arc::clone(report),
-            ))
-        }
-        None => Box::new(file),
-    };
-    // The rollsum engine (rsync-style): fixed blocks + byte-sliding scan.
-    // The signature format differs (weak checksums present), the delta op
-    // format is identical, and there is no chunk-signature byproduct (the
-    // sigCache stays a CDC feature on this branch).
-    if rollsum {
-        return match compute_delta_rollsum(&mut source, &sig, DELTA_LITERAL_CHUNK_LIMIT, verify_hash)
-            .map_err(Error::from)
+            )),
+            None => Box::new(file),
+        };
+        return match compute_delta_rollsum(
+            &mut source,
+            &sig,
+            DELTA_LITERAL_CHUNK_LIMIT,
+            verify_hash,
+        )
+        .map_err(Error::from)
         {
             Ok(delta) => Ok(PreparedDelta::Delta(delta, None, None)),
             Err(Error::Delta(DeltaError::LiteralBudgetExceeded { .. })) => {
@@ -1478,26 +1576,30 @@ fn compute_delta_job(
             Err(e) => Err(e),
         };
     }
-    // Budgeted: a basis that matches nothing aborts at the limit instead of
-    // accumulating the whole file as one literal. The source's chunk
-    // signature is collected as a free byproduct (the per-chunk hashes are
-    // already computed for matching) — the receiver caches it so the next
-    // run's basis signing can skip re-reading the destination.
-    let mut source_sig = Vec::new();
-    match compute_delta_limited(
-        &mut source,
+
+    // CDC path: the source's chunk signature was computed concurrently with
+    // the basis-signature wait (see the caller) — match the two chunk tables
+    // and re-read only the literal regions to fill the ops. The source
+    // signature is also the free byproduct the receiver caches for the next
+    // run's basis signing.
+    let (source_sig, checksum) = source_sig_rx
+        .ok_or_else(|| Error::Other("delta job without a source prefetch".to_string()))?
+        .recv()
+        .map_err(|_| Error::Other("source signature task failed".to_string()))??;
+    let mut file = std::fs::File::open(full).map_err(Error::Io)?;
+    match compute_delta_from_signatures(
+        &mut file,
         &sig,
+        &source_sig,
         DELTA_LITERAL_CHUNK_LIMIT,
-        verify_hash,
-        Some(&mut source_sig),
     )
     .map_err(Error::from)
     {
-        Ok(delta) => {
-            let source_signature = (!source_sig.is_empty()).then_some(Signature {
-                file_size: delta.source_size,
-                chunks: source_sig,
-            });
+        Ok(mut delta) => {
+            if verify_hash {
+                delta.checksum = checksum;
+            }
+            let source_signature = (!source_sig.chunks.is_empty()).then_some(source_sig);
             Ok(PreparedDelta::Delta(delta, source_signature, None))
         }
         Err(Error::Delta(DeltaError::LiteralBudgetExceeded { .. })) => {
@@ -1506,6 +1608,12 @@ fn compute_delta_job(
         Err(e) => Err(e),
     }
 }
+
+/// Delta updates at or above this size get their source signing prefetched
+/// together with the basis-signature request (see
+/// `request_needed_signatures`): the pass takes ~0.5s+ per file, and
+/// overlaps the receiver's signing instead of serializing after it.
+const BIG_DELTA_PREFETCH_MIN: u64 = 64 * 1024 * 1024;
 
 /// Minimum size for cross-file basis pairing — below this the delta
 /// machinery costs more than the whole-file transfer it would save.

@@ -16,7 +16,7 @@ pub mod ops;
 pub(crate) mod rollsum;
 pub mod signature;
 
-pub use compute::{apply_patch, compute_delta_limited, compute_delta_rollsum};
+pub use compute::{apply_patch, compute_delta_from_signatures, compute_delta_limited, compute_delta_rollsum, sign_source};
 pub use error::{DeltaError, DeltaResult};
 pub use ops::{Delta, DeltaOp};
 pub use signature::{ChunkSignature, Signature, chunk_config};
