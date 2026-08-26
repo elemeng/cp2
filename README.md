@@ -333,6 +333,16 @@ chunking overlaps the basis signing). pxs has the fastest delta edit
 files. Localhost runs vary ~±30% between runs even for the same tool —
 compare tools within a run, not across runs.
 
+Why pxs wins the edit but loses elsewhere: its "delta" is a byte-compare,
+not a hash delta — fixed 128 KiB blocks, mmap'd and compared in parallel
+(`src != dst`), only differing blocks written, and one full-file BLAKE3 for
+integrity at the end. For a same-size in-place overwrite (VM images,
+PGDATA) that is near the floor of possible work, and it has no cheaper
+peer. The same design is its weakness: fresh transfers stage and hash
+everything (the 6.40s row), and a mid-file insertion shifts every later
+block so the whole tail re-sends — the exact case content-defined chunking
+exists for.
+
 The full benchmark suite — scripts, generated trees, and how to run it — is
 documented in [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
