@@ -252,39 +252,39 @@ all platforms.
 
 ## Performance comparison
 
-Measured on a WSL2 (Fedora 42) machine, pushing over `ssh localhost` (1 MiB
-pipes on both ends; page cache warmed before each tool), from
-`bench/compare_test.sh` — cp2 vs rsync vs scp vs sy. 2026-08 re-run after
-the pipeline work (this host was ~25% slower overall than the 2026-07
-baseline — scp's raw large-first copy went 2.18s → 2.71s — so compare
-scenarios, not raw seconds; the delta-path work shows up in **large-edit**:
-cp2 3.38s → 2.90s on a slower machine, closing the gap to rsync from ~2x to
-~1.1x):
+Measured on a native Fedora 44 (x86_64, NVMe) machine, pushing over
+`ssh localhost` (1 MiB pipes on both ends; page cache warmed before each
+tool), from `bench/compare_test.sh` — cp2 vs rsync vs scp vs sy
+(2026-08-26). The 2026-07 numbers were measured on a WSL2 (Fedora 42) host,
+so compare scenarios across runs, not raw seconds:
 
 ```
 tool      large-first   large-edit  small-first   small-idle
-cp2             3.46s        2.90s        5.45s        1.94s
-rsync           3.48s        2.60s        1.55s        0.67s
-scp             2.71s        2.04s       14.20s       11.34s
-sy              5.74s       13.36s       54.56s        0.67s
+cp2             2.55s        2.54s        1.78s        0.65s
+rsync           2.39s        1.51s        2.03s        0.80s
+scp             2.26s        2.26s        3.98s        4.01s
+sy              2.59s        4.73s       14.29s        0.89s
 ```
 
 Reading the numbers honestly:
 
-- **Large first sync:** cp2 ≈ rsync, within noise of scp. All three are pinned
-  near the machine's ssh-layer ceiling (~715 MB/s on this WSL2 host).
+- **Large first sync:** all three tools cluster within ~13% — scp 2.26s,
+  rsync 2.39s, cp2 2.55s — pinned near the machine's ssh-layer ceiling
+  (≈475 MB/s on this host).
 - **Large edit:** rsync's rolling-checksum delta still wins on localhost
-  (cp2's CDC delta re-reads the basis twice — signature + compute), but the
-  gap narrowed to ~10% since the whole-file checksum became opt-in (the
-  default path no longer runs a second full-file hash on either side). On a
+  (cp2's CDC delta re-reads the basis for signature and compute; on this
+  fast host hashing, not the wire, dominates the edit time — cp2's 2.54s
+  barely beats its own fresh 2.55s, while rsync drops 2.39s → 1.51s). On a
   real 1 GbE/10 GbE link the delta's wire savings (1 MiB vs 1 GiB) flip this
   in cp2's favor — the same reason rsync beats scp on real networks.
-- **Many small files:** rsync is fastest (no per-file atomic staging, no
-  manifest exchange); cp2 pays for its guarantees — every file lands via a
-  staged temp + atomic rename, and every sync exchanges manifests — and still
-  beats scp ~2.6x on the first sync and ~6x on the idle re-sync (scp has no
-  quick check and re-copies everything).
-- **sy 0.4.0** trails on every scenario except the idle scan.
+- **Many small files:** on this host cp2 beats rsync on both the first sync
+  (1.78s vs 2.03s) and the idle re-sync (0.65s vs 0.80s) — parallel scan and
+  batch hashing overtake rsync's serial walk on a fast NVMe; the stored-file
+  guarantees that favored rsync on the old WSL2 host no longer show here.
+  scp re-copies everything and pays ~2.2x on the first sync and ~6x on the
+  idle re-sync.
+- **sy 0.4.0** trails on every scenario, including the idle scan (0.89s vs
+  cp2's 0.65s).
 
 The full benchmark suite — scripts, generated trees, and how to run it — is
 documented in [`ARCHITECTURE.md`](ARCHITECTURE.md).
@@ -374,5 +374,4 @@ MIT license; rsync (GPL) contributed design and interface semantics only.
 
 ## License
 
-MIT — see [LICENSE](LICENSE). Third-party adaptations and their retained
-copyright lines are attributed in [NOTICE](NOTICE).
+MIT — see [LICENSE](LICENSE). Third-party adaptations and their retained copyright lines are attributed in [NOTICE](NOTICE).
