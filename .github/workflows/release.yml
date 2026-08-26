@@ -22,12 +22,31 @@ defaults:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # The protocol, scanner, and e2e harness must hold on every supported
+    # platform (Windows rides the russh transport and the server falls back
+    # to tokio stdio there), so the full test+clippy gate runs natively on
+    # all three OS families. Unix-only suite pieces (symlinks, chmod, hard
+    # links) are cfg(unix)-gated in the test files.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo test --all-targets
       - run: cargo clippy --all-targets -- -D warnings
+
+  msrv:
+    # The declared MSRV (rust-version = "1.93" in Cargo.toml) must actually
+    # build: cargo refuses the lockfile when any pinned dependency needs a
+    # newer rustc, so this gate keeps the MSRV claim honest.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.93
+      - run: cargo test --all-targets
 
   build:
     needs: test
