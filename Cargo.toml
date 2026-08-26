@@ -5,15 +5,17 @@ edition = "2024"
 rust-version = "1.93"
 authors = ["elemeng"]
 license = "MIT"
-repository = "https://github.com/elemeng/cp2"
 description = "Pure-Rust cp & rsync-style copy/sync tool for local or network files, with delta transfer and verification (Linux, macOS, Windows)"
+repository = "https://github.com/elemeng/cp2"
+documentation = "https://docs.rs/cp2"
 readme = "README.md"
 keywords = ["sync", "rsync", "ssh", "backup", "file-sync"]
 categories = ["command-line-utilities", "filesystem"]
-# Dev-only content: CI workflows, release scripts, and the build-output
-# directory stay out of the published crate. `/target` is anchored to the
-# package root (gitignore-style) so `src/target/` is not matched.
-exclude = [".github/", "scripts/", "/target"]
+# Dev-only content: CI workflows, release scripts, benchmark trees, and the
+# build-output directory stay out of the published crate. `/target` is
+# anchored to the package root (gitignore-style) so `src/target/` is not
+# matched.
+exclude = [".github/", "scripts/", "/target", "bench/"]
 
 [features]
 default = []
