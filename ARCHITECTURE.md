@@ -345,9 +345,22 @@ dry-run: 0 differing files on each side); cp2 wins the 100 K-file fresh
 push. Two caveats for this particular run: the edit phase ran over the
 russh transport — the first attempt over the system-ssh transport
 deadlocked in OpenSSH's ControlMaster mux on a server-side stderr write
-(25 min, no progress; the same phase over russh completed in 55s, and the
-system-ssh path is under investigation) — and it predates the delta-overlap
-work, which halved cp2's single-file edit cost since.
+(25 min, no progress; the same phase over russh completed in 55s) — and it
+predates the delta-overlap work, which halved cp2's single-file edit cost
+since.
+
+**The deadlock, root-caused and fixed.** The server's diagnostics (the
+per-run summary, tracing lines) ride sshd's stderr pipe; a wedge anywhere
+in the forward path — sshd's channel backpressure into the ControlMaster
+mux, the mux socket, the slave's stderr — fills that pipe, and a server
+blocked writing stderr stalls the sync protocol even though the data
+flowed. The failure mode is gone on both ends now: the system-ssh client
+pipes every ssh child's stderr and drains it on a dedicated forwarding
+thread (the child can never block on stderr, and the drain keeps the
+slave's mux event loop serviced), and the server makes its fd 2
+non-blocking so diagnostics are best-effort — dropped under backpressure
+instead of stalling the serve loop (`std::eprintln!` panics on write
+failure, so the server's summary write is error-ignoring by hand).
 
 ### The studied crates, honestly
 

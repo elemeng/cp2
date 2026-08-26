@@ -62,6 +62,61 @@ pub struct SshChild {
     pub stdout: ChildStdout,
 }
 
+/// Forward an ssh child's stderr to our own, so the child can never block on
+/// it. With `Stdio::inherit()` the child writes our stderr directly; a stall
+/// anywhere behind it — a full pipe behind our own stderr, or a wedged
+/// `ControlMaster` mux (server-side stderr backpressures through sshd into the
+/// mux socket) — would stall the ssh process itself, and with it the sync
+/// protocol it pumps. The pipe is drained on a dedicated thread with blocking
+/// reads; the thread exits when the child (or a persisted master holding the
+/// pipe) closes it. The sink is our own stderr: for a terminal or a file this
+/// never blocks; for a pathologically full pipe the thread blocks and the
+/// child's stderr pipe fills again (the same stall `Stdio::inherit()` would
+/// have had) — the drain's point is that the protocol no longer rides on it.
+///
+/// Unix only: the stall is a ControlMaster-mux phenomenon (Windows rides the
+/// russh transport, where remote stderr is consumed as channel events).
+#[cfg(unix)]
+fn drain_child_stderr(stderr: tokio::process::ChildStderr) {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    // tokio exposes the pipe read end only as an AsyncRead handle (no
+    // `into_std` for stderr); take ownership of the descriptor and re-wrap
+    // it as a std file, forgetting the handle so it does not close the fd.
+    // The descriptor may be non-blocking (tokio sets it so); an empty pipe
+    // then surfaces as WouldBlock, handled with a brief pause, not a spin.
+    let fd = stderr.as_raw_fd();
+    // SAFETY: we own this descriptor — the handle is forgotten right below,
+    // so no double close; tokio's poll registration for it dies with the
+    // handle.
+    let mut pipe = unsafe { std::fs::File::from_raw_fd(fd) };
+    std::mem::forget(stderr);
+    let _ = std::thread::Builder::new()
+        .name("cp2-ssh-stderr".to_string())
+        .spawn(move || {
+            use std::io::{Read, Write};
+            let mut buf = [0u8; 8192];
+            let mut sink = std::io::stderr();
+            loop {
+                match pipe.read(&mut buf) {
+                    // EOF on the stderr pipe, or a read error: child gone.
+                    Ok(0) => return,
+                    // A write error on our own stderr (EPIPE): nothing left
+                    // to forward.
+                    Ok(n) => {
+                        if sink.write_all(&buf[..n]).is_err() {
+                            return;
+                        }
+                    }
+                    // Empty pipe read end (non-blocking fd): brief pause.
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(_) => return,
+                }
+            }
+        });
+}
+
 /// OpenSSH connection-multiplexing options shared by every ssh spawn in this
 /// module. A run opens several sequential sessions to the same peer (platform
 /// probe, version check, deploy, verify, sync); multiplexing makes them ride
@@ -157,8 +212,10 @@ impl SshChild {
 /// the same flags the client does.
 ///
 /// On Windows remotes the command is wrapped in `cmd /c` so `%USERPROFILE%`-style
-/// paths expand regardless of the sshd default shell. Stderr is inherited so
-/// ssh's own prompts, banners, and errors reach the user's terminal directly.
+/// paths expand regardless of the sshd default shell. Stderr is piped and
+/// forwarded by [`drain_child_stderr`], so ssh's own prompts, banners, and
+/// errors reach the user's terminal while a stalled forward can never stall
+/// the session (see the drain's doc comment).
 ///
 /// # Errors
 ///
@@ -176,9 +233,13 @@ pub async fn spawn_ssh(
     let mut cmd = ssh_command(peer, &remote_command(remote_os, &remote_cmd), auth);
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit());
+        .stderr(if cfg!(unix) { Stdio::piped() } else { Stdio::inherit() });
 
     let mut child = cmd.spawn().map_err(Error::Io)?;
+    #[cfg(unix)]
+    if let Some(stderr) = child.stderr.take() {
+        drain_child_stderr(stderr);
+    }
     if sudo == Sudo::Password {
         // `sudo -S` consumes exactly one stdin line as the password; write it
         // before any protocol frame so the frames pass through untouched.
@@ -273,9 +334,13 @@ pub fn spawn_ssh_preamble(
     let mut cmd = ssh_command(peer, &remote_cmd, auth);
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit());
+        .stderr(if cfg!(unix) { Stdio::piped() } else { Stdio::inherit() });
 
     let mut child = cmd.spawn().map_err(Error::Io)?;
+    #[cfg(unix)]
+    if let Some(stderr) = child.stderr.take() {
+        drain_child_stderr(stderr);
+    }
     let stdin = child
         .stdin
         .take()
@@ -1060,9 +1125,13 @@ pub async fn push_remote_binary(
     let mut child = ssh_command(peer, &remote_cmd, auth)
         .stdin(Stdio::piped())
         .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
+        .stderr(if cfg!(unix) { Stdio::piped() } else { Stdio::inherit() })
         .spawn()
         .map_err(Error::Io)?;
+    #[cfg(unix)]
+    if let Some(stderr) = child.stderr.take() {
+        drain_child_stderr(stderr);
+    }
 
     let timed = tokio::time::timeout(SSH_COMMAND_TIMEOUT, async {
         let mut stdin = child
@@ -1112,8 +1181,12 @@ pub async fn push_remote_binary_and_serve(
     let mut cmd = ssh_command(peer, &remote_cmd, auth);
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit());
+        .stderr(if cfg!(unix) { Stdio::piped() } else { Stdio::inherit() });
     let mut child = cmd.spawn().map_err(Error::Io)?;
+    #[cfg(unix)]
+    if let Some(stderr) = child.stderr.take() {
+        drain_child_stderr(stderr);
+    }
     let mut stdin = child
         .stdin
         .take()
@@ -1428,6 +1501,30 @@ mod tests {
         assert!(status.success());
         let got = std::fs::read_to_string(&out).unwrap();
         assert_eq!(got.trim(), "got:s3cret", "the injected password must arrive intact");
+    }
+
+    /// A child flooding stderr must never stall: without the drain, ~100 KiB
+    /// of stderr would fill the 64 KiB pipe and block the child forever.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stderr_flood_never_stalls_the_child() {
+        use std::time::Duration;
+        let mut child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(
+                "i=0; while [ $i -lt 8000 ]; do echo 'stderr line number $i going out'; i=$((i+1)); done",
+            )
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        drain_child_stderr(child.stderr.take().unwrap());
+        let status = tokio::time::timeout(Duration::from_secs(30), child.wait())
+            .await
+            .expect("the child must finish promptly, not block on stderr")
+            .unwrap();
+        assert!(status.success());
     }
 
     #[test]

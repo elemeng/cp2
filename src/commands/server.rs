@@ -18,6 +18,17 @@ use std::path::PathBuf;
 /// Returns an error if the protocol session fails; the peer is notified with
 /// a `Frame::Error` before the error is returned.
 pub async fn execute(options: &ExecutorOptions) -> Result<()> {
+    // Human output must never hold the protocol hostage: sshd wired our
+    // stderr to a pipe, and a stalled forward — a client that stops reading
+    // it, a wedged ControlMaster mux — can fill that pipe and block a
+    // stderr write mid-transfer. The serve loop then hangs even though the
+    // data flowed (the observed ControlMaster deadlock: the server was
+    // blocked writing its end-of-run summary while the client waited for
+    // the session to finish). fd 2 is made non-blocking so diagnostics are
+    // best-effort: dropped under backpressure instead of stalling the sync.
+    #[cfg(unix)]
+    make_stderr_non_blocking();
+
     // The protocol rides stdin/stdout, which sshd wired as pipes with the
     // default 64 KiB capacity. Enlarge them from this end (the pipe is shared,
     // so setting the size here covers both ends): a 64 KiB capacity would add
@@ -74,15 +85,36 @@ pub async fn execute(options: &ExecutorOptions) -> Result<()> {
         }
     };
 
-    // stdout is the protocol channel — human output goes to stderr.
+    // stdout is the protocol channel — human output goes to stderr. fd 2 is
+    // non-blocking (see `make_stderr_non_blocking`), so the write is
+    // error-ignoring by hand: std's `eprintln!` panics on write failure
+    // (EAGAIN included), which would turn backpressure into a crash. A
+    // dropped summary only loses the line — the protocol frames already
+    // went out.
     if !options.quiet {
-        eprintln!(
+        use std::io::Write;
+        let line = format!(
             "Synced {} files, {} bytes",
             stats.files_received + stats.files_sent,
             stats.bytes_transferred
         );
+        let _ = std::io::stderr().write_all(line.as_bytes());
+        let _ = std::io::stderr().write_all(b"\n");
     }
     Ok(())
+}
+
+/// Best-effort diagnostics on the serve path: clear the blocking flag on
+/// fd 2 so a stderr write can never stall the protocol (see `execute`).
+/// Only stderr changes — stdin/stdout carry the protocol and stay blocking.
+#[cfg(unix)]
+fn make_stderr_non_blocking() {
+    // SAFETY: F_GETFL/F_SETFL on our own stderr descriptor; the flags are
+    // only re-applied to the same descriptor with the non-blocking bit set.
+    let flags = unsafe { libc::fcntl(libc::STDERR_FILENO, libc::F_GETFL) };
+    if flags >= 0 {
+        unsafe { libc::fcntl(libc::STDERR_FILENO, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+    }
 }
 
 /// Raw-fd epoll adapters for the server's stdio (Unix).
