@@ -301,7 +301,7 @@ over ssh at all**:
 | syncz | goes over ssh but is a **wrapper around the system rsync** — benchmarking it is benchmarking rsync again |
 | sparsync | no drop-in ssh sync — needs a `serve`/`enroll`/auth mesh |
 | zsync-rs | HTTP delta client — no ssh at all |
-| robosync, rusync | accept `user@host:path`, print success (rc=0, "9 bytes transferred"), but **open no ssh connection and deliver nothing** (verified against sshd's journal) |
+| robosync, rusync | do **not parse** `user@host:path` at all — they copy into a literal local directory named `user@host:path` under the working directory (rc=0, "9 bytes transferred", no ssh connection — verified in sshd's journal) |
 | copia | library, no CLI |
 
 The four-scenario results (1 GiB fresh/edit + 8192-file tree; destination
