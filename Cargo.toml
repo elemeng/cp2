@@ -15,7 +15,7 @@ categories = ["command-line-utilities", "filesystem"]
 # build-output directory stay out of the published crate. `/target` is
 # anchored to the package root (gitignore-style) so `src/target/` is not
 # matched.
-exclude = [".github/", "scripts/", "/target", "bench/"]
+exclude = [".github/", "scripts/", "/target", "bench/", "AGENTS.md", ".zcode"]
 
 [features]
 default = []
