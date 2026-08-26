@@ -306,6 +306,7 @@ ssh key auth to `HOST`.
 | `mixed-tree.sh` | ≈10 GiB / 100 K files (70 K small 1-16 KiB, 27 K medium 64-384 KiB, 3 K large 1-2 MiB), cp2 vs rsync over ssh: `fresh` / `second` / `edit` / `integrity` phases |
 | `single-file.sh` | the delta engine's value, cp2 vs rsync: `MODE=large` (one 1 GiB file: fresh / edit A+B / insert / idle) or `MODE=small` (8192 files: fresh / edit / idle) |
 | `compare_test.sh` | cross-tool localhost push (cp2 vs rsync vs scp vs [sy](https://crates.io/crates/sy)) across four scenarios, reproducible in CI-like conditions |
+| `compare_studied.sh` | the SSH-capable studied crates (sy, pxs, ripsync) through the same four scenarios, with cp2 and rsync as reference rows; per-tool runs bounded by a timeout with rc recorded |
 | `compare_remote.sh` | cp2 vs rsync push to a **real** remote (gitignored — it holds a personal host address): fresh / idle / edit |
 
 ### Cross-tool localhost (`compare_test.sh`)

@@ -286,6 +286,44 @@ deadlocked in OpenSSH's ControlMaster mux on a server-side stderr write —
 25 min with no progress; the same phase over the russh transport completed
 in 55s. The system-ssh path is under investigation.)
 
+### The studied crates, honestly
+
+The sibling crates cp2's design was informed by were put through the same
+harness (`bench/compare_studied.sh`, same host and same run, 2026-08-26).
+The participation audit comes first — of the eight crates, **three can sync
+over ssh at all**:
+
+| Tool | Verdict |
+|------|---------|
+| ripsync | syncs over ssh, but its protocol rejects frames ≥ 512 MiB — **fails (rc=1) on any single file that large**; only the small-tree rows below are valid |
+| pxs | syncs over ssh (integrity-first), no limits found |
+| sy | syncs over ssh; **msy ships the same `sy` binary** (plus `sy-scan`/`sy-remote`/`sy-bench-gen`) — the two are the same tool, already on the list |
+| syncz | goes over ssh but is a **wrapper around the system rsync** — benchmarking it is benchmarking rsync again |
+| sparsync | no drop-in ssh sync — needs a `serve`/`enroll`/auth mesh |
+| zsync-rs | HTTP delta client — no ssh at all |
+| robosync, rusync | accept `user@host:path`, print success (rc=0, "9 bytes transferred"), but **open no ssh connection and deliver nothing** (verified against sshd's journal) |
+| copia | library, no CLI |
+
+The four-scenario results (1 GiB fresh/edit + 8192-file tree; destination
+bytes verified against each tool's edited source for the successful rows;
+per-tool runs bounded by a 300s timeout, rc recorded):
+
+```
+tool      large-first   large-edit  small-first   small-idle
+cp2             1.86s        2.53s        1.34s        0.65s
+rsync           2.07s        1.47s        1.61s        0.72s
+sy              2.49s        4.34s       12.14s        0.70s
+pxs             6.32s        1.17s        2.87s        1.50s
+ripsync         1.35s        1.35s        3.31s        0.71s  rc!=0: large-first, large-edit
+```
+
+Reading them honestly: cp2 leads the small-file scenarios (1.34s/0.65s vs
+rsync 1.61s/0.72s); pxs has the fastest delta edit (1.17s, its integrity
+hashing makes it the slowest fresh transfer at 6.32s — 3.4x cp2); sy trails
+everywhere, 7-9x slower than cp2 on many small files. Localhost runs vary
+~±30% between runs even for the same tool — compare tools within a run, not
+across runs.
+
 The full benchmark suite — scripts, generated trees, and how to run it — is
 documented in [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
