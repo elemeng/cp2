@@ -292,7 +292,12 @@ command in `~/.ssh/authorized_keys`:
 
 The **distribution tarball** (all platforms + `install.sh`) is built by the
 GitHub Actions workflow on a `v*` tag; `scripts/build-release.sh` does the
-same locally. See `scripts/` and `.github/workflows/release.yml`.
+same locally. `scripts/smoke-ssh.sh` runs a real-ssh smoke test (push with
+auto-deploy, no-op re-sync, a mid-file edit crossing the delta, a pull with
+byte-for-byte comparison, and a verbose run whose server stderr must flow
+back) against any sshd with key auth — it is the counterpart to the
+pipe-based integration tests and needs no CI wiring. See `scripts/` and
+`.github/workflows/release.yml`.
 
 ## Performance benchmarks
 

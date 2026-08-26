@@ -82,14 +82,23 @@ fn drain_child_stderr(stderr: tokio::process::ChildStderr) {
     // tokio exposes the pipe read end only as an AsyncRead handle (no
     // `into_std` for stderr); take ownership of the descriptor and re-wrap
     // it as a std file, forgetting the handle so it does not close the fd.
-    // The descriptor may be non-blocking (tokio sets it so); an empty pipe
-    // then surfaces as WouldBlock, handled with a brief pause, not a spin.
     let fd = stderr.as_raw_fd();
     // SAFETY: we own this descriptor — the handle is forgotten right below,
     // so no double close; tokio's poll registration for it dies with the
     // handle.
     let mut pipe = unsafe { std::fs::File::from_raw_fd(fd) };
     std::mem::forget(stderr);
+    // The descriptor is non-blocking (tokio sets it so); make it blocking
+    // again — the read then wakes the instant bytes arrive, so the last
+    // forward (the server's end-of-run summary) is written before the
+    // client process exits rather than racing a poll-sleep.
+    // SAFETY: F_GETFL/F_SETFL on the pipe read end this process owns; the
+    // flags are only re-applied to the same descriptor, minus the
+    // non-blocking bit.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags >= 0 {
+        unsafe { libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK) };
+    }
     let _ = std::thread::Builder::new()
         .name("cp2-ssh-stderr".to_string())
         .spawn(move || {
@@ -98,8 +107,8 @@ fn drain_child_stderr(stderr: tokio::process::ChildStderr) {
             let mut sink = std::io::stderr();
             loop {
                 match pipe.read(&mut buf) {
-                    // EOF on the stderr pipe, or a read error: child gone.
-                    Ok(0) => return,
+                    // EOF or a read error on the stderr pipe: child gone.
+                    Ok(0) | Err(_) => return,
                     // A write error on our own stderr (EPIPE): nothing left
                     // to forward.
                     Ok(n) => {
@@ -107,7 +116,30 @@ fn drain_child_stderr(stderr: tokio::process::ChildStderr) {
                             return;
                         }
                     }
-                    // Empty pipe read end (non-blocking fd): brief pause.
+                }
+            }
+        });
+}
+
+/// Non-unix fallback (Windows system-ssh is unsupported anyway): the
+/// descriptor stays non-blocking, so an empty pipe is polled with a brief
+/// pause instead of spinning.
+#[cfg(not(unix))]
+fn drain_child_stderr(stderr: tokio::process::ChildStderr) {
+    use std::io::{Read, Write};
+    let _ = std::thread::Builder::new()
+        .name("cp2-ssh-stderr".to_string())
+        .spawn(move || {
+            let mut buf = [0u8; 8192];
+            let mut sink = std::io::stderr();
+            loop {
+                match stderr.read(&mut buf) {
+                    Ok(0) => return,
+                    Ok(n) => {
+                        if sink.write_all(&buf[..n]).is_err() {
+                            return;
+                        }
+                    }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         std::thread::sleep(std::time::Duration::from_millis(5));
                     }
