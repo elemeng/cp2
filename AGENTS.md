@@ -42,8 +42,11 @@ cargo clippy
 - **Unix rides system `ssh`; Windows rides russh.** The pure-Rust russh backend
   is the Windows default (OpenSSH `ControlMaster` breaks there), overridable
   with `CP2_TRANSPORT=ssh|russh`. `cp2 --server` runs on the sshd side; the
-  client auto-deploys the matching binary to the remote (`--remote-path` /
-  `--no-auto-install`). `--jump-host` = ProxyJump; `sudo`/password handled via
+  client auto-deploys the matching binary to same-platform remotes
+  (`--remote-path` / `--no-auto-install`) — a different platform needs cp2
+  installed on the remote once (the deploy error lists `cargo install cp2
+  --locked`, the release tarball, or a source build). `--jump-host` =
+  ProxyJump; `sudo`/password handled via
   `--remote-sudo` / `--sudo-password` / `--password`.
 - **One sequential stream.** No QUIC/multi-stream/negotiation. The Hello is
   build-fingerprint-only (`BUILD_FINGERPRINT`, FNV-1a over sources), so any
@@ -106,7 +109,10 @@ cp2 /path/to/dir user@host --dry-run                # dry run
 ```
 
 `cp2 --server` is the sshd-invoked server mode (not for direct use). The
-client auto-deploys the matching binary to `~/.cargo/bin/cp2` by default.
+client auto-deploys the matching binary to `~/.cargo/bin/cp2` by default
+(same-platform remotes; a different platform needs cp2 installed on the
+remote once — `cargo install cp2 --locked`, the release tarball, or a
+source build — or a prebuilt sidecar next to the client).
 
 Key flags: `-a/--archive` (byte-identical; the `rlpt` core is always on, `-a`
 adds specials/chown/SUID-SGID-Sticky and implies `--literal-links`),

@@ -4,17 +4,16 @@
 [![docs.rs](https://docs.rs/cp2/badge.svg)](https://docs.rs/cp2)
 [![License](https://img.shields.io/crates/l/cp2.svg)](https://crates.io/crates/cp2)
 
-**Copy and sync files locally or between machines — fast, verified, and with
-zero server setup.**
+**Copy and sync files locally or between machines — ultra fast, erified, privacy and with zero server setup.**
 
-cp2 is a modern `cp`/`rsync`-style tool in one pure-Rust binary for Linux,
-macOS, and Windows. It sends only the bytes that actually changed, verifies
+cp2 is a modern `cp`/`rsync`-style tool in one pure-Rust binary for **Linux**,
+**macOS**, and **Windows**. It sends only the bytes that actually changed, verifies
 what it writes, watches folders in realtime, and needs nothing installed on
 the remote — the first sync just works against a fresh account.
 
 - **Install:** one binary, or `cargo install cp2`
 - **First sync:** `cp2 ./photos user@server:backup`
-- **Watch mode:** `cp2 -W ./photos user@server:backup`
+- **Watch mode (sync in realtime):** `cp2 -W ./photos user@server:backup`
 
 ## Contents
 
@@ -36,16 +35,17 @@ the remote — the first sync just works against a fresh account.
 ```bash
 cargo install cp2
 ```
+or 
 
-Prebuilt binaries for all platforms are on the [GitHub releases
-page](https://github.com/elemeng/cp2/releases) — download, extract, run.
-There is nothing else to install: on Unix cp2 rides the `ssh` client you
-already have, and on Windows a pure-Rust SSH client is built in.
+
+- Fetch prebuilt binaries for all platforms are on the [GitHub releases
+page](https://github.com/elemeng/cp2/releases) — download, extract, run. Nothing else!
+
 
 ## Quick start
 
 ```bash
-# Your first sync: push a folder to a server (cp2 deploys itself there)
+# Your first sync: push a folder to a server (same-platform remotes auto-deploy)
 cp2 ./photos user@server:backup
 
 # Local copy — the same engine, no ssh
@@ -66,11 +66,12 @@ everything on the remote runs as *your* account.
 - **Sends only what changed** — FastCDC chunking + BLAKE3: a one-byte edit in
   a 50 GB file transfers kilobytes, not gigabytes, and large files stream in
   bounded memory — size never becomes a RAM problem.
-- **Zero server setup** — the first sync deploys a matching binary to the
-  remote: no install, no sudo, no PATH fiddling. Same-platform remotes need
-  zero interaction; a different platform or an older glibc needs a one-time
-  sidecar build (the error prints the exact command), after which every sync
-  deploys automatically.
+- **Zero server setup on same-platform remotes** — the first sync deploys a
+  matching binary automatically: no install, no sudo, no PATH fiddling. A
+  different platform needs cp2 installed on the remote once — the error
+  lists the three ways (`cargo install cp2 --locked`, the prebuilt release
+  tarball, or building from source) — and a prebuilt sidecar next to the
+  client is picked up automatically.
 - **Verification you can trust** — `--verify` proves the destination bytes
   match the source; `--remove-source-files` frees the source disk only after
   the copy is hash-verified and fsynced.
@@ -93,7 +94,7 @@ the rough edges:
 
 | | rsync | cp2 |
 |---|---|---|
-| server setup | manual install, PATH config, or a daemon | auto-deploy on first sync |
+| server setup | manual install, PATH config, or a daemon | auto-deploy on same-platform remotes |
 | delta | fixed blocks + rolling checksums | content-defined chunks (FastCDC) + BLAKE3 |
 | integrity | none built in | `--verify`; hash-guarded `--remove-source-files` |
 | watch | not built in | built-in `-W` |

@@ -208,30 +208,32 @@ against it.
 
 ## Deploy & transport
 
-The client **auto-deploys the server binary** on first sync: the remote
-binary's freshness is verified by the Hello handshake (build fingerprint) on
-the sync session itself. When the binary is missing or stale, the client
-streams a matching build to the remote and `exec`s it as the server on the
-same session — the deploy session is the sync session, the Hello verifies the
-deploy, and the whole stale/missing case costs two ssh sessions (the failed
-attempt + the deploy-and-serve). Disable with `--no-auto-install` (e.g. for a
-managed server install).
+The client **auto-deploys the server binary** on first sync for a
+**same-platform** remote (a different platform needs cp2 installed on the
+remote once — see below): the remote binary's freshness is verified by the
+Hello handshake (build fingerprint) on the sync session itself. When the
+binary is missing or stale, the client streams a matching build to the
+remote and `exec`s it as the server on the same session — the deploy
+session is the sync session, the Hello verifies the deploy, and the whole
+stale/missing case costs two ssh sessions (the failed attempt + the
+deploy-and-serve). Disable with `--no-auto-install` (e.g. for a managed
+server install).
 
-**Platform portability:** the deployed binary must match the server. The
-client prefers a prebuilt **sidecar** named `cp2-<triple>` (e.g.
-`cp2-x86_64-unknown-linux-musl` for a Linux server) — a Linux sidecar is a
-statically linked musl build that runs on any remote glibc — found in
-`--binaries-dir` or next to the client binary. Without a sidecar, a
-same-platform remote gets the running binary (which needs the local glibc — a
-remote with an older one fails at load time, `GLIBC_2.xx not found`). The
-platform is detected from the session's preamble (`uname -s -m`, falling back
-to `cmd /c echo %PROCESSOR_ARCHITECTURE%` on Windows). Nothing is downloaded
-at sync time — if a cross-platform sidecar is missing, cp2 fails with the
-exact one-time command to build it (`cargo build --release --target <triple>
-&& cp ...` next to the client), and every subsequent sync deploys it
-automatically. The sidecar is the only manual step the zero-setup promise
-excludes: same-platform remotes (the common case) deploy the running binary
-with zero interaction.
+**Platform portability:** the deployed binary must match the server, and
+auto-deploy is same-platform: a same-platform remote gets the running
+binary (which needs the local glibc — a remote with an older one fails at
+load time, `GLIBC_2.xx not found`). A prebuilt **sidecar** named
+`cp2-<triple>` (e.g. `cp2-x86_64-unknown-linux-musl` for a Linux server — a
+statically linked musl build that runs on any remote glibc) found in
+`--binaries-dir` or next to the client binary is deployed to any platform.
+Without a sidecar, a different-platform remote gets no deploy: the error
+asks you to install cp2 on the remote once — `cargo install cp2 --locked`
+(it builds against the remote's own libc), the prebuilt release tarball
+(extract, rename the binary to `cp2`, copy it to `~/.cargo/bin`), or
+`git clone` + `cargo build --release` (copy `target/release/cp2` to
+`~/.cargo/bin`). Nothing is downloaded at sync time. The platform is
+detected from the session's preamble (`uname -s -m`, falling back to
+`cmd /c echo %PROCESSOR_ARCHITECTURE%` on Windows).
 
 Build Linux sidecars with a static libc (the default glibc build only runs on
 glibc systems):
@@ -284,7 +286,8 @@ cp2 has no auth code: sshd authenticates (PAM, LogonUser/keys) and enforces
 permissions; the remote `cp2 --server` runs as your account. Every
 peer-supplied path is sanitized against directory traversal and symlink
 escapes that leave the serve root. The client auto-deploys a matching binary
-on first use — the common Unix run is single-session (the platform preamble
+on first use (same-platform remotes) — the common Unix run is single-session
+(the platform preamble
 and the sync ride one ssh session, the Hello carries the deploy decision),
 and a stale/missing remote is recovered by deploy-and-serve (the binary is
 streamed and exec'd as the server on the same session, two ssh sessions

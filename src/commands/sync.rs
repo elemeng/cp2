@@ -1100,8 +1100,10 @@ pub(crate) async fn resolve_and_ensure(
 /// glibc, while the running binary needs the local glibc (a remote with an
 /// older one fails at load time, `GLIBC_2.xx` not found). Same-platform
 /// remotes without a sidecar deploy the running binary; a different-platform
-/// remote without a sidecar is an error. No automatic download — the user
-/// places the binary manually.
+/// remote without a sidecar is an error listing the remote-side install
+/// options (`cargo install cp2 --locked`, the release tarball, or a source
+/// build). No automatic download — the user installs the binary on the
+/// remote manually.
 fn deploy_source(
     os: &str,
     arch: &str,
@@ -1115,34 +1117,23 @@ fn deploy_source(
     if os == local_os && arch == local_arch {
         return std::env::current_exe().map_err(anyhow::Error::new);
     }
-    let names = candidates
-        .iter()
-        .map(|t| {
-            if t.contains("windows") {
-                format!("`cp2-{t}.exe`")
-            } else {
-                format!("`cp2-{t}`")
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" or ");
     let triple = candidates.first().copied().unwrap_or("<triple>");
-    let exe_suffix = if triple.contains("windows") { ".exe" } else { "" };
-    let sidecar_name = format!("cp2-{triple}{exe_suffix}");
-    let client_dir = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(std::path::Path::to_path_buf))
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
-    // The "download from the releases page" step is one-time: the sync then
-    // deploys the sidecar automatically, forever (build fingerprints match
-    // until the code changes again).
+    // Auto-deploy is same-platform only: a different-platform remote has no
+    // deployable build, so rather than guess, the error tells the user how
+    // to install cp2 on the remote once. A prebuilt sidecar (what a release
+    // tarball ships as `cp2-<triple>`) placed next to this binary or in
+    // `--binaries-dir` still deploys automatically.
     anyhow::bail!(
-        "remote is {os}/{arch}: no matching sidecar ({names}). \
-         Build it once (every sync after this deploys it automatically): \
-         cargo build --release --target {triple} && cp target/{triple}/release/cp2{exe_suffix} \
-         {}/{}",
-        client_dir.display(),
-        sidecar_name,
+        "remote is {os}/{arch}: no matching cp2 to deploy (auto-deploy covers \
+         same-platform remotes only). Install cp2 on the remote once: \
+         log in and run `cargo install cp2 --locked`, \
+         or download the prebuilt release tarball for {os}/{arch} from the GitHub \
+         releases page, extract it, rename the binary to `cp2`, and copy it to \
+         `~/.cargo/bin`, \
+         or `git clone https://github.com/elemeng/cp2 && cargo build --release` and \
+         copy `target/release/cp2` to `~/.cargo/bin`. \
+         Alternatively, place a prebuilt `cp2-{triple}` sidecar next to this binary \
+         (or in --binaries-dir): the client will deploy that automatically."
     )
 }
 
@@ -1171,8 +1162,9 @@ async fn deploy_remote_binary(
         Ok(Some((_, Some(fp)))) if fp == BUILD_FINGERPRINT => Ok(()),
         Ok(None) => Err(anyhow::anyhow!(
             "deployed cp2 to {remote} at {remote_path}, but it does not report a version — \
-             a truncated push, or the remote's glibc is older than this build's (build the \
-             musl sidecar once; every sync after this deploys it automatically)"
+             a truncated push, or the remote's glibc is older than this build's. Install cp2 \
+             on the remote with `cargo install cp2 --locked` (it builds against the remote's \
+             own glibc) or copy a static musl build to `~/.cargo/bin`"
         )),
         Ok(Some((v, fp))) => Err(anyhow::anyhow!(
             "deployed cp2 to {remote} at {remote_path}, but it reports v{v} (build {fp:?}); \
