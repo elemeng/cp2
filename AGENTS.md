@@ -120,7 +120,8 @@ the link switches (`--literal-links`/`--follow-links`/`--skip-links` +
 granular `--literal-*-links`), and the `rlpt` opt-outs (`--no-recursive`/
 `--skip-links`/`--no-perms`/`--no-times`). Defaults mirror `rsync -avP` (minus
 `-z`): recursive, mode/mtime preservation, per-file listing, terminal progress,
-keep-partials on abort. See `README.md` for the full table.
+keep-partials on abort. See `README.md` for the key-options tables; the
+full reference (every flag with its rsync equivalent) is `docs/cp2.1`.
 
 ## Conventions
 
