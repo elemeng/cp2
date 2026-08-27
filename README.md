@@ -32,14 +32,48 @@ the remote — the first sync just works against a fresh account.
 
 ## Install
 
+### On your machine
+
 ```bash
 cargo install cp2
 ```
-or 
 
+or grab a prebuilt binary for your platform from the [GitHub releases
+page](https://github.com/elemeng/cp2/releases) — download, extract, run.
+There is nothing else to install: on Unix cp2 rides the `ssh` client you
+already have, and on Windows a pure-Rust SSH client is built in.
 
-- Fetch prebuilt binaries for all platforms are on the [GitHub releases
-page](https://github.com/elemeng/cp2/releases) — download, extract, run. Nothing else!
+### On a remote (once, for different platforms)
+
+A **same-platform** remote needs nothing — cp2 deploys itself there on the
+first sync. A **different platform** needs cp2 installed on the remote
+once, any of these three ways:
+
+1. **Install with cargo** — log in and run `cargo install cp2 --locked`
+   (it builds for the remote's own libc, so it also fixes an older-glibc
+   remote):
+
+   ```bash
+   ssh user@remote
+   cargo install cp2 --locked
+   ```
+
+2. **Download the prebuilt tarball** — grab the release tarball for the
+   remote's platform from the [GitHub releases
+   page](https://github.com/elemeng/cp2/releases), extract it, rename the
+   binary to `cp2`, and copy it to `~/.cargo/bin/`.
+
+3. **Build from source** — on the remote:
+
+   ```bash
+   git clone https://github.com/elemeng/cp2 && cd cp2
+   cargo build --release
+   cp target/release/cp2 ~/.cargo/bin/
+   ```
+
+The remote build must match your client's build — the sync handshake
+enforces it, and the error names what to reinstall. After that,
+`cp2 ./data user@remote:backup` syncs like any same-platform remote.
 
 
 ## Quick start
