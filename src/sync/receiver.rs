@@ -31,6 +31,14 @@ pub(crate) struct Receiver {
     sanitizer: PathSanitizer,
     /// fsync every received file before rename (opt-in via `--fsync`).
     fsync: bool,
+    /// End-of-run durability: fsync each renamed file's parent directory
+    /// before the `Ack`. Runs only when a promise requires it —
+    /// `--remove-source-files` (the source is deleted on our word, so the
+    /// destination must survive a crash) or `--fsync` (explicit
+    /// durability). A plain sync skips it, like rsync's non-durable
+    /// default — the per-directory fsync is measurable on trees with
+    /// thousands of directories.
+    durable_end: bool,
     /// Keep partial files at the destination when a transfer aborts
     /// (rsync `-P`); the next run delta-resumes against them.
     partial: bool,
@@ -98,6 +106,7 @@ impl Receiver {
             root,
             sanitizer,
             fsync: options.fsync,
+            durable_end: options.remove_source_files || options.fsync,
             partial: options.partial,
             backup: options.backup,
             max_delete: options.max_delete,
@@ -984,10 +993,15 @@ impl Receiver {
     ) -> Result<bool> {
         tracing::info!("peer done: {files} files, {bytes} bytes");
         drain_applies(state).await?;
-        // Make the renames durable *before* acknowledging: the sender may
-        // delete the source immediately after the Ack, so a crash must not be
-        // able to lose a just-renamed destination file.
-        sync_dirs(&state.renamed_dirs).await;
+        // Make the renames durable *before* acknowledging — but only when a
+        // promise requires it: `--remove-source-files` (the sender deletes
+        // the source on our word, so a crash must not lose a just-renamed
+        // destination file) or `--fsync` (explicit durability). A plain sync
+        // skips the per-directory fsync, matching rsync's non-durable
+        // default — it is measurable on trees with thousands of directories.
+        if self.durable_end {
+            sync_dirs(&state.renamed_dirs).await;
+        }
         // Acknowledge so the sender can close the connection without
         // discarding unread stream data. The hashes are consumed (the
         // receive loop ends here), so they are taken rather than cloned.
@@ -1591,6 +1605,9 @@ where
 /// Sync the directories that received a commit, making the completed renames
 /// durable without a per-file fsync. Best effort per platform — see
 /// [`crate::platform::fs::sync_dir`].
+/// fsync each renamed file's parent directory once (fsync on a directory
+/// flushes its rename entries). Caller-gated on the run's durability
+/// promise — see `Receiver::durable_end`.
 async fn sync_dirs(dirs: &HashSet<PathBuf>) {
     if dirs.is_empty() {
         return;
