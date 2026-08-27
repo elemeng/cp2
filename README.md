@@ -4,12 +4,14 @@
 [![docs.rs](https://docs.rs/cp2/badge.svg)](https://docs.rs/cp2)
 [![License](https://img.shields.io/crates/l/cp2.svg)](https://crates.io/crates/cp2)
 
-**Copy and sync files locally or between machines — ultra fast, erified, privacy and with zero server setup.**
+**Copy and sync files locally or between machines — ultra fast, verified,
+private, and with zero server setup.**
 
 cp2 is a modern `cp`/`rsync`-style tool in one pure-Rust binary for **Linux**,
-**macOS**, and **Windows**. It sends only the bytes that actually changed, verifies
-what it writes, watches folders in realtime, and needs nothing installed on
-the remote — the first sync just works against a fresh account.
+**macOS**, and **Windows**. It sends only the bytes that actually changed,
+verifies what it writes, and watches folders in realtime; a same-platform
+remote needs nothing installed — the first sync deploys cp2 there
+automatically.
 
 - **Install:** one binary, or `cargo install cp2`
 - **First sync:** `cp2 ./photos user@server:backup`
@@ -34,9 +36,10 @@ the remote — the first sync just works against a fresh account.
 
 ### On your machine
 
-Recommend! but Rust need to be required in your PC
+The recommended way — just note it needs the Rust toolchain on your PC:
+
 ```bash
-cargo install cp2 
+cargo install cp2
 ```
 
 or grab a prebuilt binary for your platform from the [GitHub releases
