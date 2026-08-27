@@ -282,7 +282,7 @@ impl Receiver {
                 }
                 let _ = std::fs::rename(staged.path(), &f.file_path);
             }
-            if let Some(handle) = state.batch_apply.take() {
+            while let Some(handle) = state.batch_applies.pop_front() {
                 let _ = handle.await;
             }
             for handle in state.applied_this_run.drain().map(|(_, h)| h) {
@@ -379,20 +379,10 @@ impl Receiver {
     ) -> Result<()> {
         // A previous batch's apply task may still be in flight — the sender
         // emits one `Batch` frame per 128 MiB budget crossing, and batches
-        // arrive back-to-back when the plan is all small files. The handle
-        // is overwritten below, so join the previous one first: folding its
-        // outcomes keeps the stats, verification hashes, and the rename-sync
-        // set accurate (dropping the handle would silently lose an entire
-        // earlier batch).
-        if let Some(prev) = state.batch_apply.take() {
-            for outcome in prev
-                .await
-                .map_err(|e| Error::Other(format!("Batch apply task panicked: {e}")))?
-                ?
-            {
-                fold_outcome(state, outcome);
-            }
-        }
+        // arrive back-to-back when the plan is all small files. The applies
+        // run concurrently with the wire reads (see the queue cap below), so
+        // a slow receiver disk never stalls the transfer at a batch
+        // boundary.
         // Pre-verify each unique parent directory once and join the files
         // with the parent-chain walk skipped (see `join_preverified`). A
         // recipe that fails the pre-verification (a traversal attempt from
@@ -487,7 +477,23 @@ impl Receiver {
             }
             Ok(outcomes)
         });
-        state.batch_apply = Some(handle);
+        // Keep the wire fed while batches apply: the dispatch loop no
+        // longer joins the previous apply inline (that stalled every 128 MiB
+        // boundary for the whole apply duration). The queue is capped at
+        // `BATCH_APPLY_SLOTS` — the oldest handle's outcome is folded into
+        // the run stats/verify state here, and the shared apply semaphore
+        // plus the window bound the concurrent writers.
+        state.batch_applies.push_back(handle);
+        while state.batch_applies.len() > BATCH_APPLY_SLOTS {
+            let prev = state.batch_applies.pop_front().expect("len > slots");
+            for outcome in prev
+                .await
+                .map_err(|e| Error::Other(format!("Batch apply task panicked: {e}")))?
+                ?
+            {
+                fold_outcome(state, outcome);
+            }
+        }
         Ok(())
     }
 
@@ -1061,12 +1067,15 @@ struct ApplyState {
     /// Wire path → apply task of files applied this run (cross-file deltas
     /// join their basis's apply before reading it).
     applied_this_run: HashMap<String, tokio::task::JoinHandle<Result<ApplyOutcome>>>,
-    /// The one blocking task applying the current `Batch` frame (all its
-    /// files in a single pass — the per-file task overhead dominates
-    /// small-file trees). Joined by `drain_applies` like the per-file
-    /// handles; batch files are never cross-file bases (≤ 2 MiB), so they
-    /// need no `applied_this_run` entries.
-    batch_apply: Option<tokio::task::JoinHandle<Result<Vec<ApplyOutcome>>>>,
+    /// The blocking tasks applying `Batch` frames (all of a batch's files
+    /// in a single pass — the per-file task overhead dominates small-file
+    /// trees). Bounded at `BATCH_APPLY_SLOTS`, oldest first: the dispatch
+    /// loop accepts the next batch while the previous one applies, and only
+    /// folds an apply once a new one pushes past the window. Folded by
+    /// `drain_applies` like the per-file handles; batch files are never
+    /// cross-file bases (≤ 2 MiB), so they need no `applied_this_run`
+    /// entries.
+    batch_applies: std::collections::VecDeque<tokio::task::JoinHandle<Result<Vec<ApplyOutcome>>>>,
     in_flight: Option<ChunkedFile>,
 }
 
@@ -1089,7 +1098,7 @@ impl ApplyState {
             skipped: Vec::new(),
             hashes: HashMap::new(),
             applied_this_run: HashMap::new(),
-            batch_apply: None,
+            batch_applies: std::collections::VecDeque::new(),
             in_flight: None,
         }
     }
@@ -1101,7 +1110,7 @@ impl ApplyState {
 /// `CreateLinks` (hard link targets must already be on disk). The `Batch`
 /// frame's single apply task is joined here too.
 async fn drain_applies(state: &mut ApplyState) -> Result<()> {
-    if let Some(handle) = state.batch_apply.take() {
+    while let Some(handle) = state.batch_applies.pop_front() {
         for outcome in handle
             .await
             .map_err(|e| Error::Other(format!("Batch apply task panicked: {e}")))?
@@ -1644,6 +1653,14 @@ const SPARSE_RUN_MIN: usize = 4096;
 /// loop never joins mid-stream, so a slow disk cannot stall the wire, and the
 /// queue depth bounds the buffered bytes (1 MiB chunks — ~32 MiB).
 const WRITE_QUEUE_DEPTH: usize = 32;
+
+/// In-flight `Batch` applies the dispatch loop tolerates before folding the
+/// oldest (see `handle_batch`): the wire keeps flowing across 128 MiB batch
+/// boundaries while the receiver disk catches up — applies no longer
+/// serialize the read loop. The shared apply semaphore still caps the total
+/// concurrent writers, so the slot count is a memory bound, not a
+/// concurrency one.
+const BATCH_APPLY_SLOTS: usize = 2;
 
 /// A write filter that turns runs of zeros into holes (`--sparse`, rsync
 /// `-S`): each write is split at its non-zero bytes, and once a pending zero
