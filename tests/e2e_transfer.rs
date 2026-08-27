@@ -692,3 +692,53 @@ async fn remote_files_from_pull_merges_absolute_paths() {
         b"bb"
     );
 }
+
+#[tokio::test]
+async fn multi_batch_push_verify_acks_every_batch() {
+    // The sender flushes a `Batch` frame at every 128 MiB budget crossing,
+    // so >128 MiB of small (batchable, <=2 MiB) files arrive as several
+    // back-to-back Batch frames. Each frame's apply task must be joined
+    // before the next frame's handle overwrites the slot — a lost earlier
+    // batch drops its verification hashes, and `--verify` then reports
+    // every file of the earlier batches as "no verification hash from
+    // receiver". Flat prefix-free file names avoid the cross-file-sibling
+    // pairing (which pulls files out of the batch); 1.9 MiB each makes the
+    // budget cross mid-plan with files to spare.
+    let src = tempfile::tempdir().unwrap();
+    let dst = tempfile::tempdir().unwrap();
+
+    for i in 0..200 {
+        let data = pseudo_random(1_900_000 + i);
+        tokio::fs::write(src.path().join(format!("file_{:02}{:02}.bin", i / 26, i % 26)), &data)
+            .await
+            .unwrap();
+    }
+
+    let mut options = default_options();
+    options.verify = true;
+    let stats = push_tree(src.path(), dst.path(), &options).await;
+    assert_eq!(stats.files_sent, 200);
+    assert!(
+        stats.skipped.is_empty(),
+        "every batch's verification hashes must reach the sender: {:?}",
+        stats.skipped
+    );
+
+    // The no-trailing-slash source recreates its name under the
+    // destination: find every .bin at any depth and check it arrived whole.
+    let mut landed = 0;
+    let mut stack = vec![dst.path().to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            if entry.file_type().unwrap().is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|e| e == "bin") {
+                assert!(std::fs::metadata(&path).unwrap().len() >= 1_900_000);
+                landed += 1;
+            }
+        }
+    }
+    assert_eq!(landed, 200);
+}

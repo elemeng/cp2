@@ -377,6 +377,22 @@ impl Receiver {
         recipes: Vec<BatchFile>,
         files_total: u64,
     ) -> Result<()> {
+        // A previous batch's apply task may still be in flight — the sender
+        // emits one `Batch` frame per 128 MiB budget crossing, and batches
+        // arrive back-to-back when the plan is all small files. The handle
+        // is overwritten below, so join the previous one first: folding its
+        // outcomes keeps the stats, verification hashes, and the rename-sync
+        // set accurate (dropping the handle would silently lose an entire
+        // earlier batch).
+        if let Some(prev) = state.batch_apply.take() {
+            for outcome in prev
+                .await
+                .map_err(|e| Error::Other(format!("Batch apply task panicked: {e}")))?
+                ?
+            {
+                fold_outcome(state, outcome);
+            }
+        }
         // Pre-verify each unique parent directory once and join the files
         // with the parent-chain walk skipped (see `join_preverified`). A
         // recipe that fails the pre-verification (a traversal attempt from
