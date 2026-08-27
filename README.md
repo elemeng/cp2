@@ -255,37 +255,44 @@ all platforms.
 ## Performance comparison
 
 All tools in one run, pushing over `ssh localhost` on a native Fedora 44
-(x86_64, NVMe); destination bytes verified against each tool's edited
-source, per-tool runs bounded by a 300s timeout (rc recorded). From
-`bench/bench.sh compare`; sy and pxs are the two studied crates that sync
-over ssh at all (the full audit is in
-[`ARCHITECTURE.md`](ARCHITECTURE.md)).
+(x86_64, NVMe), 2026-08-27. Every cell is three repetitions reported as
+**mean ± sd**, with the page cache warmed before each run, the tool order
+rotated per scenario (no slot bias), every run bounded by a 300 s timeout
+with rc recorded, and both destinations byte-verified against each tool's
+edited source (0 differing files). From `bench/bench.sh compare`; sy and
+pxs are the two studied crates that sync over ssh at all (the full audit
+is in [`ARCHITECTURE.md`](ARCHITECTURE.md)).
 
 ```
-tool      large-first   large-edit  small-first   small-idle
-cp2             1.77s        1.83s        1.72s        0.60s
-rsync           1.95s        1.46s        1.59s        0.71s
-scp             1.87s        2.09s        4.09s        3.37s
-sy              2.49s        4.33s       14.34s        0.84s
-pxs             6.30s        0.98s        2.78s        1.46s
+tool      large-first       large-edit      small-first       small-idle
+cp2       1.88±0.07s        1.89±0.08s      2.17±0.60s        0.65±0.00s
+rsync     2.26±0.04s        1.64±0.09s      1.79±0.00s        0.82±0.05s
+scp       2.39±0.20s        2.19±0.01s      4.68±1.02s        4.18±0.63s
+sy        2.78±0.06s        4.55±0.12s     53.89±0.70s        0.84±0.13s
+pxs       6.87±0.03s        1.04±0.04s      3.26±0.04s        1.70±0.02s
+fastest          cp2              pxs            rsync              cp2
 ```
 
 Reading the numbers honestly:
 
-- **Fresh large transfer (1 GiB):** cp2, scp, and rsync land within 10%
-  (1.77s / 1.87s / 1.95s), pinned near the machine's ssh-layer ceiling —
-  raw throughput is a wash.
-- **One 1 MiB edit mid-file:** fastest is a byte-compare delta (pxs, 0.98s
+- **Fresh large transfer (1 GiB):** cp2 is fastest (1.88s); rsync and scp
+  land within ~20% and ~27% (2.26s / 2.39s). The gap is ssh session
+  overhead, not throughput — all three sit near the machine's ssh-layer
+  ceiling, and their ordering flips between runs.
+- **One 1 MiB edit mid-file:** fastest is a byte-compare delta (pxs, 1.04s
   — analyzed in [`ARCHITECTURE.md`](ARCHITECTURE.md)); rsync's rolling
-  checksum is next (1.46s); cp2 is ~25% behind rsync (1.83s) — its source
-  chunking already overlaps the basis signing; the remainder is
-  FastCDC+BLAKE3 vs rolling per byte. scp re-copies the whole file (2.09s,
-  ≈ its fresh time).
-- **8192 small files (1-64 KiB):** cp2 and rsync trade the first sync within
-  ~8% (1.72s vs 1.59s); cp2 leads the no-op re-sync (0.60s vs 0.71s). scp
-  re-copies everything both times (~4s); sy trails ~8x (14.34s).
-- Localhost runs vary ~±30% between runs even for the same tool — compare
-  tools within a run, not across runs.
+  checksum is next (1.64s); cp2 is ~15% behind rsync (1.89s) — its source
+  chunking overlaps the basis signing, and the remainder is
+  FastCDC+BLAKE3 vs rolling per byte. scp re-copies the whole file (2.19s
+  ≈ its fresh time); sy re-transfers everything (4.55s).
+- **8192 small files (1-64 KiB):** rsync leads the first sync (1.79s);
+  cp2 is ~21% behind (2.17s) and this cell is also the loudest in the
+  table (±0.60s), so treat the two as trading places; scp re-copies
+  everything (4.68s); sy trails ~30x (53.89s). cp2 leads the no-op
+  re-sync (0.65s vs rsync 0.82s).
+- The ±sd column is the point of the methodology: localhost noise is
+  visible per cell, and tools drift run to run — compare means within a
+  run, not across runs.
 
 The mixed tree (≈10 GiB, 100 K files) and the full benchmark suite —
 scripts, generated trees, how to run it — are documented in
