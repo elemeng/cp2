@@ -308,9 +308,9 @@ to `REMOTE`, default `whoami@localhost`):
 | Suite | What it measures |
 |-------|------------------|
 | `compare [tool ...]` | cp2 vs rsync vs scp vs the ssh-capable studied crates (sy, pxs by default) through four push scenarios, all in one run, per-tool runs bounded by a timeout with rc recorded |
-| `mixed` | ≈10 GiB / 100 K files (70 K small 1-16 KiB, 27 K medium 64-384 KiB, 3 K large 1-2 MiB), cp2 vs rsync over ssh: `fresh` / `second` / `edit` / `integrity` phases |
-| `single` | the delta engine's value, cp2 vs rsync: `MODE=large` (one 1 GiB file: fresh / edit A+B / insert / idle) or `MODE=small` (8192 files: fresh / edit / idle) |
-| `remote` | cp2 vs rsync push to a **real** remote (set `REMOTE=user@host`): fresh / idle / edit, `RUNS`-averaged, MiB/s from each tool's own transferred-volume summary |
+| `mixed [tool ...]` | ≈10 GiB / 100 K files (70 K small 1-16 KiB, 27 K medium 64-384 KiB, 3 K large 1-2 MiB) over ssh, default cp2 vs rsync: `fresh` / `second` / `edit` / `integrity` phases — the tree is the same one `MIXED=1` / `MODE=mixed` select in the other suites |
+| `single` | the delta engine's value, cp2 vs rsync: `MODE=large` (one 1 GiB file: fresh / edit A+B / insert / idle), `MODE=small` (8192 files: fresh / edit / idle), or `MODE=mixed` (the mixed tree) |
+| `remote` | cp2 vs rsync push to a **real** remote (set `REMOTE=user@host`): fresh / idle / edit, `RUNS`-averaged, MiB/s from each tool's own transferred-volume summary (`MIXED=1` uses the mixed tree) |
 
 ### Cross-tool comparison (`bench.sh compare`)
 

@@ -125,8 +125,10 @@ keep-partials on abort. See `README.md` for the full table.
   no sshd needed in CI).
 - Benchmarks live in `bench/bench.sh` — one script, a suite per workload
   (`compare` four-scenario multi-tool table with `REMOTE`/`TOOLS` overrides;
-  `mixed` ≈10 GiB / 100 K-file cp2-vs-rsync; `single` `MODE=large|small`;
-  `remote` real-network daily flows; env knobs `CP2_BIN`/`REMOTE`/`WORK`/...).
+  `mixed` ≈10 GiB / 100 K-file phase runner, default cp2-vs-rsync; `single`
+  `MODE=large|small|mixed`; `remote` real-network daily flows; the mixed
+  tree is selectable everywhere — `MIXED=1` on compare/remote,
+  `MODE=mixed` on single; env knobs `CP2_BIN`/`REMOTE`/`WORK`/...).
 - `cargo clippy` must be clean (`Cargo.toml` sets `clippy::all` deny,
   `pedantic` warn; CI runs `-D warnings`).
 - Delta types are `serde`-serialized over the wire via `postcard`.
