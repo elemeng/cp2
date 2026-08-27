@@ -104,8 +104,10 @@ push_impl() { # tool src remote_dest_rel
     local tool="$1" src="$2" rd="$3"
     case "$tool" in
         cp2)   "$CP2_BIN" "$src" "$REMOTE:$rd" ;;
-        # --stats so the volume extractor can read rsync's summary.
-        rsync) rsync -rlt --stats "$src/" "$REMOTE:$rd/" ;;
+        # -a (no -c): the same default core cp2 runs — recursive, links,
+        # perms, times, owner/group — with the same size+mtime quick check.
+        # --stats feeds the volume extractor.
+        rsync) rsync -a --stats "$src/" "$REMOTE:$rd/" ;;
         scp)   scp -r -q "$src/." "$REMOTE:$rd/" ;;
         sy)    sy "$src" "$REMOTE:$rd" ;;
         pxs)   pxs sync "$src" "$REMOTE:$rd" ;;
