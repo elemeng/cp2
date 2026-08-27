@@ -197,7 +197,7 @@ pub struct Cli {
 
     /// Limit bandwidth (K/M/G suffixes; 0 = unlimited)
     #[arg(long, value_parser = parse_bwlimit, help_heading = "Engine")]
-    pub bwlimit: Option<Option<u64>>,
+    pub bwlimit: Option<u64>,
 
     /// Parallel workers (default: tuned from the storage class)
     #[arg(short = 'j', long, help_heading = "Engine")]
@@ -315,13 +315,13 @@ pub fn parse_duration(s: &str) -> Result<std::time::Duration, String> {
 ///
 /// Accepts a plain number (bytes/s) or a number with a `K`/`M`/`G` suffix
 /// (1024-based), e.g. `10M` → 10 MiB/s. A value of `0` means unlimited
-/// (`None`).
+/// (translated to `None` by the caller).
 ///
 /// # Errors
 ///
 /// Returns an error if the value is empty, has an unknown suffix, does not
 /// parse as a number, or overflows.
-pub fn parse_bwlimit(s: &str) -> Result<Option<u64>, String> {
+pub fn parse_bwlimit(s: &str) -> Result<u64, String> {
     let s = s.trim();
     if s.is_empty() {
         return Err("empty value".to_string());
@@ -345,7 +345,7 @@ pub fn parse_bwlimit(s: &str) -> Result<Option<u64>, String> {
     let bytes = value
         .checked_mul(multiplier)
         .ok_or_else(|| format!("bandwidth value '{s}' overflows"))?;
-    Ok(if bytes == 0 { None } else { Some(bytes) })
+    Ok(bytes)
 }
 
 #[cfg(test)]
@@ -356,11 +356,12 @@ mod tests {
 
     #[test]
     fn bwlimit_parses() {
-        assert_eq!(parse_bwlimit("1024").unwrap(), Some(1024));
-        assert_eq!(parse_bwlimit("10K").unwrap(), Some(10 * 1024));
-        assert_eq!(parse_bwlimit("10M").unwrap(), Some(10 * 1024 * 1024));
-        assert_eq!(parse_bwlimit("1g").unwrap(), Some(1024 * 1024 * 1024));
-        assert_eq!(parse_bwlimit("0").unwrap(), None);
+        assert_eq!(parse_bwlimit("1024").unwrap(), 1024);
+        assert_eq!(parse_bwlimit("10K").unwrap(), 10 * 1024);
+        assert_eq!(parse_bwlimit("10M").unwrap(), 10 * 1024 * 1024);
+        assert_eq!(parse_bwlimit("1g").unwrap(), 1024 * 1024 * 1024);
+        // `0` is the unlimited sentinel; the CLI filters it to `None`.
+        assert_eq!(parse_bwlimit("0").unwrap(), 0);
         assert!(parse_bwlimit("10X").is_err());
         assert!(parse_bwlimit("abc").is_err());
     }

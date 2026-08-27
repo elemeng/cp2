@@ -109,7 +109,7 @@ pub(crate) fn options_from_cli(cli: &Cli) -> anyhow::Result<ExecutorOptions> {
         jobs: cli.jobs,
         storage: cli.storage,
         compress: cli.compress,
-        bwlimit: cli.bwlimit.flatten(),
+        bwlimit: cli.bwlimit.filter(|&b| b != 0),
         exclude,
         include,
         itemize: cli.itemize_changes,

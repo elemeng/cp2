@@ -241,10 +241,12 @@ entries are warned about and skipped. Local entries only.
 
 cp2's defaults mirror **`rsync -avP` without `-z`**: recursive sync with
 mode/mtime preservation, a per-file listing annotated with the file's
-position and the run's total (`[12/3456] path`), live progress on a
-terminal, and partial files kept at the destination when a transfer is
-interrupted — the next run delta-resumes against them. Compression is
-opt-in via `-z`; the listing and progress are silenced by `-q`.
+position and the run's total, a dnf-style summary row per file
+(`[12/3456] path 100% | rate | size | elapsed`), live progress on a
+terminal (one in-place row per file, growing `0%`→`100%`), and partial
+files kept at the destination when a transfer is interrupted — the next
+run delta-resumes against them. Compression is opt-in via `-z`; the
+listing and progress are silenced by `-q`.
 
 ## Key options
 

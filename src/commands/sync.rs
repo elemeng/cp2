@@ -1400,13 +1400,18 @@ fn print_itemize(stats: &SyncStats) {
 }
 
 /// Install the default per-file progress reporter (rsync `-aP`-style):
-/// every transferred file gets a listing line on stdout, and on a terminal
-/// an in-place percentage is shown while the file is in flight.
+/// every transferred file ends with a dnf-style summary row on stdout
+/// (`[12/3456] path 100% | rate | size | elapsed`), and on a terminal the
+/// in-flight file shows one in-place row whose percentage grows `0%`→`100%`
+/// until the summary row replaces it.
 ///
-/// The in-place redraw is throttled to ~10/s: on a fast link the per-chunk
-/// reports arrive thousands of times per second, and a redraw (write +
-/// flush) per report would make the transfer itself terminal-bound. The
-/// per-file completion line is never throttled.
+/// The in-place redraw clears the row before painting (`\r` + erase-line)
+/// and is throttled to ~10/s: on a fast link the per-chunk reports arrive
+/// thousands of times per second, and a redraw (write + flush) per report
+/// would make the transfer itself terminal-bound. The same clear lands
+/// before the pending summary rows are flushed, so they get fresh rows of
+/// their own instead of gluing onto the live progress. The per-file
+/// summary rows are never throttled.
 fn install_progress(options: &mut ExecutorOptions) {
     use std::io::IsTerminal;
     let interactive = std::io::stdout().is_terminal();
@@ -1416,44 +1421,72 @@ fn install_progress(options: &mut ExecutorOptions) {
         use std::io::Write;
         let mut out = std::io::stdout();
         let mut st = state.lock().unwrap();
+        let now = std::time::Instant::now();
         // The speed's byte counter: the per-file done deltas (the reported
-        // bytes are monotonic per file).
-        let prev = st.last_done.insert(path.to_string(), done).unwrap_or(0);
-        st.bytes = st.bytes.saturating_add(done.saturating_sub(prev));
+        // bytes are monotonic per file); the entry also pins the file's
+        // first-seen time for the summary row's elapsed readout. Both
+        // values are copied out so the entry borrow does not span the
+        // other `st` updates below.
+        let (delta, started) = {
+            let prog = st
+                .files
+                .entry(path.to_string())
+                .or_insert_with(|| ProgressFile::new(now));
+            let delta = done.saturating_sub(prog.done);
+            prog.done = done;
+            (delta, prog.started)
+        };
+        st.bytes = st.bytes.saturating_add(delta);
         if done >= total {
             // A file can report completion twice (the wrapper's final
             // in-progress write plus the explicit completion call) — count
-            // each path once so `[index/total]` and the remaining count
-            // stay honest (the byte counter is already delta-based).
+            // each path once and emit one summary row, so `[index/total]`,
+            // the remaining count, and the per-file history stay honest
+            // (the byte counter is already delta-based).
             if st.completed_paths.insert(path.to_string()) {
                 st.completed += 1;
-            }
-            // Completion line — the rsync -v per-file listing, with the
-            // file's ordinal and the run's total (`[12/3456]`). Lines are
-            // batched: on a 100 K-file transfer the per-line write syscall
-            // alone costs seconds, and the batch path reports whole batches
-            // at once anyway.
-            let completed = st.completed;
-            let _ = writeln!(st.pending, "[{completed}/{files_total}] {path}");
-            let now = std::time::Instant::now();
-            if st.pending.len() >= PROGRESS_BATCH_BYTES
-                || now.duration_since(st.last_flush) >= PROGRESS_BATCH_AGE
-                || st.completed == files_total
-            {
-                let _ = write!(out, "{}", st.pending);
-                st.pending.clear();
-                st.last_flush = now;
+                // Summary row: the file's ordinal and the run's total, then
+                // 100% + rate + size + elapsed (dnf-style). Rows are
+                // batched: on a 100 K-file transfer the per-line write
+                // syscall alone costs seconds, and the batch path reports
+                // whole batches at once anyway.
+                let completed = st.completed;
+                let speed = st.windowed_speed(now);
+                let elapsed = now.saturating_duration_since(started);
+                let _ = writeln!(
+                    st.pending,
+                    "[{completed}/{files_total}] {path} 100% | {} | {} | {}",
+                    human_speed(speed),
+                    human_bytes(total),
+                    fmt_elapsed(elapsed)
+                );
+                if st.pending.len() >= PROGRESS_BATCH_BYTES
+                    || now.duration_since(st.last_flush) >= PROGRESS_BATCH_AGE
+                    || st.completed == files_total
+                {
+                    // Clear the live in-place row first so the summary rows
+                    // land on fresh rows of their own instead of gluing onto
+                    // the progress still on screen.
+                    if interactive {
+                        let _ = write!(out, "\r\x1b[2K");
+                    }
+                    let _ = write!(out, "{}", st.pending);
+                    st.pending.clear();
+                    st.last_flush = now;
+                }
             }
         } else if interactive {
-            // The redraw overwrites the current line — any pending
-            // completion lines must land first so the display stays clean.
+            // The redraw overwrites the current line — any pending summary
+            // rows must land first (on a cleared row) so the display stays
+            // clean.
             if !st.pending.is_empty() {
-                let _ = write!(out, "{}", st.pending);
+                let _ = write!(out, "\r\x1b[2K{}", st.pending);
                 st.pending.clear();
                 st.last_flush = std::time::Instant::now();
             }
-            let now = std::time::Instant::now();
-            if st.last_redraw.is_some_and(|t| now.duration_since(t) < std::time::Duration::from_millis(100))
+            if st
+                .last_redraw
+                .is_some_and(|t| now.duration_since(t) < std::time::Duration::from_millis(100))
             {
                 return;
             }
@@ -1465,27 +1498,15 @@ fn install_progress(options: &mut ExecutorOptions) {
                 .checked_mul(100)
                 .and_then(|d| d.checked_div(total))
                 .unwrap_or(100);
-            // Display-only speed estimate over a short window (bytes since the
-            // last redraw — ~100 ms at the 10/s throttle), not a lifetime
-            // average: the run-wide figure would be dragged down by the
-            // connect/planning time before any bytes flowed. The fallback
-            // covers a zero-length window on the first redraw.
-            let delta_bytes = st.bytes.saturating_sub(st.last_speed_bytes);
-            let delta_secs = now.duration_since(st.last_speed_at).as_secs_f64();
-            st.last_speed_bytes = st.bytes;
-            st.last_speed_at = now;
-            #[expect(clippy::cast_precision_loss)]
-            let speed = if delta_secs > 0.0 {
-                delta_bytes as f64 / delta_secs
-            } else {
-                st.bytes as f64 / st.start.elapsed().as_secs_f64()
-            };
+            let speed = st.windowed_speed(now);
             let remaining = files_total.saturating_sub(st.completed);
             let _ = write!(
                 out,
-                "\r[{}/{}] {path} {pct}% {} / {}  {}  ({} left)",
+                "\r\x1b[2K[{}/{}] {} {}% {} / {}  {}  ({} left)",
                 st.completed + 1,
                 files_total,
+                path,
+                pct,
                 human_bytes(done),
                 human_bytes(total),
                 human_speed(speed),
@@ -1503,19 +1524,55 @@ struct ProgressState {
     start: std::time::Instant,
     completed: u64,
     bytes: u64,
-    last_done: std::collections::HashMap<String, u64>,
+    /// Per-path progress: the done-delta byte counter (the reported bytes
+    /// are monotonic per file) and the first-seen time, which anchors the
+    /// summary row's elapsed readout.
+    files: std::collections::HashMap<String, ProgressFile>,
     /// Paths already counted as completed (a file's completion can be
     /// reported twice — the wrapper's final write plus the explicit call).
     completed_paths: std::collections::HashSet<String>,
     last_redraw: Option<std::time::Instant>,
-    /// Bytes and timestamp for the windowed (since-last-redraw) speed readout.
+    /// Bytes and timestamp for the windowed (since-last-readout) speed
+    /// readout.
     last_speed_bytes: u64,
     last_speed_at: std::time::Instant,
-    /// Pending per-file completion lines. On a large transfer the per-line
-    /// write syscalls alone cost seconds per 100 K files, so lines are
+    /// Pending per-file summary rows. On a large transfer the per-line
+    /// write syscalls alone cost seconds per 100 K files, so rows are
     /// batched and flushed on a size or time budget instead.
     pending: String,
     last_flush: std::time::Instant,
+}
+
+/// Per-path progress bookkeeping (see [`ProgressState::files`]).
+struct ProgressFile {
+    done: u64,
+    started: std::time::Instant,
+}
+
+impl ProgressFile {
+    fn new(now: std::time::Instant) -> Self {
+        Self { done: 0, started: now }
+    }
+}
+
+impl ProgressState {
+    /// Display-only speed estimate over a short window (bytes since the
+    /// last readout — ~100 ms at the 10/s redraw throttle), not a lifetime
+    /// average: the run-wide figure would be dragged down by the
+    /// connect/planning time before any bytes flowed. The fallback covers
+    /// a zero-length window on the first readout.
+    #[expect(clippy::cast_precision_loss)]
+    fn windowed_speed(&mut self, now: std::time::Instant) -> f64 {
+        let delta_bytes = self.bytes.saturating_sub(self.last_speed_bytes);
+        let delta_secs = now.duration_since(self.last_speed_at).as_secs_f64();
+        self.last_speed_bytes = self.bytes;
+        self.last_speed_at = now;
+        if delta_secs > 0.0 {
+            delta_bytes as f64 / delta_secs
+        } else {
+            self.bytes as f64 / self.start.elapsed().as_secs_f64()
+        }
+    }
 }
 
 /// Flush the completion-line buffer when it is large enough or old enough.
@@ -1529,7 +1586,7 @@ impl Default for ProgressState {
             start: now,
             completed: 0,
             bytes: 0,
-            last_done: std::collections::HashMap::new(),
+            files: std::collections::HashMap::new(),
             completed_paths: std::collections::HashSet::new(),
             last_redraw: None,
             last_speed_bytes: 0,
@@ -1550,6 +1607,13 @@ fn human_speed(bytes_per_sec: f64) -> String {
         unit += 1;
     }
     format!("{value:.1}{}/s", UNITS[unit])
+}
+
+/// dnf-style elapsed readout for the summary row ("00m03s"; the minute
+/// field grows past two digits on long transfers).
+fn fmt_elapsed(d: std::time::Duration) -> String {
+    let secs = d.as_secs();
+    format!("{:02}m{:02}s", secs / 60, secs % 60)
 }
 
 /// Format a byte count for progress display (1024-based K/M/G/T).
