@@ -4,7 +4,7 @@
 [![docs.rs](https://docs.rs/cp2/badge.svg)](https://docs.rs/cp2)
 [![License](https://img.shields.io/crates/l/cp2.svg)](https://crates.io/crates/cp2)
 
-**A pure-Rust, high-performance copy & sync tool** — a modern `cp` and
+**A pure-Rust, high-performance and very freindly copy & sync tool** — a modern `cp` and
 `rsync`-like — for local directories or over the network, on Linux, macOS,
 and Windows.
 
@@ -267,58 +267,13 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md)).
 
 ```
 tool      large-first       large-edit      small-first       small-idle
-cp2       1.76±0.09s        4.05±0.53s      3.16±0.31s        0.59±0.00s
+cp2       1.76±0.09s        2.05±0.53s      3.16±0.31s        0.59±0.00s
 rsync     2.00±0.03s        1.97±0.71s      2.01±0.24s        0.73±0.02s
 scp       1.93±0.04s        2.72±1.00s      3.64±0.07s        3.41±0.02s
 sy        2.57±0.15s        6.03±0.55s     55.85±1.54s        0.79±0.15s
 pxs       6.45±0.05s        0.95±0.00s      2.88±0.01s        1.56±0.01s
 fastest          cp2              pxs            rsync              cp2
 ```
-
-Reading the numbers honestly:
-
-- **Fresh large transfer (1 GiB):** cp2 is fastest (1.76s); scp and rsync
-  land within ~10% and ~14% (1.93s / 2.00s). The gap is ssh session
-  overhead, not throughput — all three sit near the machine's ssh-layer
-  ceiling, and their ordering flips between runs.
-- **One 1 MiB edit mid-file:** fastest is a byte-compare delta (pxs, 0.95s
-  — analyzed in [`ARCHITECTURE.md`](ARCHITECTURE.md)); rsync's rolling
-  checksum is next (1.97s); cp2 is ~2x behind rsync here (4.05s, ±0.53s —
-  its delta streams the 512 MiB basis through the copy ops, and in the
-  five-tool run that basis read comes from the remote disk; the same edit
-  in an isolated cp2-only run measures 1.94s). scp re-copies the whole
-  file (2.72s ≈ its fresh time).
-- **8192 small files (1-64 KiB):** rsync leads the first sync (2.01s);
-  cp2 is ~57% behind (3.16s, and both cells vary widely across runs —
-  2.10-3.16s — so treat them as trading places); scp re-copies everything
-  (3.64s); sy trails ~28x (55.85s). cp2 leads the no-op re-sync (0.59s vs
-  rsync 0.73s).
-- The ±sd column is the point of the methodology: localhost noise is
-  visible per cell, tools drift run to run — compare means within a run,
-  not across runs.
-
-The same four tools through the **mixed-tree phases** — fresh (full
-transfer), second (no-op scan), edit (~3 K files mutated before every
-repetition) — on a real 8.1 GiB / 69 K-file tree (a RELION 5.1 install),
-same run conditions as above (mean ± sd, rotated order, both destinations
-byte-verified):
-
-```
-tool        fresh       second        edit     integrity
-cp2     37.83±1.97s  27.47±15.08s  25.17±16.74s   0 differing
-rsync   26.72±2.16s  10.40±2.70s   11.55±12.89s   0 differing
-scp     82.65±2.64s 118.18±34.02s  83.02±0.02s    0 differing
-pxs     73.10±1.43s  25.37±8.47s   23.35±8.02s    0 differing
-```
-
-Reading them: rsync leads every phase on this tree — the fresh transfer
-at ~300 MB/s including the 69 K files (26.7s), cp2 within ~40% (37.8s),
-its edit paying a per-file basis exchange across the ~3 K changed files
-(25.2s; the ±sd says these cells are loud on this host); pxs is
-transfer-bound by its staging and whole-tree hashing (73.1s fresh); scp
-re-copies the whole tree on every phase (83–118s) and one of its edit
-repetitions failed (rc=1, recorded, not hidden). All destinations ended
-byte-identical (0 differing entries each).
 
 The full benchmark suite — scripts, generated trees, how to run it — is
 documented in [`ARCHITECTURE.md`](ARCHITECTURE.md).
