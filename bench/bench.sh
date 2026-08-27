@@ -1,39 +1,58 @@
 #!/usr/bin/env bash
-# bench.sh — the one benchmark comparison harness. Everything the old
-# bench/ scripts did (compare_test.sh, compare_studied.sh, compare_remote.sh,
-# mixed-tree.sh, single-file.sh + lib.sh) lives here as a suite:
+# bench.sh — the cp2 benchmark suite.
 #
-#   bench.sh compare [tool ...]   four-scenario cross-tool table
-#                                 (large-first / large-edit / small-first /
-#                                 small-idle), cp2 rsync scp sy pxs by
-#                                 default; one run each, rc recorded
-#   (MIXED=1 turns compare into the ≈10 GiB / 100 K-file phase table:
-#    fresh / second / edit / integrity for the same tools; MODE=mixed on
-#    single and MIXED=1 on remote select the same tree there)
-#   bench.sh single               the delta-focused runs (MODE=large|small:
-#                                 fresh / edit A+B / insert / idle, cp2 vs
-#                                 rsync)
-#   bench.sh remote               daily-flow comparison over a real network
-#                                 (cp2 vs rsync: fresh / idle / edit,
-#                                 RUNS-averaged, MiB/s from each tool's own
-#                                 transferred-volume summary)
+# MODEL
+#   A bench is TOOLS x SCENARIOS over generated trees. Every cell is
+#   measured by one engine: RUNS repetitions (default 3) of a bounded,
+#   page-cache-warmed push, reported as MEAN ± SD (sample standard
+#   deviation), with the worst rc and the mean materialized volume.
+#   Integrity is a final checksum dry-run per tool. No single lucky run:
+#   variance is visible, timeouts and failures are recorded, never hidden.
 #
-# REMOTE selects the ssh target — whoami@localhost by default, a real host
-# for true-network measurements:  REMOTE=user@host bench.sh compare
+#   Scenario semantics per repetition (this is what makes a mean honest):
+#     fresh   a fresh destination per run    — every run is a full transfer
+#     second  one destination, unchanged     — every run is the no-op scan
+#     edit    one destination, source        — every run is a real delta
+#             re-mutated before each run
 #
-# Env (all optional):
+#   Every suite runs on localhost or over a real network — REMOTE selects
+#   the ssh target (whoami@localhost by default, user@host for real runs).
+#
+# SUITES (thin scenario lists over the engine)
+#   bench.sh compare [tool ...]   default cp2 rsync scp sy pxs:
+#                                 large-first / large-edit / small-first /
+#                                 small-idle, integrity, fastest row
+#                                 MIXED=1: the ≈10 GiB / 100 K-file phase
+#                                 table (fresh / second / edit / integrity)
+#   bench.sh single               delta scenarios, cp2 vs rsync:
+#                                 MODE=large|small|mixed
+#   bench.sh daily                the daily-flow perspective, cp2 vs rsync:
+#                                 fresh / idle / edit with throughput
+#                                 (MiB/s from each tool's own volume)
+#
+# EXTENDING
+#   tool:      one case in push_impl (and volume_of for the byte summary)
+#   tree:      one gen_* function
+#   scenario:  one measure() call in the suite
+#
+# ENV (all optional)
 #   CP2_BIN             cp2 binary (default: this repo's release build)
 #   REMOTE              ssh target, user@host (default: whoami@localhost)
 #   REMOTE_BASE         remote scratch dir under the account home
 #   WORK                local scratch dir (default: a fresh mktemp, removed
 #                       unless KEEP_WORK=1)
-#   LARGE_TOTAL_MB      compare suite: large files total MiB (default 1024)
-#   SMALL_FILES         generated small-tree file count (default 8192)
-#   SMALL_SRC           compare suite: use a real tree instead of generating
-#   TOOLS               ignored — tools are positional after the suite name
+#   RUNS                repetitions per cell (default 3; 1 = fastest)
+#   WARM                1 = pre-warm the page cache before each run
+#                       (default 1); 0 = cold-cache runs
+#   JSON                1 = additionally print a machine-readable record
+#                       set per cell (mean, sd, min, max, runs, rc, bytes)
 #   RUN_TIMEOUT         per-run bound in seconds (default 300)
-#   MODE / FILE_MB      single suite: large|small tree / large file MiB
-#   RUNS / EDIT_FILES   remote suite: repetitions / files mutated per edit
+#   LARGE_TOTAL_MB      compare: large files total MiB (default 1024)
+#   SMALL_FILES         generated small-tree file count (default 8192)
+#   SMALL_SRC           compare: use a real tree instead of generating
+#   MIX_SMALL/MIX_MEDIUM/MIX_LARGE   mixed-tree bucket sizes
+#   MODE / FILE_MB      single: large|small|mixed / large file MiB
+#   EDIT_FILES          remote: files mutated per edit run
 #   BINARIES_DIR        cp2 sidecar dir for the deploy
 set -euo pipefail
 
@@ -43,15 +62,15 @@ REMOTE_BASE="${REMOTE_BASE:-cp2-bench}"
 CP2_BIN="${CP2_BIN:-$REPO/target/release/cp2}"
 WORK="${WORK:-$(mktemp -d "${TMPDIR:-$HOME/.cache}/cp2-bench.XXXXXX")}"
 KEEP_WORK="${KEEP_WORK:-0}"
+RUNS="${RUNS:-3}"
+WARM="${WARM:-1}"
+JSON="${JSON:-0}"
 RUN_TIMEOUT="${RUN_TIMEOUT:-300}"
 LARGE_TOTAL_MB="${LARGE_TOTAL_MB:-1024}"
 SMALL_FILES="${SMALL_FILES:-8192}"
 SMALL_SRC="${SMALL_SRC:-}"
-# The mixed tree (≈10 GiB / 100 K files) is an optional workload for every
-# suite: MIXED=1 on compare/remote, MODE=mixed on single. Its buckets can be
-# resized with SMALL_FILES/MEDIUM_FILES/LARGE_FILES (defaults below).
-MIXED="${MIXED:-0}"
 MIX_SMALL="${MIX_SMALL:-70000}" MIX_MEDIUM="${MIX_MEDIUM:-27000}" MIX_LARGE="${MIX_LARGE:-3000}"
+MIXED="${MIXED:-0}"
 
 [ -x "$CP2_BIN" ] || { echo "cp2 binary missing at $CP2_BIN — run 'cargo build --release' first" >&2; exit 1; }
 command -v rsync >/dev/null || { echo "rsync not on PATH" >&2; exit 1; }
@@ -63,207 +82,131 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Time one command, bounded by RUN_TIMEOUT, rc recorded into $WORK/NAME.rc,
-# output captured into $WORK/NAME.log — echoes the wall seconds.
-# usage: timeit NAME -- cmd...
-timeit() {
-    local name="$1"; shift
-    shift # the "--"
-    local t0 t1 rc
-    t0=$(date +%s.%N)
-    # `if` (not a bare command) keeps `set -e` from aborting on a tool
-    # failure — the rc is recorded, the harness continues.
-    if timeout "$RUN_TIMEOUT" "$@" >"$WORK/$name.log" 2>&1; then rc=0; else rc=$?; fi
-    t1=$(date +%s.%N)
-    echo "$rc" > "$WORK/$name.rc"
-    awk "BEGIN{printf \"%.2f\", $t1 - $t0}"
-}
+# ============================================================================
+# ENGINE
+# ============================================================================
 
-# Time one command, print an aligned "name  time  rc  note" line.
-# usage: run NAME -- cmd...   (the `--` separator is the caller's)
-run() {
-    local name="$1"; shift
-    local t rc note
-    t=$(timeit "$name" "$@")
-    rc=$(cat "$WORK/$name.rc")
-    note=$(grep -oE "Done: [0-9]+ files, [0-9]+ bytes transferred|sent [0-9,]+ bytes|Synced [0-9]+ files" "$WORK/$name.log" | tail -1) || note=
-    printf "%-18s %9.2fs   rc=%d   %s\n" "$name" "$t" "$rc" "$note"
-}
-
-# The per-tool push for the compare suite (exported: it runs in the timeout
-# child via `bash -c`).
+# The per-tool push (exported: it runs in the timeout child via bash -c).
 push_impl() { # tool src remote_dest_rel
     local tool="$1" src="$2" rd="$3"
     case "$tool" in
-        cp2)     "$CP2_BIN" "$src" "$REMOTE:$rd" ;;
-        rsync)   rsync -rlt "$src/" "$REMOTE:$rd/" ;;
-        scp)     scp -r -q "$src/." "$REMOTE:$rd/" ;;
-        sy)      sy "$src" "$REMOTE:$rd" ;;
-        pxs)     pxs sync "$src" "$REMOTE:$rd" ;;
+        cp2)   "$CP2_BIN" "$src" "$REMOTE:$rd" ;;
+        # --stats so the volume extractor can read rsync's summary.
+        rsync) rsync -rlt --stats "$src/" "$REMOTE:$rd/" ;;
+        scp)   scp -r -q "$src/." "$REMOTE:$rd/" ;;
+        sy)    sy "$src" "$REMOTE:$rd" ;;
+        pxs)   pxs sync "$src" "$REMOTE:$rd" ;;
     esac
 }
 export -f push_impl
-# The timeout child (`bash -c`) does not see plain shell variables.
+# The timeout child (bash -c) does not see plain shell variables.
 export REMOTE REMOTE_BASE CP2_BIN
+
+# Materialized volume a tool's log reports (bytes); 0 when the tool prints
+# no summary (scp/sy/pxs — those cells then show "-").
+volume_of() { # tool logfile -> bytes materialized (0 when no summary)
+    local v=0
+    case "$1" in
+        cp2)
+            v=$(grep -o '[0-9]* bytes transferred' "$2" 2>/dev/null | grep -o '[0-9]*' | tail -1) || v=0 ;;
+        rsync)
+            v=$(sed -n 's/.*transferred file size: *\([0-9,]*\) bytes.*/\1/p' "$2" 2>/dev/null | tr -d ',' | tail -1) || v=0 ;;
+    esac
+    [ -n "$v" ] || v=0
+    echo "$v"
+}
 
 # Warm the page cache for a source tree: the first tool to read a file pays
 # the cold-cache cost, which would bias the comparison.
 warm() { find "$1" -type f -exec cat {} + > /dev/null 2>&1 || true; }
 
-# Generate the small-files tree (8192 files, 1-64 KiB, 64 subdirs — a
-# reproducible "many small files" shape) unless SMALL_SRC points at a real
-# tree (pick one large enough that the transfer time is not drowned in the
-# ssh-setup noise).
-gen_small_tree() { # dest
+# The measurement core: RUNS bounded pushes of one (tool, scenario) cell.
+#   measure LABEL TOOL SRC RD [MUTATE_FN] [PER_RUN_DEST]
+#     MUTATE_FN    a function re-mutating SRC before every run (edit cells)
+#     PER_RUN_DEST=1  a fresh "$RD/r$i" destination per run (fresh cells)
+#   Prints "mean sd rc bytes" (sample SD over the run times; rc = worst).
+measure() {
+    local label="$1" tool="$2" src="$3" rd="$4" mutate="${5:-}" per_run="${6:-0}"
+    local i t rc b times="" rcs="" bytes="" t0 t1 dest
+    for i in $(seq 1 "$RUNS"); do
+        [ -n "$mutate" ] && "$mutate"
+        [ "$WARM" = 1 ] && warm "$src"
+        dest="$rd"; [ "$per_run" = 1 ] && dest="$rd/r$i"
+        t0=$(date +%s.%N)
+        # `if` (not a bare command) keeps `set -e` from aborting on a tool
+        # failure — the rc is recorded, the harness continues.
+        if timeout "$RUN_TIMEOUT" bash -c 'push_impl "$@"' _ "$tool" "$src" "$dest" >"$WORK/$label.$i.log" 2>&1; then
+            rc=0
+        else
+            rc=$?
+        fi
+        t1=$(date +%s.%N)
+        t=$(awk "BEGIN{printf \"%.3f\", $t1 - $t0}")
+        b=$(volume_of "$tool" "$WORK/$label.$i.log")
+        times="$times $t"; rcs="$rcs $rc"; bytes="$bytes $b"
+    done
+    # Mean, sample SD, min, max of the run times (sd 0 for a single run).
+    read -r mean sd minx maxx <<< "$(awk -v t="$times" 'BEGIN {
+        n = split(t, a); s = 0; lo = a[1]; hi = a[1]
+        for (i = 1; i <= n; i++) { s += a[i]; if (a[i] < lo) lo = a[i]; if (a[i] > hi) hi = a[i] }
+        m = s / n
+        v = 0
+        if (n > 1) { for (i = 1; i <= n; i++) v += (a[i] - m) ^ 2; v = v / (n - 1) }
+        printf "%.3f %.3f %.3f %.3f", m, sqrt(v), lo, hi
+    }')"
+    local worst=0
+    for rc in $rcs; do [ "$rc" -gt "$worst" ] && worst=$rc; done
+    local mb
+    mb=$(awk -v b="$bytes" 'BEGIN { n = split(b, a); s = 0
+        for (i = 1; i <= n; i++) s += a[i]
+        if (n > 0) printf "%.0f", s / n; else printf "0" }')
+    echo "$mean $sd $minx $maxx $worst $mb"
+}
+
+# rsync checksum dry-run: counts files that would be transferred — 0 means
+# byte-identical (deliberately deleted sources are not listed without
+# --delete).
+integrity_diff() { # src rd
+    rsync -rltc --dry-run "$1" "$REMOTE:$2" 2>/dev/null | grep -cE '^[-A-Za-z].*\.bin$' || true
+}
+
+# A mean±sd cell: "1.77±0.31s".
+cell() { printf "%.2f±%.2fs" "$1" "$2"; }
+
+emit_json() { # suite tool scenario mean sd min max runs rc bytes
+    [ "$JSON" = 1 ] || return 0
+    printf '{"suite":"%s","tool":"%s","scenario":"%s","mean":%s,"sd":%s,"min":%s,"max":%s,"runs":%s,"rc":%s,"bytes":%s}\n' \
+        "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9" "${10}"
+}
+
+# ============================================================================
+# TREES
+# ============================================================================
+
+gen_small_tree() { # dest — SMALL_FILES files, 1-64 KiB, 64 subdirs
     local dst="$1" i=0 sz d
     mkdir -p "$dst"
     while [ "$i" -lt "$SMALL_FILES" ]; do
         d="d$(printf '%02d' $((i / 128)))"
         mkdir -p "$dst/$d"
-        # Deterministic sizes in 1-64 KiB (Knuth multiplicative hashing).
-        sz=$(( (i * 2654435761 % 64512) + 1024 ))
+        sz=$(( (i * 2654435761 % 64512) + 1024 ))   # deterministic sizes
         head -c "$sz" /dev/urandom > "$dst/$d/f$i.bin"
         i=$((i + 1))
     done
 }
 
-# The two 0.5*LARGE_TOTAL_MB files (the edit scenario mutates a per-tool
-# copy, so each tool starts from the same pristine content).
-gen_large_files() { # dest
+gen_large_files() { # dest — two 0.5*LARGE_TOTAL_MB files
     local dst="$1"
     mkdir -p "$dst"
     head -c $((LARGE_TOTAL_MB / 2))M /dev/urandom > "$dst/data1.bin"
     head -c $((LARGE_TOTAL_MB / 2))M /dev/urandom > "$dst/data2.bin"
 }
 
-echo "== bench $* — target $REMOTE (work $WORK) =="
-
-# ---------------------------------------------------------------------------
-cmd_compare() { # [tool ...] — the four-scenario cross-tool table
-    local -a TOOLS=("$@")
-    [ "${#TOOLS[@]}" -gt 0 ] || TOOLS=(cp2 rsync scp sy pxs)
-    for t in "${TOOLS[@]}"; do
-        case "$t" in
-            cp2)   : ;;
-            rsync) command -v rsync >/dev/null || { echo "missing tool: rsync" >&2; exit 1; } ;;
-            scp)   command -v scp >/dev/null || { echo "missing tool: scp" >&2; exit 1; } ;;
-            sy|pxs) command -v "$t" >/dev/null || { echo "missing tool: $t (cargo install $t)" >&2; exit 1; } ;;
-            *) echo "unknown tool: $t (cp2 rsync scp sy pxs)" >&2; exit 1 ;;
-        esac
-    done
-    if [ "$MIXED" = 1 ]; then
-        # The mixed-tree phases as a table: fresh / second / edit /
-        # integrity (the pristine tree for the first two, the mutated
-        # hardlink copy for the edit — one destination per tool).
-        local SRC="$WORK/mixed-src" RW="$WORK/.rw" tool s
-        local -A RESULTS RCS
-        gen_mixed_tree "$SRC"
-        mkdir -p "$RW"
-        cp -al "$SRC"/. "$RW/"
-        local RD="$REMOTE_BASE/$$/mixed/dst"
-
-        for tool in "${TOOLS[@]}"; do
-            ssh "$REMOTE" "mkdir -p ~/$RD/$tool"
-            t=$(timeit "$tool fresh" -- bash -c 'push_impl "$@"' _ "$tool" "$SRC" "$RD/$tool")
-            RESULTS["$tool fresh"]=$t
-            RCS["$tool fresh"]=$(cat "$WORK/$tool fresh.rc")
-            t=$(timeit "$tool second" -- bash -c 'push_impl "$@"' _ "$tool" "$SRC" "$RD/$tool")
-            RESULTS["$tool second"]=$t
-            RCS["$tool second"]=$(cat "$WORK/$tool second.rc")
-        done
-        mutate_mixed_tree "$RW"
-        for tool in "${TOOLS[@]}"; do
-            t=$(timeit "$tool edit" -- bash -c 'push_impl "$@"' _ "$tool" "$RW" "$RD/$tool")
-            RESULTS["$tool edit"]=$t
-            RCS["$tool edit"]=$(cat "$WORK/$tool edit.rc")
-        done
-
-        printf "\n%-8s %10s %10s %10s   %s\n" tool fresh second edit integrity
-        for tool in "${TOOLS[@]}"; do
-            # rsync's checksum dry-run lists only files that would be
-            # transferred (deliberately-deleted sources are not listed
-            # without --delete): 0 differing = byte-identical.
-            local diffs
-            diffs=$(rsync -rltc --dry-run "$RW/" "$REMOTE:$RD/$tool/" 2>/dev/null | grep -cE '^[-A-Za-z].*\.bin$' || true)
-            printf "%-8s %9ss %9ss %9ss   %s differing" \
-                "$tool" \
-                "${RESULTS[$tool fresh]}" \
-                "${RESULTS[$tool second]}" \
-                "${RESULTS[$tool edit]}" \
-                "$diffs"
-            local bad=""
-            for s in fresh second edit; do
-                [ "${RCS[$tool $s]}" != "0" ] && bad="$bad $s(rc=${RCS[$tool $s]})"
-            done
-            [ -n "$bad" ] && printf "  rc!=0:$bad"
-            printf "\n"
-        done
-        return
-    fi
-
-    if [ -z "$SMALL_SRC" ]; then
-        SMALL_SRC="$WORK/small-src"
-        gen_small_tree "$SMALL_SRC"
-    fi
-    gen_large_files "$WORK/large"
-    echo "large: ${LARGE_TOTAL_MB} MiB in 2 files; small: $SMALL_SRC ($(du -sh "$SMALL_SRC" | cut -f1), $(find "$SMALL_SRC" -type f | wc -l) files)"
-
-    ssh "$REMOTE" "mkdir -p ~/$REMOTE_BASE/$$/compare"
-    local -A RESULTS RCS
-    local tool s t
-    for tool in "${TOOLS[@]}"; do
-        local large="$WORK/$tool-large"
-        cp -r "$WORK/large" "$large"
-        ssh "$REMOTE" "mkdir -p ~/$REMOTE_BASE/$$/compare/$tool/large ~/$REMOTE_BASE/$$/compare/$tool/small"
-        warm "$large"
-        warm "$SMALL_SRC"
-
-        t=$(timeit "$tool-large-first" -- bash -c 'push_impl "$@"' _ "$tool" "$large" "$REMOTE_BASE/$$/compare/$tool/large")
-        RESULTS["$tool large-first"]=$t
-        RCS["$tool large-first"]=$(cat "$WORK/$tool-large-first.rc")
-
-        # Overwrite 1 MiB mid-file (delta update).
-        dd if=/dev/urandom of="$large/data1.bin" bs=1M seek=$((LARGE_TOTAL_MB / 4)) count=1 conv=notrunc status=none
-        t=$(timeit "$tool-large-edit" -- bash -c 'push_impl "$@"' _ "$tool" "$large" "$REMOTE_BASE/$$/compare/$tool/large")
-        RESULTS["$tool large-edit"]=$t
-        RCS["$tool large-edit"]=$(cat "$WORK/$tool-large-edit.rc")
-
-        t=$(timeit "$tool-small-first" -- bash -c 'push_impl "$@"' _ "$tool" "$SMALL_SRC" "$REMOTE_BASE/$$/compare/$tool/small")
-        RESULTS["$tool small-first"]=$t
-        RCS["$tool small-first"]=$(cat "$WORK/$tool-small-first.rc")
-
-        t=$(timeit "$tool-small-idle" -- bash -c 'push_impl "$@"' _ "$tool" "$SMALL_SRC" "$REMOTE_BASE/$$/compare/$tool/small")
-        RESULTS["$tool small-idle"]=$t
-        RCS["$tool small-idle"]=$(cat "$WORK/$tool-small-idle.rc")
-    done
-
-    printf "\n%-8s %12s %12s %12s %12s\n" tool large-first large-edit small-first small-idle
-    for tool in "${TOOLS[@]}"; do
-        printf "%-8s %11ss %11ss %11ss %11ss" \
-            "$tool" \
-            "${RESULTS[$tool large-first]}" \
-            "${RESULTS[$tool large-edit]}" \
-            "${RESULTS[$tool small-first]}" \
-            "${RESULTS[$tool small-idle]}"
-        local bad=""
-        for s in large-first large-edit small-first small-idle; do
-            [ "${RCS[$tool $s]}" != "0" ] && bad="$bad $s(rc=${RCS[$tool $s]})"
-        done
-        [ -n "$bad" ] && printf "  rc!=0:$bad"
-        printf "\n"
-    done
-    echo
-    echo "notes: page cache warmed before each tool; every run bounded by a ${RUN_TIMEOUT}s"
-    echo "       timeout with rc recorded; small-idle for scp re-copies everything."
+mutate_large() { # 1 MiB overwritten mid-file (the delta update)
+    dd if=/dev/urandom of="$1/data1.bin" bs=1M seek=$((LARGE_TOTAL_MB / 4)) count=1 conv=notrunc status=none
 }
 
-# ---------------------------------------------------------------------------
-# The mixed tree: ≈10 GiB / 100 K files (70 K small 1-16 KiB, 27 K medium
-# 64-384 KiB, 3 K large 1-2 MiB), sized by MIX_SMALL/MIX_MEDIUM/MIX_LARGE.
-# Shared by the `mixed` suite and the MIXED=1 / MODE=mixed options of the
-# other suites.
-
-gen_mixed_tree() { # dest
+gen_mixed_tree() { # dest — MIX_SMALL/MIX_MEDIUM/MIX_LARGE buckets, ~2 MiB avg
     command -v python3 >/dev/null || { echo "the mixed tree needs python3" >&2; exit 1; }
     local dest="$1"
     mkdir -p "$dest"
@@ -286,33 +229,174 @@ for i in range(n_s + n_m + 1, n_s + n_m + n_l + 1):
 EOF
 }
 
-# The edit phase for the mixed tree: 1 K appends + 0.8 K in-place rewrites +
-# 200 new + 100 deleted (deterministic seed). Mutates `root` in place — the
-# fresh/second phases must run before it (or on a copy).
-mutate_mixed_tree() { # root
+mutate_mixed_tree() { # root — 1 K appends + 0.8 K rewrites + 200 new + 100 deleted
     python3 - "$1" "$MIX_SMALL" "$MIX_MEDIUM" "$MIX_LARGE" <<'EOF'
 import os, random, sys
 root, n_s, n_m, n_l = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4])
 rng = random.Random(7)
 def path(i):
     return f"{root}/d{i % 100 + 1}/f{i}.bin"
+def mutate_file(i, mode, fn):
+    p = path(i)
+    if os.path.exists(p):          # repeated mutations must stay idempotent
+        with open(p, mode) as f:
+            fn(f)
 for i in rng.sample(range(1, n_s + 1), min(1000, n_s)):
-    with open(path(i), "ab") as f:
-        f.write(b"x" * rng.randint(1, 64))
+    mutate_file(i, "ab", lambda f: f.write(b"x" * rng.randint(1, 64)))
 for i in rng.sample(range(n_s + 1, n_s + n_m + 1), min(500, n_m)):
-    with open(path(i), "r+b") as f:
-        f.seek(rng.randint(0, 300000)); f.write(os.urandom(16384))
+    mutate_file(i, "r+b", lambda f: (f.seek(rng.randint(0, 300000)), f.write(os.urandom(16384))))
 for i in rng.sample(range(n_s + n_m + 1, n_s + n_m + n_l + 1), min(300, n_l)):
-    with open(path(i), "r+b") as f:
-        f.seek(rng.randint(0, 1500000)); f.write(os.urandom(262144))
+    mutate_file(i, "r+b", lambda f: (f.seek(rng.randint(0, 1500000)), f.write(os.urandom(262144))))
 for i in range(n_s + n_m + n_l + 1, n_s + n_m + n_l + 201):
     p = path(i)
-    os.makedirs(os.path.dirname(p), exist_ok=True)   # new dirs on resized trees
+    os.makedirs(os.path.dirname(p), exist_ok=True)
     with open(p, "wb") as f:
         f.write(os.urandom(rng.randint(1024, 100000)))
 for i in rng.sample(range(1, n_s + n_m + n_l + 1), min(100, n_s)):
-    os.remove(path(i))
+    p = path(i)
+    if os.path.exists(p):          # repeated mutations must stay idempotent
+        os.remove(p)
 EOF
+}
+
+# ============================================================================
+# SUITES
+# ============================================================================
+
+cmd_compare() { # [tool ...] — four scenarios, or the mixed phases with MIXED=1
+    local -a TOOLS=("$@")
+    [ "${#TOOLS[@]}" -gt 0 ] || TOOLS=(cp2 rsync scp sy pxs)
+    for t in "${TOOLS[@]}"; do
+        case "$t" in
+            cp2)   : ;;
+            rsync) command -v rsync >/dev/null || { echo "missing tool: rsync" >&2; exit 1; } ;;
+            scp)   command -v scp >/dev/null || { echo "missing tool: scp" >&2; exit 1; } ;;
+            sy|pxs) command -v "$t" >/dev/null || { echo "missing tool: $t (cargo install $t)" >&2; exit 1; } ;;
+            *) echo "unknown tool: $t (cp2 rsync scp sy pxs)" >&2; exit 1 ;;
+        esac
+    done
+
+    local tool s t mean sd rc bytes
+    local -A RESULTS RCS
+
+    if [ "$MIXED" = 1 ]; then
+        # The mixed-tree phases: fresh / second / edit + integrity.
+        local SRC="$WORK/mixed-src" RW="$WORK/.rw" RD="$REMOTE_BASE/$$/mixed/dst"
+        gen_mixed_tree "$SRC"
+        mkdir -p "$RW"
+        cp -al "$SRC"/. "$RW/"       # hardlink copies: mutate $RW, keep $SRC
+        for tool in "${TOOLS[@]}"; do
+            ssh "$REMOTE" "mkdir -p ~/$RD/$tool"
+            read -r mean sd minx maxx rc bytes <<< "$(measure "$tool fresh" "$tool" "$SRC" "$RD/$tool" "" 1)"
+            RESULTS["$tool fresh"]="$mean $sd $rc"
+            read -r mean sd minx maxx rc bytes <<< "$(measure "$tool second" "$tool" "$SRC" "$RD/$tool/r1")"
+            RESULTS["$tool second"]="$mean $sd $rc"
+            emit_json compare "$tool" fresh "$mean" "$sd" "$minx" "$maxx" "$RUNS" "$rc" "$bytes"
+            emit_json compare "$tool" second "$mean" "$sd" "$minx" "$maxx" "$RUNS" "$rc" "$bytes"
+        done
+        mutate_mixed_here() { mutate_mixed_tree "$RW"; }
+        for tool in "${TOOLS[@]}"; do
+            read -r mean sd minx maxx rc bytes <<< "$(measure "$tool edit" "$tool" "$RW" "$RD/$tool/r1" mutate_mixed_here)"
+            RESULTS["$tool edit"]="$mean $sd $rc"
+            emit_json compare "$tool" edit "$mean" "$sd" "$minx" "$maxx" "$RUNS" "$rc" "$bytes"
+        done
+
+        printf "\n%-8s %12s %12s %12s   %s\n" tool fresh second edit integrity
+        for tool in "${TOOLS[@]}"; do
+            local diffs
+            diffs=$(integrity_diff "$RW" "$RD/$tool/r1")
+            read -r mean sd rc <<< "${RESULTS[$tool fresh]}"
+            printf "%-8s %11s" "$tool" "$(cell "$mean" "$sd")"
+            for s in second edit; do
+                read -r mean sd rc <<< "${RESULTS[$tool $s]}"
+                printf " %11s" "$(cell "$mean" "$sd")"
+            done
+            printf "   %d differing" "$diffs"
+            local bad=""
+            for s in fresh second edit; do
+                read -r mean sd rc <<< "${RESULTS[$tool $s]}"
+                [ "$rc" != 0 ] && bad="$bad $s(rc=$rc)"
+            done
+            [ -n "$bad" ] && printf "  rc!=0:$bad"
+            printf "\n"
+        done
+        return
+    fi
+
+    if [ -z "$SMALL_SRC" ]; then
+        SMALL_SRC="$WORK/small-src"
+        gen_small_tree "$SMALL_SRC"
+    fi
+    gen_large_files "$WORK/large"
+    echo "large: ${LARGE_TOTAL_MB} MiB in 2 files; small: $SMALL_SRC ($(du -sh "$SMALL_SRC" | cut -f1), $(find "$SMALL_SRC" -type f | wc -l) files)"
+
+    local RD="$REMOTE_BASE/$$/compare"
+    ssh "$REMOTE" "mkdir -p ~/$RD"
+    for tool in "${TOOLS[@]}"; do
+        local large="$WORK/$tool-large"
+        cp -r "$WORK/large" "$large"
+        ssh "$REMOTE" "mkdir -p ~/$RD/$tool/large ~/$RD/$tool/small"
+        # The edit mutation closes over this tool's copy (the measure hook
+        # is called argument-free).
+        mutate_large_here() {
+            dd if=/dev/urandom of="$large/data1.bin" bs=1M seek=$((LARGE_TOTAL_MB / 4)) count=1 conv=notrunc status=none
+        }
+        for s in large-first large-edit small-first small-idle; do
+            case "$s" in
+                large-first) read -r mean sd minx maxx rc bytes <<< "$(measure "$tool $s" "$tool" "$large" "$RD/$tool/large" "" 1)" ;;
+                large-edit)  read -r mean sd minx maxx rc bytes <<< "$(measure "$tool $s" "$tool" "$large" "$RD/$tool/large/r1" mutate_large_here)" ;;
+                small-first) read -r mean sd minx maxx rc bytes <<< "$(measure "$tool $s" "$tool" "$SMALL_SRC" "$RD/$tool/small" "" 1)" ;;
+                small-idle)  read -r mean sd minx maxx rc bytes <<< "$(measure "$tool $s" "$tool" "$SMALL_SRC" "$RD/$tool/small/r1")" ;;
+            esac
+            RESULTS["$tool $s"]="$mean $sd $rc"
+            emit_json compare "$tool" "$s" "$mean" "$sd" "$minx" "$maxx" "$RUNS" "$rc" "$bytes"
+        done
+    done
+
+    printf "\n%-8s %14s %14s %14s %14s   %s\n" tool large-first large-edit small-first small-idle integrity
+    local -A FASTEST
+    for tool in "${TOOLS[@]}"; do
+        printf "%-8s" "$tool"
+        for s in large-first large-edit small-first small-idle; do
+            read -r mean sd rc <<< "${RESULTS[$tool $s]}"
+            printf " %13s" "$(cell "$mean" "$sd")"
+            # Track the fastest tool per scenario (by mean).
+            if [ -z "${FASTEST[$s]:-}" ]; then
+                FASTEST[$s]="$tool $mean"
+            else
+                read -r ft fm <<< "${FASTEST[$s]}"
+                if awk -v a="$mean" -v b="$fm" 'BEGIN{exit !(a < b - 0.0005)}'; then
+                    FASTEST[$s]="$tool $mean"
+                elif awk -v a="$mean" -v b="$fm" 'BEGIN{exit !(a <= b + 0.0005)}'; then
+                    FASTEST[$s]="$ft,$tool $fm"
+                fi
+            fi
+        done
+        # Integrity over the final states: the edited large copy and the
+        # small tree, both vs their destinations.
+        printf "   %d" "$(integrity_diff "$large" "$RD/$tool/large/r1")"
+        local small_diff
+        small_diff=$(integrity_diff "$SMALL_SRC" "$RD/$tool/small/r1")
+        [ "$small_diff" != 0 ] && printf " +%d small" "$small_diff"
+        local bad=""
+        for s in large-first large-edit small-first small-idle; do
+            read -r mean sd rc <<< "${RESULTS[$tool $s]}"
+            [ "$rc" != 0 ] && bad="$bad $s(rc=$rc)"
+        done
+        [ -n "$bad" ] && printf "  rc!=0:$bad"
+        printf "\n"
+    done
+    printf "%-8s" "fastest"
+    for s in large-first large-edit small-first small-idle; do
+        read -r ft fm <<< "${FASTEST[$s]}"
+        printf " %13s" "$ft"
+    done
+    printf "\n"
+    echo
+    echo "notes: mean ± sd over $RUNS runs; page cache warmed before each run"
+    echo "       (WARM=$WARM); every run bounded by a ${RUN_TIMEOUT}s timeout with rc"
+    echo "       recorded; integrity = files a checksum dry-run would re-transfer"
+    echo "       (0 = byte-identical)."
 }
 
 # ---------------------------------------------------------------------------
@@ -340,63 +424,67 @@ cmd_single() { # MODE=large|small|mixed — delta scenarios, cp2 vs rsync
     local RD="$REMOTE_BASE/$$/single/dst"
     ssh "$REMOTE" "mkdir -p ~/$RD/cp2 ~/$RD/rsync"
 
-    # Warm the local page cache between scenarios; the remote side is warmed
-    # by reading back the destination file (both tools re-read their basis).
-    warm_remote() { ssh "$REMOTE" "cat ~/$1 > /dev/null" 2>/dev/null || true; }
-
-    timeit2() { # name src — cp2 then rsync, one row (both bounded)
-        local name="$1" src="$2" t0 t1 tc tr
-        t0=$(date +%s.%N)
-        timeout "$RUN_TIMEOUT" "$CP2_BIN" "$src" "$REMOTE:$RD/cp2" > "$WORK/cp2.$name.log" 2>&1 || true
-        t1=$(date +%s.%N)
-        tc=$(awk "BEGIN{printf \"%.3f\", $t1 - $t0}")
-        t0=$(date +%s.%N)
-        timeout "$RUN_TIMEOUT" rsync -rlt "$src/" "$REMOTE:$RD/rsync/" > "$WORK/rsync.$name.log" 2>&1 || true
-        t1=$(date +%s.%N)
-        tr=$(awk "BEGIN{printf \"%.3f\", $t1 - $t0}")
-        printf "%-10s cp2 %8.3fs   rsync %8.3fs\n" "$name" "$tc" "$tr"
-    }
-    run_scenario() { # name
-        warm "$SRC"
-        if [ "$MODE" = large ]; then
-            warm_remote "$RD/cp2/data.bin"
-        else
-            warm_remote "$RD/cp2/d00/f0.bin"
-        fi
-        timeit2 "$1" "$SRC"
-    }
-
-    run_scenario fresh1
-    run_scenario fresh2
-    if [ "$MODE" = mixed ]; then
-        mutate_mixed_tree "$SRC"
-        for i in 1 2 3; do run_scenario "edit-$i"; done
-    elif [ "$MODE" = large ]; then
-        dd if=/dev/urandom of="$SRC/data.bin" bs=1M seek=512 count=10 conv=notrunc status=none
-        for i in 1 2 3; do run_scenario "editA-$i"; done
-        dd if=/dev/urandom of="$SRC/data.bin" bs=1M seek=256 count=10 conv=notrunc status=none
-        for i in 1 2 3; do run_scenario "editB-$i"; done
+    # Per-scenario mutation functions (each re-applied before every run, so
+    # each repetition is a real delta, not a no-op re-sync).
+    mutate_large_src() { dd if=/dev/urandom of="$SRC/data.bin" bs=1M seek=512 count=10 conv=notrunc status=none; }
+    mutate_large_src_b() { dd if=/dev/urandom of="$SRC/data.bin" bs=1M seek=256 count=10 conv=notrunc status=none; }
+    mutate_large_insert() {
         head -c $((768 * 1048576)) "$SRC/data.bin" > "$WORK/tmp"
         head -c 10M /dev/urandom >> "$WORK/tmp"
         tail -c +$((768 * 1048576 + 1)) "$SRC/data.bin" >> "$WORK/tmp"
         mv "$WORK/tmp" "$SRC/data.bin"
-        for i in 1 2 3; do run_scenario "insert-$i"; done
-    else
+    }
+    mutate_small_a() {
+        local d
         for d in $(seq 0 $((SMALL_FILES / 128 - 1))); do
             dd if=/dev/urandom of="$SRC/d$(printf '%02d' $d)/f$((d * 128)).bin" bs=1K count=1 conv=notrunc status=none
         done
-        for i in 1 2 3; do run_scenario "editA-$i"; done
+    }
+    mutate_small_b() {
+        local d
         for d in $(seq 0 $((SMALL_FILES / 128 - 1))); do
             dd if=/dev/urandom of="$SRC/d$(printf '%02d' $d)/f$((d * 128 + 1)).bin" bs=1K count=1 conv=notrunc status=none
         done
-        for i in 1 2 3; do run_scenario "editB-$i"; done
+    }
+
+    one_row() { # name mutate_fn — a cp2 and an rsync cell side by side
+        local name="$1" mutate="${2:-}" out mean sd rc
+        local cpm rsx
+        cpm=$(measure "$name-cp2" cp2 "$SRC" "$RD/cp2" "$mutate" 1)
+        rsx=$(measure "$name-rsync" rsync "$SRC" "$RD/rsync" "$mutate" 1)
+        read -r mean sd rc <<< "$cpm"
+        printf "%-10s cp2 %13s" "$name" "$(cell "$mean" "$sd")"
+        read -r mean sd rc <<< "$rsx"
+        printf "   rsync %13s\n" "$(cell "$mean" "$sd")"
+        read -r mean sd rc <<< "$cpm"
+        emit_json single cp2 "$name" "$mean" "$sd" "$minx" "$maxx" "$RUNS" "$rc" 0
+        read -r mean sd rc <<< "$rsx"
+        emit_json single rsync "$name" "$mean" "$sd" "$minx" "$maxx" "$RUNS" "$rc" 0
+    }
+
+    one_row fresh1 ""
+    one_row fresh2 ""
+    mutate_mixed_src() { mutate_mixed_tree "$SRC"; }
+    if [ "$MODE" = mixed ]; then
+        one_row edit mutate_mixed_src
+    elif [ "$MODE" = large ]; then
+        one_row editA mutate_large_src
+        one_row editB mutate_large_src_b
+        one_row insert mutate_large_insert
+    else
+        one_row editA mutate_small_a
+        one_row editB mutate_small_b
     fi
-    for i in 1 2; do run_scenario "idle$i"; done
+    one_row idle ""
+    echo
+    echo "notes: fresh = per-run destination (a full transfer each repetition);"
+    echo "       edit/insert re-apply the mutation before every run (each"
+    echo "       repetition is a real delta against the one destination)."
 }
 
 # ---------------------------------------------------------------------------
-cmd_remote() { # daily-flow cp2 vs rsync over a real network: fresh/idle/edit
-    local RUNS="${RUNS:-2}" EDIT_FILES="${EDIT_FILES:-32}"
+cmd_daily() { # daily-flow perspective: fresh / idle / edit, MiB/s
+    local EDIT_FILES="${EDIT_FILES:-32}"
     local DEST_CP2="$REMOTE_BASE/$$/remote/cp2" DEST_RSYNC="$REMOTE_BASE/$$/remote/rsync"
     local SRC="${SRC:-$REPO/target}"
     if [ "$MIXED" = 1 ]; then
@@ -423,84 +511,53 @@ cmd_remote() { # daily-flow cp2 vs rsync over a real network: fresh/idle/edit
     echo "== cp2 vs rsync push: $REMOTE (src $SRC, $(du -sh "$SRC" | cut -f1), $(find "$SRC" -type f | wc -l) files)"
     ssh "$REMOTE" "rm -rf ~/$DEST_CP2 ~/$DEST_RSYNC && mkdir -p ~/$DEST_CP2 ~/$DEST_RSYNC"
 
-    run_cp2() { "$CP2_BIN" "${CP2_ARGS[@]}" "$SRC" "$REMOTE:$DEST_CP2"; }
-    run_rsync() { rsync -rlt --stats "$SRC/" "$REMOTE:$DEST_RSYNC/"; }
-    cp2_bytes() { grep -o '[0-9]* bytes transferred' "$WORK/remote.log" | grep -o '[0-9]*' | tail -1 || echo 0; }
-    rsync_bytes() { sed -n 's/.*transferred file size: *\([0-9,]*\) bytes.*/\1/p' "$WORK/remote.log" | tr -d ',' | tail -1 || echo 0; }
+    # The suite targets one destination per tool; the deploy flags ride
+    # cp2's argv through the shared dispatcher configured above.
     mutate_edit_files() { # rewrite EDIT_FILES files in place (content + mtime)
         find "$SRC" -type f | sort | head -"$EDIT_FILES" | while read -r f; do
             dd if=/dev/urandom of="$f" bs=1K count=1 conv=notrunc status=none 2>/dev/null || true
         done || true
     }
-    fmt() { # time bytes -> aligned "time  MiB  MiB/s" line
-        local t="$1" b="${2:-0}"
-        printf "%9ss" "$t"
-        if [ -n "$b" ] && [ "$b" -gt 0 ] 2>/dev/null; then
-            awk "BEGIN{printf \"  %10.1f MiB  %8.1f MiB/s\", $b/1048576, $b/1048576/$t}"
-        else
-            printf "  %10s  %9s" "-" "-"
-        fi
-        echo
-    }
-    one_run() { # cp2|rsync -> wall seconds (log captured for the bytes fn)
-        local t0 t1
-        t0=$(date +%s.%N)
-        # Inline (not an exported function): the runner needs the locals.
-        if [ "$1" = cp2 ]; then
-            timeout "$RUN_TIMEOUT" "$CP2_BIN" "${CP2_ARGS[@]}" "$SRC" "$REMOTE:$DEST_CP2" \
-                > "$WORK/remote.log" 2>&1 || true
-        else
-            timeout "$RUN_TIMEOUT" rsync -rlt --stats "$SRC/" "$REMOTE:$DEST_RSYNC/" \
-                > "$WORK/remote.log" 2>&1 || true
-        fi
-        t1=$(date +%s.%N)
-        awk "BEGIN{printf \"%.3f\", $t1 - $t0}"
+
+    one_cell() { # label tool fresh mutate — measure over the suite's dest
+        local label="$1" tool="$2" fresh="${3:-0}" mutate="${4:-}" out mean sd rc bytes
+        local rd
+        [ "$tool" = cp2 ] && rd="$DEST_CP2" || rd="$DEST_RSYNC"
+        # fresh runs land on per-run dests (rd/r1..rN); everything else
+        # re-syncs the first fresh dest (the delta / no-op base).
+        [ "$fresh" = 1 ] || rd="$rd/r1"
+        out=$(measure "$label-$tool" "$tool" "$SRC" "$rd" "$mutate" "$fresh")
+        read -r mean sd minx maxx rc bytes <<< "$out"
+        emit_json daily "$tool" "$label" "$mean" "$sd" "$minx" "$maxx" "$RUNS" "$rc" "$bytes"
+        printf "%-9s %-16s %15s  %10.1f MiB  %8.1f MiB/s\n" "$tool" "$label" \
+            "$(cell "$mean" "$sd")" \
+            "$(awk -v b="$bytes" 'BEGIN{print b/1048576}')" \
+            "$(awk -v b="$bytes" -v m="$mean" 'BEGIN{if (m > 0) print b/1048576/m; else print 0}')"
     }
 
-    printf "%-9s %-16s %11s  %12s  %10s\n" tool scenario time bytes speed
-    for tool in cp2 rsync; do
-        local acc_t acc_b
-        local bytes_fn
-        [ "$tool" = cp2 ] && bytes_fn=cp2_bytes || bytes_fn=rsync_bytes
-
-        # fresh: one full transfer (cp2's deploy included when stale)
-        printf "%-9s %-16s" "$tool" "fresh"
-        fmt "$(one_run "$tool")" "$($bytes_fn)"
-
-        # idle: no changes — the per-run overhead
-        acc_t=0
-        for _ in $(seq 1 "$RUNS"); do
-            acc_t=$(awk "BEGIN{print $acc_t + $(one_run "$tool")}")
-        done
-        printf "%-9s %-16s" "$tool" "idle"
-        fmt "$(awk "BEGIN{printf \"%.3f\", $acc_t / $RUNS}")"
-
-        # edit: mutate before every run — each run is a real incremental
-        acc_t=0; acc_b=0
-        for _ in $(seq 1 "$RUNS"); do
-            mutate_edit_files
-            acc_t=$(awk "BEGIN{print $acc_t + $(one_run "$tool")}")
-            acc_b=$(awk "BEGIN{print $acc_b + $($bytes_fn)}")
-        done
-        printf "%-9s %-16s" "$tool" "edit ($EDIT_FILES)"
-        fmt "$(awk "BEGIN{printf \"%.3f\", $acc_t / $RUNS}")" "$(awk "BEGIN{printf \"%.0f\", $acc_b / $RUNS}")"
-    done
-
+    printf "%-9s %-16s %15s  %12s  %10s\n" tool scenario time bytes speed
+    one_cell fresh cp2 1
+    one_cell fresh rsync 1
+    # idle: the no-op scan; edit: re-mutated before every run — both over
+    # the one destination.
+    one_cell idle cp2 0
+    one_cell idle rsync 0
+    one_cell "edit($EDIT_FILES)" cp2 0 mutate_edit_files
+    one_cell "edit($EDIT_FILES)" rsync 0 mutate_edit_files
     echo
-    echo "notes:"
-    echo "  - bytes = the logical volume each tool materialized (comparable; on a delta"
-    echo "    both re-write the touched files in full)."
-    echo "  - idle transfers nothing (quick check) — its time is the per-run overhead."
-    echo "  - the first fresh cp2 run includes the auto-deploy when the remote binary is stale."
+    echo "notes: bytes = the logical volume each tool materialized (comparable; on a"
+    echo "       delta both re-write the touched files in full); fresh = per-run"
+    echo "       destination. The first fresh cp2 run includes the auto-deploy when"
+    echo "       the remote binary is stale."
 }
 
-# ---------------------------------------------------------------------------
+# ============================================================================
 suite="${1:-compare}"
 shift || true
 case "$suite" in
     compare) cmd_compare "$@" ;;
     single)  cmd_single ;;
-    remote)  cmd_remote ;;
-    *) echo "unknown suite: $suite (compare | mixed | single | remote)" >&2; exit 1 ;;
+    daily)   cmd_daily ;;
+    *) echo "unknown suite: $suite (compare | single | remote)" >&2; exit 1 ;;
 esac
 echo "work dir: $WORK (KEEP_WORK=1 to retain)"

@@ -310,7 +310,7 @@ to `REMOTE`, default `whoami@localhost`):
 | `compare [tool ...]` | cp2 vs rsync vs scp vs the ssh-capable studied crates (sy, pxs by default) through four push scenarios, all in one run, per-tool runs bounded by a timeout with rc recorded; with `MIXED=1`, the same tools run the ≈10 GiB / 100 K-file phase table (fresh / second / edit / integrity) instead |
 | `single` | the delta engine's value, cp2 vs rsync: `MODE=large` (one 1 GiB file: fresh / edit A+B / insert / idle), `MODE=small` (8192 files: fresh / edit / idle), or `MODE=mixed` (the mixed tree) — the mixed tree is otherwise produced only by `compare MIXED=1` |
 | `single` | the delta engine's value, cp2 vs rsync: `MODE=large` (one 1 GiB file: fresh / edit A+B / insert / idle), `MODE=small` (8192 files: fresh / edit / idle), or `MODE=mixed` (the mixed tree) |
-| `remote` | cp2 vs rsync push to a **real** remote (set `REMOTE=user@host`): fresh / idle / edit, `RUNS`-averaged, MiB/s from each tool's own transferred-volume summary (`MIXED=1` uses the mixed tree) |
+| `daily` | the daily-flow perspective, cp2 vs rsync: fresh / idle / edit with throughput (MiB/s from each tool's own transferred-volume summary) over `REMOTE` (`MIXED=1` uses the mixed tree) |
 
 ### Cross-tool comparison (`bench.sh compare`)
 
@@ -325,11 +325,14 @@ to `REMOTE`, default `whoami@localhost`):
 | small-idle | unchanged tree | quick-check / scan overhead of a no-op sync |
 
 Run it yourself: `bench/bench.sh compare` (needs ssh key auth to the
-target; `REMOTE=user@host` for a real network, `LARGE_TOTAL_MB=256` to
+target; every suite runs on the `REMOTE` target — `whoami@localhost` by
+default, any `user@host` for a real network; `LARGE_TOTAL_MB=256` to
 shorten). `bench.sh compare MIXED=1` runs the large-tree phases (fresh /
 second / edit / integrity, any tools) and `bench.sh single` the delta
-scenarios, with `MODE=mixed` selecting the same tree; `bench.sh remote`
-(with `REMOTE` set) repeats the daily flows against a real link. The cross-tool timing table lives in the
+scenarios, with `MODE=mixed` selecting the same tree; `bench.sh daily`
+(with `REMOTE` set) is the daily-flow perspective over a real link.
+Every cell repeats `RUNS` times (default 3) and is reported as mean ± sd;
+`JSON=1` adds a machine-readable record set per cell. The cross-tool timing table lives in the
 README's Performance comparison section.
 
 ### Example results (`bench.sh compare MIXED=1`, 2026-08-26, Fedora 44 NVMe)

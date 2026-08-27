@@ -123,11 +123,13 @@ keep-partials on abort. See `README.md` for the full table.
   passing (`tests/e2e_{transfer,links,meta,features}.rs` share helpers in
   `tests/common/mod.rs` and run against a spawned `cp2 --server` over pipes —
   no sshd needed in CI).
-- Benchmarks live in `bench/bench.sh` — one script, a suite per workload
-  (`compare` four-scenario multi-tool table with `REMOTE`/`TOOLS` overrides,
-  `MIXED=1` turns it into the ≈10 GiB / 100 K-file phase table; `single`
-  `MODE=large|small|mixed`; `remote` real-network daily flows, `MIXED=1`
-  uses the mixed tree there too; env knobs `CP2_BIN`/`REMOTE`/`WORK`/...).
+- Benchmarks live in `bench/bench.sh` — one engine, three suites, all
+  runnable locally or over a real network via `REMOTE=user@host`:
+  `compare` four-scenario multi-tool table with `TOOLS` overrides
+  (`MIXED=1` turns it into the ≈10 GiB / 100 K-file phase table);
+  `single` `MODE=large|small|mixed`; `daily` the daily-flow table with
+  MiB/s. Every cell = `RUNS` repetitions reported as mean ± sd; `JSON=1`
+  emits machine-readable records; env knobs `CP2_BIN`/`REMOTE`/`WORK`/...).
 - `cargo clippy` must be clean (`Cargo.toml` sets `clippy::all` deny,
   `pedantic` warn; CI runs `-D warnings`).
 - Delta types are `serde`-serialized over the wire via `postcard`.
