@@ -53,7 +53,8 @@ cargo clippy
   streaming with bounded memory (256 MiB literal cap, 1 MiB copy scratch).
   Large new files stream as `FileStart/Chunk/End` frames over a zero-copy wire
   layout. Basis signatures are requested on demand (groups of 32) and cached
-  across runs (`sigcache`, keyed by size+mtime; `~/.cache/cp2/sig-cache`).
+  across runs (`sigcache`, keyed by size+mtime, each entry re-verified
+  against a head+tail sample on hit; `~/.cache/cp2/sig-cache`).
 - **Cross-file delta.** Sibling files ("1.iso"/"1.1.iso", same dir, sizes
   within 2x) pair in the plan: the dependent ships as a delta against the
   reference copy — the scenario where CDC beats rsync.
@@ -67,6 +68,10 @@ cargo clippy
   `--partial` follow rsync semantics.
 - **Pipelined & storage-adaptive.** End-to-end pipelining keeps the wire fed;
   the apply window is 1 on HDD / 16 on SSD (`-j/--jobs` overrides).
+- **Minimal destination scan.** The receiver's dest scan is a source-keyed
+  probe (one stat per source path, parallel), never a tree walk unless
+  `--delete`; an empty destination skips the probe entirely. The quick
+  check is size+mtime (`-c` switches to hashes).
 - **Opt-in features.** `-z` = lz4, `-S` = sparse write, `-X` = xattrs,
   `-U` = atimes, `--bwlimit` = token bucket, `--fsync`, `-W/--watch` realtime
   (notify + debounce; pull is server-driven).

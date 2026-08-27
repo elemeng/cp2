@@ -117,6 +117,15 @@ value computed by the §2.2 matrix; owner/group are never transferred (0-Root).
 The pull direction is the mirror image: the client sends a `PullRequest`,
 the server plays the sender, and the client plays the receiver.
 
+**Minimal destination scan.** The receiver's destination scan answers only
+what the quick check needs: without `--delete` it is a *targeted probe* —
+one stat per *source* path, run in parallel batches (`scan_targeted`), never
+a walk of the destination tree; the planner then compares size+mtime
+(`-c` switches to hashes). A destination root with no entries at all
+(freshly created, or new) skips even the probe and answers with the empty
+manifest. Only `--delete` forces the full destination walk — deletions are
+the one decision that requires knowing what else exists.
+
 ## The delta engine
 
 ```
@@ -139,6 +148,19 @@ only shifts the chunks it touches — a 1-byte insertion near the start of a
 Chunk identity is a BLAKE3 hash (SIMD-accelerated), which doubles as the
 integrity check: `apply_patch` verifies the reconstructed output against the
 delta checksum.
+
+## The signature cache
+
+The receiver stores the chunk signature of every file it applies, keyed by
+the applied file's (size, mtime) — so the next run's basis signing (`--watch`
+cycles, repeated idempotent syncs) is served from disk instead of re-reading
+and re-hashing the basis (`~/.cache/cp2/sig-cache`, one postcard file per
+destination path, atomic temp+rename, corrupt entries are misses). Each
+entry additionally carries a head+tail content sample that is re-verified
+against the live file on every hit: a (size, mtime)-preserving in-place
+replacement of the destination (`cp -p`, `rsync -t`, restores) must never
+serve a stale basis to the delta engine — quick-check staleness only *skips*
+a file, while a stale basis signature would *write* misaligned bytes.
 
 ## The receiver's atomic apply
 
@@ -180,7 +202,7 @@ against it.
 - Directory walks are parallel (jwalk/rayon), applying include/exclude
   filters while pruning.
 - The receiver applies files with a bounded in-flight window tuned from the
-  destination storage class (1 on HDD, 8 on SSD/NVMe — detected via sysfs
+  destination storage class (1 on HDD, 16 on SSD/NVMe — detected via sysfs
   / IOCTL / `diskutil`); an explicit `-j` always wins.
 - Hashing is SIMD-accelerated (blake3/rayon).
 
@@ -308,7 +330,6 @@ to `REMOTE`, default `whoami@localhost`):
 | Suite | What it measures |
 |-------|------------------|
 | `compare [tool ...]` | cp2 vs rsync vs scp vs the ssh-capable studied crates (sy, pxs by default) through four push scenarios, all in one run, per-tool runs bounded by a timeout with rc recorded; with `MIXED=1`, the same tools run the ≈10 GiB / 100 K-file phase table (fresh / second / edit / integrity) instead |
-| `single` | the delta engine's value, cp2 vs rsync: `MODE=large` (one 1 GiB file: fresh / edit A+B / insert / idle), `MODE=small` (8192 files: fresh / edit / idle), or `MODE=mixed` (the mixed tree) — the mixed tree is otherwise produced only by `compare MIXED=1` |
 | `single` | the delta engine's value, cp2 vs rsync: `MODE=large` (one 1 GiB file: fresh / edit A+B / insert / idle), `MODE=small` (8192 files: fresh / edit / idle), or `MODE=mixed` (the mixed tree) |
 | `daily` | the daily-flow perspective, cp2 vs rsync: fresh / idle / edit with throughput (MiB/s from each tool's own transferred-volume summary) over `REMOTE` (`MIXED=1` uses the mixed tree) |
 
@@ -358,7 +379,9 @@ russh transport — the first attempt over the system-ssh transport
 deadlocked in OpenSSH's ControlMaster mux on a server-side stderr write
 (25 min, no progress; the same phase over russh completed in 55s) — and it
 predates the delta-overlap work, which halved cp2's single-file edit cost
-since.
+since. It is the historical record of the *generated* tree; the README
+carries the current mean ± sd runs (four scenarios, and the mixed phases
+over a real tree).
 
 **The deadlock, root-caused and fixed.** The server's diagnostics (the
 per-run summary, tracing lines) ride sshd's stderr pipe; a wedge anywhere
@@ -395,10 +418,13 @@ in parallel (`src != dst`), only differing blocks written, and one
 full-file BLAKE3 for integrity at the end. For a same-size in-place
 overwrite (VM images, PGDATA) that is near the floor of possible work. The
 same design is its weakness: fresh transfers stage and hash everything (the
-6.30s row in the README table), and a mid-file insertion shifts every later
-block so the whole tail re-sends — the exact case content-defined chunking
-exists for.
+6.45s fresh row in the README table), and a mid-file insertion shifts every
+later block so the whole tail re-sends — the exact case content-defined
+chunking exists for.
 
-sy trails everywhere, ~8x slower than cp2 on many small files. The single
-timing table across all ssh-capable tools (cp2, rsync, scp, sy, pxs in one
-run) lives in the README's Performance comparison section.
+sy trails everywhere, ~25-30x slower than cp2 on many small files
+(2026-08-27 run). The single timing table across all ssh-capable tools
+(cp2, rsync, scp, sy, pxs in one run) lives in the README's Performance
+comparison section; the current tables there — the four-scenario mean ± sd
+run and the mixed phases on a real 8.1 GiB / 69 K-file tree — supersede
+the dated example above.

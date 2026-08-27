@@ -4,9 +4,9 @@
 [![docs.rs](https://docs.rs/cp2/badge.svg)](https://docs.rs/cp2)
 [![License](https://img.shields.io/crates/l/cp2.svg)](https://crates.io/crates/cp2)
 
-**A pure-Rust, high-performance and very freindly copy & sync tool** — a modern `cp` and
-`rsync`-like — for local directories or over the network, on Linux, macOS,
-and Windows.
+**A pure-Rust, high-performance and very friendly copy & sync tool** — a
+modern `cp` and `rsync`-like — for local directories or over the network,
+on Linux, macOS, and Windows.
 
 Copy files locally, or sync two machines over SSH with rsync-style
 semantics — but with a modern delta engine that sends only the bytes that
@@ -259,7 +259,7 @@ All tools in one run, pushing over `ssh localhost` on a native Fedora 44
 **mean ± sd**, with the page cache warmed before each run, the tool order
 rotated per scenario (no slot bias), every run bounded by a 300 s timeout
 with rc recorded, and both destinations byte-verified against each tool's
-edited source (0 differing files). Everybody runs its default core — cp2
+edited source (0 differing files). Every tool runs its default core — cp2
 bare (the rlpt core), rsync plain `-a`, scp `-r`, sy/pxs defaults — no
 `-c`/checksum flag anywhere. From `bench/bench.sh compare`; sy and pxs
 are the two studied crates that sync over ssh at all (the full audit is
