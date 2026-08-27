@@ -16,50 +16,40 @@ already have.
 
 ## Why cp2?
 
-- **Sends only what changed** — FastCDC content-defined chunking + BLAKE3: a
-  1-byte edit in a 50 GB file transfers kilobytes, not gigabytes, and large
-  files stream in bounded memory (a 100 GB file never needs 100 GB of RAM).
-- **Zero-setup server** — cp2 deploys a matching binary to the remote
-  automatically on first sync. `cp2 SRC user@host:DEST` just works against a
-  fresh account: no install, no sudo, no PATH setup. The zero-interaction
-  promise holds for same-platform remotes (local binary in, matching build
-  out); a **different platform** or a **remote with an older glibc** than
-  your build needs a one-time sidecar — the error tells you the exact
-  `cargo build --target ...` command, and every sync after that deploys
-  automatically.
-- **One password prompt** — on Unix the run's ssh sessions multiplex over a
-  single `ControlMaster` connection, so with password auth you authenticate
-  once per run. On Windows (where OpenSSH's multiplexing socket is broken,
-  `getsockname failed: Not a socket`) cp2 uses its own pure-Rust SSH client
-  (`russh`): one connection, one authentication, one channel per session.
+- **Sends only what changed** — FastCDC chunking + BLAKE3: a 1-byte edit in a
+  50 GB file transfers kilobytes, and large files stream in bounded memory.
+- **Zero-setup server** — the first sync deploys a matching binary to the
+  remote; nothing to install on a fresh account. Same-platform remotes need
+  zero interaction; a different platform or older glibc needs a one-time
+  sidecar build (the error prints the exact command), after which deploys
+  are automatic.
+- **One password prompt per run** — Unix multiplexes the run's sessions over
+  a single ControlMaster connection; Windows uses cp2's own pure-Rust SSH
+  client, since OpenSSH multiplexing is broken there.
 - **Verification you can trust** — `--verify` proves the destination bytes
-  match the source (hashed on the fly, no re-reads); `--remove-source-files`
-  frees the source disk only after the copy is hash-verified, fsynced, and
-  re-checked — safe for clearing an instrument's storage.
+  match the source; `--remove-source-files` frees disk only after the copy
+  is hash-verified and fsynced.
 - **rsync semantics, minus the setup** — `-a`, `--delete`, `--backup`,
-  `--exclude-from`/`--include-from`, itemize/stat/reporting flags, `--no-*`
-  opt-outs, exit code 23. If you know rsync, you know cp2. For scripting and
-  auditing, `-i/--itemize-changes` prints per-file change lines, `--stats` a
-  post-run block, and `--list-only` a source listing without touching the
-  destination.
-- **Realtime watch** — `-W` syncs changes as they happen (event-driven push,
-  server-driven pull), with a duration cap built in.
-- **Cross-platform, embeddable** — any combination of Linux, macOS, and
-  Windows; the sync engine runs over any byte stream.
+  excludes, `--no-*` opt-outs, exit code 23. If you know rsync, you know
+  cp2; `-i`/`--stats`/`--list-only` cover scripting and auditing.
+- **Realtime watch** — `-W` syncs changes as they happen, with a duration
+  cap.
+- **Pure Rust, cross-platform** — Linux, macOS, Windows; the engine runs
+  over any byte stream.
 
 ### Why not just rsync?
 
-rsync is battle-tested and ubiquitous — cp2 doesn't argue with that. It
-argues with the rough edges:
+rsync is battle-tested and ubiquitous — cp2 doesn't argue with that, just
+the rough edges:
 
 | | rsync | cp2 |
 |---|---|---|
-| server setup | manual install, PATH config, or an rsync daemon | **auto-deploy on first sync** |
-| delta | fixed-size blocks + rolling checksums | **content-defined chunks (FastCDC) + BLAKE3** |
-| integrity | none built in | **`--verify`; hash-guarded `--remove-source-files`** |
+| server setup | manual install, PATH config, or a daemon | auto-deploy on first sync |
+| delta | fixed blocks + rolling checksums | content-defined chunks (FastCDC) + BLAKE3 |
+| integrity | none built in | `--verify`; hash-guarded `--remove-source-files` |
 | watch | not built in | built-in `-W` |
-| password prompts | once per session (unless ssh config) | **once per run** |
-| Windows | via WSL/Cygwin | **native** |
+| password prompts | once per session | once per run |
+| Windows | via WSL/Cygwin | native |
 
 ## Quick start
 
