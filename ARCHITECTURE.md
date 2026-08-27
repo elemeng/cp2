@@ -261,7 +261,7 @@ auto-deploying.
 **Windows remotes** get a PowerShell + `certutil` deploy (base64 over stdin —
 Windows' 32 KB command-line limit rules out inline base64) and a
 `cmd /c`-wrapped server command so `%USERPROFILE%` paths expand under any
-sshd default shell; the default remote path is `%USERPROFILE%\.local\bin\cp2.exe`.
+sshd default shell; the default remote path is `%USERPROFILE%\.cargo\bin\cp2.exe`.
 The platform probe is instant and locale-independent.
 
 **Transport dispatch.** On Unix the system `ssh` process carries the protocol

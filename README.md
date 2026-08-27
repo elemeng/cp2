@@ -34,8 +34,10 @@ the remote — the first sync just works against a fresh account.
 
 ### On your machine
 
+Recommend
+ust need to be required in your PC
 ```bash
-cargo install cp2
+cargo install cp2 
 ```
 
 or grab a prebuilt binary for your platform from the [GitHub releases
@@ -49,13 +51,13 @@ A **same-platform** remote needs nothing — cp2 deploys itself there on the
 first sync. A **different platform** needs cp2 installed on the remote
 once, any of these three ways:
 
-1. **Install with cargo** — log in and run `cargo install cp2 --locked`
+1. **Install with cargo** (Recommend) — log in and run `cargo install cp2 --locked`
    (it builds for the remote's own libc, so it also fixes an older-glibc
    remote):
 
    ```bash
    ssh user@remote
-   cargo install cp2 --locked
+   cargo install cp2 --locked #Recommend
    ```
 
 2. **Download the prebuilt tarball** — grab the release tarball for the
@@ -71,10 +73,15 @@ once, any of these three ways:
    cp target/release/cp2 ~/.cargo/bin/
    ```
 
+The binary is plain `cp2` on Linux **and** macOS — only Windows appends
+`.exe` — and the install folder is `~/.cargo/bin` on Unix,
+`%USERPROFILE%\.cargo\bin` on Windows (`cp2.exe`). That is also exactly
+where `cargo install` puts it and where the client probes by default, so
+any of the three methods lands the binary in the right place.
+
 The remote build must match your client's build — the sync handshake
 enforces it, and the error names what to reinstall. After that,
 `cp2 ./data user@remote:backup` syncs like any same-platform remote.
-
 
 ## Quick start
 

@@ -1118,6 +1118,14 @@ fn deploy_source(
         return std::env::current_exe().map_err(anyhow::Error::new);
     }
     let triple = candidates.first().copied().unwrap_or("<triple>");
+    // The binary name and the install folder differ per OS: only Windows
+    // appends `.exe`, and the cargo bin folder is `%USERPROFILE%\.cargo\bin`
+    // there (`default_remote_path` matches).
+    let (bin_name, bin_dir) = if os == "windows" {
+        ("cp2.exe", r"%USERPROFILE%\.cargo\bin".to_string())
+    } else {
+        ("cp2", "~/.cargo/bin".to_string())
+    };
     // Auto-deploy is same-platform only: a different-platform remote has no
     // deployable build, so rather than guess, the error tells the user how
     // to install cp2 on the remote once. A prebuilt sidecar (what a release
@@ -1128,10 +1136,10 @@ fn deploy_source(
          same-platform remotes only). Install cp2 on the remote once: \
          log in and run `cargo install cp2 --locked`, \
          or download the prebuilt release tarball for {os}/{arch} from the GitHub \
-         releases page, extract it, rename the binary to `cp2`, and copy it to \
-         `~/.cargo/bin`, \
+         releases page, extract it, rename the binary to `{bin_name}`, and copy it \
+         to `{bin_dir}`, \
          or `git clone https://github.com/elemeng/cp2 && cargo build --release` and \
-         copy `target/release/cp2` to `~/.cargo/bin`. \
+         copy `target/release/{bin_name}` to `{bin_dir}`. \
          Alternatively, place a prebuilt `cp2-{triple}` sidecar next to this binary \
          (or in --binaries-dir): the client will deploy that automatically."
     )
