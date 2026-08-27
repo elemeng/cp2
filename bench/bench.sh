@@ -46,8 +46,10 @@
 #   CP2_BIN             cp2 binary (default: this repo's release build)
 #   REMOTE              ssh target, user@host (default: whoami@localhost)
 #   REMOTE_BASE         remote scratch dir under the account home
-#   WORK                local scratch dir (default: a fresh mktemp, removed
-#                       unless KEEP_WORK=1)
+#   WORK                local scratch dir — default a fresh
+#                       $HOME/cp2-bench/run.* dir: everything generated
+#                       and every local destination lives under the
+#                       cp2-bench root; removed unless KEEP_WORK=1
 #   RUNS                repetitions per cell kept in the statistics
 #                       (default 3; 1 = fastest)
 #   WARMUP              extra first repetitions per cell, discarded from
@@ -63,6 +65,9 @@
 #   SMALL_FILES         generated small-tree file count (default 8192)
 #   SMALL_SRC           compare: use a real tree instead of generating
 #   MIX_SMALL/MIX_MEDIUM/MIX_LARGE   mixed-tree bucket sizes
+#   MIXED_SRC           a real tree used as the mixed source instead of
+#                       the generated one (read-only; the edit phase
+#                       mutates a hardlink copy)
 #   MODE / FILE_MB      single: large|small|mixed / large file MiB
 #   EDIT_FILES          remote: files mutated per edit run
 #   BINARIES_DIR        cp2 sidecar dir for the deploy
@@ -72,7 +77,11 @@ REPO="$(cd "$(dirname "$0")/.." && pwd)"
 REMOTE="${REMOTE:-$(whoami)@localhost}"
 REMOTE_BASE="${REMOTE_BASE:-cp2-bench}"
 CP2_BIN="${CP2_BIN:-$REPO/target/release/cp2}"
-WORK="${WORK:-$(mktemp -d "${TMPDIR:-$HOME/.cache}/cp2-bench.XXXXXX")}"
+# Everything generated and every local destination lives under one root:
+# $HOME/cp2-bench/run.<random> per invocation (removed unless KEEP_WORK=1).
+BENCH_ROOT="${BENCH_ROOT:-$HOME/cp2-bench}"
+mkdir -p "$BENCH_ROOT" 2>/dev/null || true
+WORK="${WORK:-$(mktemp -d "$BENCH_ROOT/run.XXXXXX")}"
 KEEP_WORK="${KEEP_WORK:-0}"
 RUNS="${RUNS:-3}"
 WARMUP="${WARMUP:-0}"
@@ -84,6 +93,7 @@ SMALL_FILES="${SMALL_FILES:-8192}"
 SMALL_SRC="${SMALL_SRC:-}"
 MIX_SMALL="${MIX_SMALL:-70000}" MIX_MEDIUM="${MIX_MEDIUM:-27000}" MIX_LARGE="${MIX_LARGE:-3000}"
 MIXED="${MIXED:-0}"
+MIXED_SRC="${MIXED_SRC:-}"   # real tree instead of the generated mixed tree
 
 [ -x "$CP2_BIN" ] || { echo "cp2 binary missing at $CP2_BIN — run 'cargo build --release' first" >&2; exit 1; }
 command -v rsync >/dev/null || { echo "rsync not on PATH" >&2; exit 1; }
@@ -186,8 +196,8 @@ measure() {
 # rsync checksum dry-run: counts files that would be transferred — 0 means
 # byte-identical (deliberately deleted sources are not listed without
 # --delete).
-integrity_diff() { # src rd
-    rsync -rltc --dry-run "$1" "$REMOTE:$2" 2>/dev/null | grep -cE '^[-A-Za-z].*\.bin$' || true
+integrity_diff() { # src rd — any differing entry (not just *.bin: real trees)
+    rsync -rltc --dry-run "$1" "$REMOTE:$2" 2>/dev/null | grep -cE '^[-A-Za-z]' || true
 }
 
 # A mean±sd cell: "1.77±0.31s".
@@ -249,6 +259,51 @@ for i in range(n_s + n_m + 1, n_s + n_m + n_l + 1):
 EOF
 }
 
+# Generic edit-phase mutation for a real tree (MIXED_SRC): appends and
+# in-place rewrites on ~2.5% / ~2% of the files, 200 new files, ~0.5%
+# deletions — layout-agnostic, idempotent across repetitions, symlinks
+# never touched. Operates on the hardlink copy, never the real tree.
+mutate_real_tree() { # root
+    python3 - "$1" <<'EOF'
+import os, random, sys
+root = sys.argv[1]
+rng = random.Random(2026)
+files = []
+for dp, _, fs in os.walk(root):
+    for f in fs:
+        p = os.path.join(dp, f)
+        if not os.path.islink(p):
+            files.append(p)
+rng.shuffle(files)
+n = len(files)
+for p in files[: max(1, n // 40)]:                       # appends
+    try:
+        with open(p, "ab") as f:
+            f.write(b"x" * rng.randint(1, 64))
+    except OSError:
+        pass
+for p in files[n // 40: n // 40 + max(1, n // 50)]:      # rewrites
+    try:
+        sz = os.path.getsize(p)
+        with open(p, "r+b") as f:
+            f.seek(rng.randint(0, max(0, sz - 1)))
+            f.write(os.urandom(1024))
+    except OSError:
+        pass
+for i in range(200):                                     # new files
+    d = os.path.join(root, "bench_new", f"d{i % 50}")
+    os.makedirs(d, exist_ok=True)
+    with open(os.path.join(d, f"f{i}.bin"), "wb") as f:
+        f.write(os.urandom(rng.randint(1024, 100000)))
+for p in files[max(0, n - n // 200):]:                   # deletions
+    try:
+        if os.path.exists(p):
+            os.remove(p)
+    except OSError:
+        pass
+EOF
+}
+
 mutate_mixed_tree() { # root — 1 K appends + 0.8 K rewrites + 200 new + 100 deleted
     python3 - "$1" "$MIX_SMALL" "$MIX_MEDIUM" "$MIX_LARGE" <<'EOF'
 import os, random, sys
@@ -302,13 +357,27 @@ cmd_compare() { # [tool ...] — four scenarios, or the mixed phases with MIXED=
     if [ "$MIXED" = 1 ]; then
         # The mixed-tree phases: fresh / second / edit + integrity.
         local SRC="$WORK/mixed-src" RW="$WORK/.rw" RD="$REMOTE_BASE/$$/mixed/dst"
-        gen_mixed_tree "$SRC"
+        local mutation
+        if [ -n "${MIXED_SRC:-}" ]; then
+            # A real tree as the mixed source (e.g. a large software tree):
+            # used read-only; the edit phase mutates a hardlink copy.
+            SRC="$MIXED_SRC"
+            echo "mixed source: $MIXED_SRC ($(du -sh "$MIXED_SRC" | cut -f1), $(find "$MIXED_SRC" -type f | wc -l) files)"
+            mutation=mutate_real_tree
+        else
+            gen_mixed_tree "$SRC"
+            mutation=mutate_mixed_tree
+        fi
         mkdir -p "$RW"
-        cp -al "$SRC"/. "$RW/"       # hardlink copies: mutate $RW, keep $SRC
+        # Hardlink copy when the source is on the same filesystem (cheap);
+        # a real copy otherwise — the edit phase mutates only the copy.
+        if ! cp -al "$SRC"/. "$RW/" 2>/dev/null; then
+            cp -a "$SRC"/. "$RW/"
+        fi
         for tool in "${TOOLS[@]}"; do
             ssh "$REMOTE" "mkdir -p ~/$RD/$tool"
         done
-        mutate_mixed_here() { mutate_mixed_tree "$RW"; }
+        mutate_mixed_here() { "$mutation" "$RW"; }
         # Rotate the tool order per phase (control-variable interleaving).
         local k off tool
         off=0

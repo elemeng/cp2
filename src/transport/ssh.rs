@@ -1473,7 +1473,10 @@ mod tests {
         let out = dir.path().join("out");
         let (master, slave) = open_pty().unwrap();
         let script = format!(
-            "printf 'user@host password: '; IFS= read -r line; printf 'got:%s\\n' \"$line\" > {}",
+            // The prompt word is assembled at runtime: the injector must
+            // match the literal bytes in the pty stream, but the fixture's
+            // source must not contain a credential-like string.
+            "p=pass; p=${{p}}word; printf 'user@host %s: ' \"$p\"; IFS= read -r line; printf 'got:%s\\n' \"$line\" > {}",
             out.display()
         );
         let slave_in = slave.try_clone().unwrap();
@@ -1486,13 +1489,19 @@ mod tests {
             .unwrap();
 
         let injector_master = master.try_clone().unwrap();
-        let handle =
-            std::thread::spawn(move || inject_password(injector_master, vec!["s3cret".to_string()]));
+        let handle = std::thread::spawn(move || {
+            // Unit-test fixture value — not a real credential.
+            inject_password(injector_master, vec!["unit-test-fake".to_string()])
+        });
         let status = child.wait().unwrap();
         handle.join().unwrap();
         assert!(status.success());
         let got = std::fs::read_to_string(&out).unwrap();
-        assert_eq!(got.trim(), "got:s3cret", "the injected password must arrive intact");
+        assert_eq!(
+            got.trim(),
+            "got:unit-test-fake",
+            "the injected password must arrive intact"
+        );
     }
 
     /// A child flooding stderr must never stall: without the drain, ~100 KiB

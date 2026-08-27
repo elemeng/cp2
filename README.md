@@ -297,9 +297,31 @@ Reading the numbers honestly:
   visible per cell, tools drift run to run — compare means within a run,
   not across runs.
 
-The mixed tree (≈10 GiB, 100 K files) and the full benchmark suite —
-scripts, generated trees, how to run it — are documented in
-[`ARCHITECTURE.md`](ARCHITECTURE.md).
+The same four tools through the **mixed-tree phases** — fresh (full
+transfer), second (no-op scan), edit (~3 K files mutated before every
+repetition) — on a real 8.1 GiB / 69 K-file tree (a RELION 5.1 install),
+same run conditions as above (mean ± sd, rotated order, both destinations
+byte-verified):
+
+```
+tool        fresh       second        edit     integrity
+cp2     37.83±1.97s  27.47±15.08s  25.17±16.74s   0 differing
+rsync   26.72±2.16s  10.40±2.70s   11.55±12.89s   0 differing
+scp     82.65±2.64s 118.18±34.02s  83.02±0.02s    0 differing
+pxs     73.10±1.43s  25.37±8.47s   23.35±8.02s    0 differing
+```
+
+Reading them: rsync leads every phase on this tree — the fresh transfer
+at ~300 MB/s including the 69 K files (26.7s), cp2 within ~40% (37.8s),
+its edit paying a per-file basis exchange across the ~3 K changed files
+(25.2s; the ±sd says these cells are loud on this host); pxs is
+transfer-bound by its staging and whole-tree hashing (73.1s fresh); scp
+re-copies the whole tree on every phase (83–118s) and one of its edit
+repetitions failed (rc=1, recorded, not hidden). All destinations ended
+byte-identical (0 differing entries each).
+
+The full benchmark suite — scripts, generated trees, how to run it — is
+documented in [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
 ## Contributing
 
