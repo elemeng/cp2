@@ -1491,7 +1491,7 @@ mod tests {
         let injector_master = master.try_clone().unwrap();
         let handle = std::thread::spawn(move || {
             // Unit-test fixture value — not a real credential.
-            inject_password(injector_master, vec!["unit-test-fake".to_string()])
+            inject_password(injector_master, vec!["unit-test-fake".to_string()]);
         });
         let status = child.wait().unwrap();
         handle.join().unwrap();

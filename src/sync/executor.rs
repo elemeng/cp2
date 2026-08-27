@@ -932,6 +932,21 @@ async fn scan_dest(
     if options.delete {
         return scanner.scan(root).await;
     }
+    // Empty-destination fast path: a destination root with no entries at
+    // all (freshly created by us, or a new directory) has nothing to
+    // answer — the quick check would find every source path absent
+    // anyway. Skip the per-path probe (≈ one remote stat per source
+    // path); the resulting manifest is identical.
+    if let Ok(mut it) = std::fs::read_dir(root)
+        && it.next().is_none()
+    {
+        return Ok(Manifest {
+            root: root.to_path_buf(),
+            files: Vec::new(),
+            total_bytes: 0,
+            skipped: Vec::new(),
+        });
+    }
     let source = manifest_from_file_meta(source_files);
     scanner.scan_targeted(root, &source).await
 }
