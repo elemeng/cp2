@@ -149,6 +149,10 @@ pub struct PlannerConfig {
     pub ignore_times: bool,
     /// Remove destination files not present in source.
     pub delete: bool,
+    /// Bound the delete set to destination paths under these wire-relative
+    /// roots (the `--files-from` entries; `None` = the whole destination
+    /// may be trimmed).
+    pub delete_scope: Option<Vec<String>>,
     /// Re-apply permission bits to already-in-sync files whose mode drifted
     /// (the `rlpt` core is on by default; off with `--no-perms`).
     pub preserve_perms: bool,
@@ -270,7 +274,9 @@ impl Planner {
 
         if self.config.delete {
             for dst in &dest.files {
-                if !src_map.contains_key(dst.relative_path.as_str()) {
+                if !src_map.contains_key(dst.relative_path.as_str())
+                    && self.delete_in_scope(&dst.relative_path)
+                {
                     plan.deletes.push(SyncTask {
                         relative_path: PathBuf::from(&dst.relative_path),
                         action: SyncAction::Delete,
@@ -296,6 +302,22 @@ impl Planner {
             kind,
             FileKind::Fifo | FileKind::Socket | FileKind::BlockDevice | FileKind::CharDevice
         )
+    }
+
+    /// Whether a destination path may be deleted: unrestricted, or under one
+    /// of the `--files-from` roots that bound the delete set (rsync scopes
+    /// deletes to the listed paths — `--files-from` with one file entry must
+    /// not trim the files sitting next to it). The comparison is on wire
+    /// paths, so `\` is normalized on Windows sources.
+    fn delete_in_scope(&self, rel: &str) -> bool {
+        let Some(scope) = &self.config.delete_scope else {
+            return true;
+        };
+        let rel = rel.replace('\\', "/");
+        scope.iter().any(|root| {
+            let root = root.replace('\\', "/");
+            rel == root || rel.starts_with(&format!("{root}/"))
+        })
     }
 
     /// Build a task for a source entry, mirroring the entry's link nature.
@@ -595,6 +617,43 @@ mod tests {
         })
         .plan(&src, &dst);
         assert_eq!(plan.deletes.len(), 1);
+    }
+
+    #[test]
+    fn plan_delete_respects_files_from_scope() {
+        // `--files-from` + `--delete`: only destination paths under the
+        // listed roots (or the roots themselves) are deleted; a sibling
+        // sharing a prefix (`data.txt` vs `data/…`) and everything outside
+        // the listed paths survive.
+        let src = manifest(vec![]);
+        let dst = manifest(vec![
+            entry("data/old.txt", 10, 100, None),
+            entry("data/sub/deep.txt", 10, 100, None),
+            entry("unrelated.txt", 10, 100, None),
+            entry("data.txt", 10, 100, None),
+        ]);
+        let plan = Planner::new(PlannerConfig {
+            delete: true,
+            delete_scope: Some(vec![
+                "data/old.txt".to_string(),
+                "data/sub".to_string(),
+            ]),
+            ..PlannerConfig::default()
+        })
+        .plan(&src, &dst);
+        let deleted: Vec<&str> = plan
+            .deletes
+            .iter()
+            .map(|t| t.relative_path.to_str().unwrap())
+            .collect();
+        assert_eq!(deleted, vec!["data/old.txt", "data/sub/deep.txt"]);
+        // No scope = the whole destination may be trimmed.
+        let plan = Planner::new(PlannerConfig {
+            delete: true,
+            ..PlannerConfig::default()
+        })
+        .plan(&src, &dst);
+        assert_eq!(plan.deletes.len(), 4);
     }
 
     #[test]

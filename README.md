@@ -235,7 +235,9 @@ cp2 --files-from manifests/microscopy.txt user@host:backup
 One absolute path per line — Unix and Windows line endings both work, blank
 lines are skipped, and paths may contain spaces. Entries may be files or
 directories (directories recurse), and each file syncs exactly once; missing
-entries are warned about and skipped. Local entries only.
+entries are warned about and skipped. Local entries only. With `--delete`,
+only destination content under the listed paths is removed (rsync scope) —
+files sitting next to them are left alone.
 
 ## Defaults
 

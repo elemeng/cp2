@@ -137,6 +137,11 @@ pub enum Frame {
         /// Client-side decision flags, applied by the server's planner.
         checksum: bool,
         delete: bool,
+        /// `--files-from` delete scope: the client's listed paths, in
+        /// root-relative wire form (`/data/a.txt` → `data/a.txt`), bound
+        /// the delete set on the server's planner. Empty = the whole
+        /// destination may be trimmed.
+        delete_scope: Vec<String>,
         update_only: bool,
         ignore_existing: bool,
         /// rsync `--existing`: only update files present on the receiver, do
@@ -586,6 +591,7 @@ mod tests {
                 includes: vec![],
                 checksum: false,
                 delete: false,
+                delete_scope: vec![],
                 update_only: false,
                 ignore_existing: false,
                 existing: true,

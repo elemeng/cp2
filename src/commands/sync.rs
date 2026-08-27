@@ -154,6 +154,20 @@ pub async fn execute(cli: &mut Cli) -> Result<()> {
         install_progress(&mut options);
     }
 
+    // `--files-from`: the listed paths bound the `--delete` set (rsync
+    // scopes deletes to the listed paths — destination content outside
+    // them is left alone). A glob or a single plain path keeps rsync's
+    // whole-destination delete semantics.
+    if let Some((base, roots)) = &source_multi
+        && cli.files_from.is_some()
+    {
+        options.delete_scope = roots
+            .iter()
+            .filter_map(|r| r.strip_prefix(base).ok())
+            .map(|s| s.to_string_lossy().replace('\\', "/"))
+            .collect();
+    }
+
     // rsync trailing-slash semantics for the local source: a single-directory
     // source *without* a trailing slash recreates the directory under the
     // destination (`cp2 dir user@host:dst` → `dst/dir/*`); a trailing slash
@@ -222,6 +236,13 @@ pub async fn execute(cli: &mut Cli) -> Result<()> {
             anyhow::bail!("--files-from list is empty");
         }
         options.remote_paths = paths;
+        // The listed paths also bound the `--delete` set on the server's
+        // planner (root-relative wire form; entries were validated absolute).
+        options.delete_scope = options
+            .remote_paths
+            .iter()
+            .map(|p| p.trim_start_matches('/').to_string())
+            .collect();
     }
 
     // `--list-only`: print the source listing without transferring. The
@@ -234,16 +255,16 @@ pub async fn execute(cli: &mut Cli) -> Result<()> {
                 let manifest = crate::sync::executor::scan_tree(&src_path, &options, true).await?;
                 if !cli.quiet {
                     println!("Listing {}:", src_path.display());
-                }
-                for f in &manifest.files {
-                    let kind = if f.is_dir {
-                        'd'
-                    } else if f.link_target.is_some() {
-                        'L'
-                    } else {
-                        'f'
-                    };
-                    println!("{kind} {:>12} {}", f.size, f.relative_path);
+                    for f in &manifest.files {
+                        let kind = if f.is_dir {
+                            'd'
+                        } else if f.link_target.is_some() {
+                            'L'
+                        } else {
+                            'f'
+                        };
+                        println!("{kind} {:>12} {}", f.size, f.relative_path);
+                    }
                 }
                 Ok(())
             }
@@ -262,9 +283,9 @@ pub async fn execute(cli: &mut Cli) -> Result<()> {
                 .await?;
                 if !cli.quiet {
                     println!("Listing {remote}:");
-                }
-                for e in &stats.changes {
-                    println!("{} {:>12} {}", e.kind, e.size, e.path);
+                    for e in &stats.changes {
+                        println!("{} {:>12} {}", e.kind, e.size, e.path);
+                    }
                 }
                 Ok(())
             }

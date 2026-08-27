@@ -163,7 +163,7 @@ Delete source files only after the destination is \fBhash-verified and fsynced\f
 Verify the destination bytes match the source after the transfer (BLAKE3 on the fly, no re-reads; mismatches → exit 23, nothing deleted)
 .TP
 \fB\--files-from FILE\fP \fI(rsync \--files-from)\fP
-Sync only the listed \fBabsolute\fP paths (one per line, Unix or Windows line endings), mirrored under DST; relative entries rejected; SRC not used (\fBcp2 --files-from FILE DST\fP). On a remote pull the entries are server-absolute paths
+Sync only the listed \fBabsolute\fP paths (one per line, Unix or Windows line endings), mirrored under DST; relative entries rejected; SRC not used (\fBcp2 --files-from FILE DST\fP). On a remote pull the entries are server-absolute paths. With \fB\--delete\fP the delete set is bounded by the listed paths (rsync scope): destination content outside them is left alone
 .TP
 \fB\--exclude GLOB\fP \fI(rsync \--exclude)\fP
 Exclude matching paths (repeatable)

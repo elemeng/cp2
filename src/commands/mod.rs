@@ -105,6 +105,9 @@ pub(crate) fn options_from_cli(cli: &Cli) -> anyhow::Result<ExecutorOptions> {
         existing: cli.existing,
         ignore_times: cli.ignore_times,
         max_delete: cli.max_delete,
+        // Set by `sync::execute` for `--files-from` sources: the listed
+        // paths bound the `--delete` set.
+        delete_scope: Vec::new(),
         backup: cli.backup,
         jobs: cli.jobs,
         storage: cli.storage,

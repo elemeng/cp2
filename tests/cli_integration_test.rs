@@ -124,3 +124,56 @@ fn test_local_copy_dry_run() {
     assert!(output.status.success());
     assert!(!dst.path().join("out/a.txt").exists());
 }
+
+#[test]
+fn test_files_from_delete_only_trims_the_listed_paths() {
+    // `--files-from` + `--delete`: the delete set is bounded by the listed
+    // paths (rsync scope). An extra inside a listed directory's subtree is
+    // removed; unrelated destination content outside every listed path
+    // survives — a plain `--delete` run would have removed it.
+    let src = TempDir::new().unwrap();
+    let dst = TempDir::new().unwrap();
+    std::fs::create_dir(src.path().join("data")).unwrap();
+    std::fs::write(src.path().join("data/keep.txt"), b"k").unwrap();
+
+    // The destination mirrors the listed path from the filesystem root
+    // (`/data` → `DST/data`). Prep the mirror with a stale extra inside
+    // the listed subtree and an unrelated file outside it.
+    let rel = src.path().strip_prefix(std::path::Path::new("/")).unwrap();
+    let mirror_root = dst.path().join(rel);
+    std::fs::create_dir_all(mirror_root.join("data")).unwrap();
+    std::fs::write(mirror_root.join("data/old.txt"), b"old").unwrap();
+    std::fs::write(dst.path().join("unrelated.txt"), b"unrelated").unwrap();
+
+    let list_dir = TempDir::new().unwrap();
+    let list = list_dir.path().join("list.txt");
+    std::fs::write(&list, format!("{}\n", src.path().join("data").display())).unwrap();
+
+    let output = cp2_command()
+        .arg("--files-from")
+        .arg(&list)
+        .arg("--delete")
+        .arg(dst.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // The listed directory transferred; the in-scope extra was deleted;
+    // the unrelated destination file survived.
+    assert_eq!(
+        std::fs::read(mirror_root.join("data/keep.txt")).unwrap(),
+        b"k"
+    );
+    assert!(
+        !mirror_root.join("data/old.txt").exists(),
+        "extra inside a listed directory must be deleted by --delete"
+    );
+    assert!(
+        dst.path().join("unrelated.txt").exists(),
+        "content outside the --files-from paths must survive --delete"
+    );
+}

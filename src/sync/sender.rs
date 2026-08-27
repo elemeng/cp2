@@ -161,6 +161,7 @@ impl Sender {
         let planner = Planner::new(PlannerConfig {
             checksum: options.checksum,
             delete: options.delete,
+            delete_scope: (!options.delete_scope.is_empty()).then(|| options.delete_scope.clone()),
             update_only: options.update_only,
             ignore_existing: options.ignore_existing,
             existing: options.existing,

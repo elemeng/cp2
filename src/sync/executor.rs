@@ -116,6 +116,13 @@ pub struct ExecutorOptions {
     /// Refuse to delete more than this many files per sync (rsync
     /// `--max-delete`); `None` = unlimited.
     pub max_delete: Option<u64>,
+    /// Bound `--delete` to destination paths under these wire-relative
+    /// roots — the `--files-from` entries (`/data/a.txt` → `data/a.txt`):
+    /// destination content outside the listed paths is left alone (rsync
+    /// scopes deletes to the listed paths). Empty = the whole destination
+    /// may be trimmed (`--delete` without `--files-from`, or a glob source,
+    /// where rsync deletes the unmatched destination content).
+    pub delete_scope: Vec<String>,
     /// Keep the replaced destination file as `<name>~` (rsync `--backup`).
     pub backup: bool,
     /// Explicit worker count for transfer + hashing (`-j`). `None` tunes the
@@ -295,6 +302,7 @@ fn pull_request(options: &ExecutorOptions, watch: bool, watch_delay_ms: u32) -> 
         includes: options.include.clone(),
         checksum: options.checksum,
         delete: options.delete,
+        delete_scope: options.delete_scope.clone(),
         update_only: options.update_only,
         ignore_existing: options.ignore_existing,
         existing: options.existing,
@@ -319,6 +327,7 @@ impl Default for ExecutorOptions {
             existing: false,
             ignore_times: false,
             max_delete: None,
+            delete_scope: Vec::new(),
             backup: false,
             jobs: None,
             storage: StoragePreference::Auto,
@@ -501,6 +510,8 @@ pub async fn push_multi(
             let planner = Planner::new(PlannerConfig {
                 checksum: options.checksum,
                 delete: options.delete,
+                delete_scope: (!options.delete_scope.is_empty())
+                    .then(|| options.delete_scope.clone()),
                 update_only: options.update_only,
                 ignore_existing: options.ignore_existing,
                 existing: options.existing,
@@ -721,6 +732,7 @@ pub async fn push_multi(
                 includes,
                 checksum,
                 delete,
+                delete_scope,
                 update_only,
                 ignore_existing,
                 existing,
@@ -741,6 +753,7 @@ pub async fn push_multi(
                 let pull_options = ExecutorOptions {
                     checksum,
                     delete,
+                    delete_scope,
                     update_only,
                     ignore_existing,
                     existing,
