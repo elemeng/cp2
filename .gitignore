@@ -3,9 +3,6 @@
 /cp2
 /data
 
-# Local-only benchmark against a personal remote (contains no credentials,
-# but the host/user is personal) — keep it out of the repo.
-/bench/compare_remote.sh
 
 .zcode
 # Release build artifacts (build-release.sh staging + tarball)

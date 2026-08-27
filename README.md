@@ -257,7 +257,7 @@ all platforms.
 All tools in one run, pushing over `ssh localhost` on a native Fedora 44
 (x86_64, NVMe); destination bytes verified against each tool's edited
 source, per-tool runs bounded by a 300s timeout (rc recorded). From
-`bench/compare_studied.sh`; sy and pxs are the two studied crates that sync
+`bench/bench.sh compare`; sy and pxs are the two studied crates that sync
 over ssh at all (the full audit is in
 [`ARCHITECTURE.md`](ARCHITECTURE.md)).
 

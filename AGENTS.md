@@ -123,9 +123,10 @@ keep-partials on abort. See `README.md` for the full table.
   passing (`tests/e2e_{transfer,links,meta,features}.rs` share helpers in
   `tests/common/mod.rs` and run against a spawned `cp2 --server` over pipes —
   no sshd needed in CI).
-- Benchmarks live in `bench/` (sourced from `bench/lib.sh`, take
-  `CP2_BIN`/`HOST`/`WORK`): `bench/mixed-tree.sh` (≈10 GiB / 100 K-file) and
-  `bench/single-file.sh` (`MODE=large|small`).
+- Benchmarks live in `bench/bench.sh` — one script, a suite per workload
+  (`compare` four-scenario multi-tool table with `REMOTE`/`TOOLS` overrides;
+  `mixed` ≈10 GiB / 100 K-file cp2-vs-rsync; `single` `MODE=large|small`;
+  `remote` real-network daily flows; env knobs `CP2_BIN`/`REMOTE`/`WORK`/...).
 - `cargo clippy` must be clean (`Cargo.toml` sets `clippy::all` deny,
   `pedantic` warn; CI runs `-D warnings`).
 - Delta types are `serde`-serialized over the wire via `postcard`.

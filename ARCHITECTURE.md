@@ -301,40 +301,37 @@ pipe-based integration tests and needs no CI wiring. See `scripts/` and
 
 ## Performance benchmarks
 
-The `bench/` directory holds the benchmark suite. Shared helpers live in
-`bench/lib.sh` (takes `CP2_BIN`, `HOST`, `WORK`, `KEEP_WORK=1`); scenario
-scripts source it. Requires the release build (`cargo build --release`) and
-ssh key auth to `HOST`.
+The whole suite is one script, `bench/bench.sh`, with a suite per workload
+(requires the release build — `cargo build --release` — and ssh key auth
+to `REMOTE`, default `whoami@localhost`):
 
-| Script | What it measures |
-|--------|------------------|
-| `mixed-tree.sh` | ≈10 GiB / 100 K files (70 K small 1-16 KiB, 27 K medium 64-384 KiB, 3 K large 1-2 MiB), cp2 vs rsync over ssh: `fresh` / `second` / `edit` / `integrity` phases |
-| `single-file.sh` | the delta engine's value, cp2 vs rsync: `MODE=large` (one 1 GiB file: fresh / edit A+B / insert / idle) or `MODE=small` (8192 files: fresh / edit / idle) |
-| `compare_test.sh` | cross-tool localhost push (cp2 vs rsync vs scp vs [sy](https://crates.io/crates/sy)) across four scenarios, reproducible in CI-like conditions |
-| `compare_studied.sh` | cp2 vs rsync vs scp vs the ssh-capable studied crates (sy, pxs) through the same four scenarios, all in one run; per-tool runs bounded by a timeout with rc recorded |
-| `compare_remote.sh` | cp2 vs rsync push to a **real** remote (gitignored — it holds a personal host address): fresh / idle / edit |
+| Suite | What it measures |
+|-------|------------------|
+| `compare [tool ...]` | cp2 vs rsync vs scp vs the ssh-capable studied crates (sy, pxs by default) through four push scenarios, all in one run, per-tool runs bounded by a timeout with rc recorded |
+| `mixed` | ≈10 GiB / 100 K files (70 K small 1-16 KiB, 27 K medium 64-384 KiB, 3 K large 1-2 MiB), cp2 vs rsync over ssh: `fresh` / `second` / `edit` / `integrity` phases |
+| `single` | the delta engine's value, cp2 vs rsync: `MODE=large` (one 1 GiB file: fresh / edit A+B / insert / idle) or `MODE=small` (8192 files: fresh / edit / idle) |
+| `remote` | cp2 vs rsync push to a **real** remote (set `REMOTE=user@host`): fresh / idle / edit, `RUNS`-averaged, MiB/s from each tool's own transferred-volume summary |
 
-### Cross-tool localhost (`compare_test.sh`)
+### Cross-tool comparison (`bench.sh compare`)
 
-`bench/compare_test.sh` pushes the same trees over ssh with cp2, rsync, scp,
-and sy, across four scenarios:
+`bench.sh compare` pushes the same trees over ssh with the selected tools
+(cp2, rsync, scp, sy, pxs by default), across four scenarios:
 
 | Scenario | Source | What it measures |
 |----------|--------|------------------|
-| large-first | 1 GiB (2 × 512 MiB, generated) | raw transfer throughput, fresh destination |
+| large-first | 1 GiB (2 × 512 MiB, generated; `LARGE_TOTAL_MB` shrinks it) | raw transfer throughput, fresh destination |
 | large-edit | same tree, 1 MiB overwritten mid-file | delta/incremental behavior on a changed large file |
-| small-first | 8192 files, 1-64 KiB, 64 dirs (generated; `--small-src` to point at a real tree) | per-file overhead, fresh destination |
+| small-first | 8192 files, 1-64 KiB, 64 dirs (generated; `SMALL_SRC` to point at a real tree; `SMALL_FILES` to resize) | per-file overhead, fresh destination |
 | small-idle | unchanged tree | quick-check / scan overhead of a no-op sync |
 
-Run it yourself: `bench/compare_test.sh` (needs ssh key auth to the target;
-`--remote user@host`, `--small-src DIR`, `--large-mb N` to adjust).
-`bench/mixed-tree.sh` and `bench/single-file.sh` (sourced from `bench/lib.sh`)
-cover the large-tree and delta scenarios; `bench/compare_remote.sh REMOTE`
-repeats the daily flows against a real link. The cross-tool timing table
-for compare_test/compare_studied lives in the README's Performance
-comparison section.
+Run it yourself: `bench/bench.sh compare` (needs ssh key auth to the
+target; `REMOTE=user@host` for a real network, `LARGE_TOTAL_MB=256` to
+shorten). `bench.sh mixed` and `bench.sh single` cover the large-tree and
+delta scenarios; `bench.sh remote` (with `REMOTE` set) repeats the daily
+flows against a real link. The cross-tool timing table lives in the
+README's Performance comparison section.
 
-### Example results (`mixed-tree.sh`, 2026-08-26, Fedora 44 NVMe)
+### Example results (`bench.sh mixed`, 2026-08-26, Fedora 44 NVMe)
 
 The mixed tree is ≈10 GiB / 100 K files (70 K small 1-16 KiB, 27 K medium
 64-384 KiB, 3 K large 1-2 MiB), phases over unchanged sources:
@@ -370,7 +367,7 @@ failure, so the server's summary write is error-ignoring by hand).
 ### The studied crates, honestly
 
 cp2's design was informed by sibling crates, so they were put through the
-same harness (`bench/compare_studied.sh`). The participation audit comes
+same harness (`bench.sh compare`). The participation audit comes
 first — of the eight, **two can sync over ssh at all**:
 
 | Tool | Verdict |
