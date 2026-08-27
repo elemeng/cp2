@@ -270,7 +270,7 @@ reach for:
 |---|---|
 | `--verify` | Prove the destination bytes match the source (exit 23 on mismatch, nothing deleted) |
 | `--remove-source-files` | Delete source files only after the copy is hash-verified and fsynced |
-| `--fsync` | fsync every received file before it is renamed into place |
+| `--fsync` | fsync every received file before it is renamed into place, and the destination directories holding the renames once at the end |
 | `--backup` | Keep replaced destination files as `<name>~` |
 
 ### Speed and bandwidth

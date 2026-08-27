@@ -199,7 +199,7 @@ Compress the data stream (lz4)
 Limit transfer bandwidth (e.g. 10M, 100K)
 .TP
 \fB\--fsync\fP
-fsync every received file before it is renamed into place (durable but slower; off by default)
+fsync every received file before it is renamed into place, and the destination directories holding the renames once at the end (durable but slower; off by default)
 .TP
 \fB\-v, \--verbose\fP \fI(rsync \-v)\fP
 Verbosity (repeat for more: -v, -vv, -vvv)

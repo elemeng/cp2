@@ -677,7 +677,9 @@ impl Receiver {
             if let Some(mut writer) = sparse_writer {
                 writer.finish()?;
             }
-            staged.commit(cfg.fsync, cfg.backup)?;
+            // Verification implies durability: the sender will delete the
+            // source on our word, so the file must be on disk first.
+            staged.commit(cfg.fsync || cfg.verify, cfg.backup)?;
             if let Some(meta) = &meta {
                 apply_source_meta_sync(&path, meta, cfg)?;
                 if cfg.verify {
