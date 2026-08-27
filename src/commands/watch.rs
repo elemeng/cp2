@@ -144,6 +144,7 @@ pub(crate) async fn watch_push(
                             binaries_dir.as_deref(),
                             &mut *client.lock().await,
                             jump.as_ref(),
+                            false,
                             |send, recv| {
                                 let src_path = (*src_path).clone();
                                 let options = options.clone();
@@ -427,6 +428,7 @@ pub(crate) async fn watch_pull(
                     binaries_dir.as_deref(),
                     &mut client,
                     jump.as_ref(),
+                    true,
                     |send, recv| {
                         let dst_path = dst_path.clone();
                         let options = options.clone();

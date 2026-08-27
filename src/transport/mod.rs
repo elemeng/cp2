@@ -1085,6 +1085,31 @@ impl SessionHandle {
             Self::Russh(session) => session.finish(result).await,
         }
     }
+
+    /// Wait for the transport after the session was ended locally (Ctrl-C,
+    /// the `-W=DUR` cap): the peer's channel died as a consequence, so the
+    /// remote exits non-zero (its final write EPIPEs) — an expected outcome,
+    /// not an error. The transfer result stays authoritative: a peer error
+    /// propagates unchanged, and on success the child is reaped (bounded)
+    /// with its status ignored — a watch-pull Ctrl-C must not exit 1.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the transfer failed or the wait itself failed.
+    pub async fn finish_after_local_cancel<T>(
+        &mut self,
+        result: anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        match self {
+            Self::Ssh(child) => {
+                let result = result?;
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(30), child.wait()).await;
+                Ok(result)
+            }
+            #[cfg(target_os = "windows")]
+            Self::Russh(session) => session.finish(result).await,
+        }
+    }
 }
 
 #[cfg(test)]

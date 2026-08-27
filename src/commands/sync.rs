@@ -698,6 +698,7 @@ async fn push_via_ssh(
                 binaries_dir,
                 client,
                 jump,
+                false,
                 |send, recv| {
                     let src_path = src_path.to_path_buf();
                     let options = options.clone();
@@ -798,6 +799,7 @@ async fn push_multi_via_ssh(
                 binaries_dir,
                 client,
                 jump,
+                false,
                 |send, recv| {
                     let base = base.to_path_buf();
                     let roots = roots.to_vec();
@@ -895,6 +897,7 @@ async fn pull_via_ssh(
                 binaries_dir,
                 client,
                 jump,
+                false,
                 |send, recv| {
                     let dst_path = dst_path.to_path_buf();
                     let options = options.clone();
@@ -1008,6 +1011,7 @@ async fn list_via_ssh(
                 binaries_dir,
                 client,
                 jump,
+                false,
                 |send, recv| {
                     let remote_path = remote_path.clone();
                     let options = options.clone();
@@ -1231,6 +1235,7 @@ pub(crate) async fn ensure_and_open(
 /// child exited.
 async fn run_session_once<F, Fut>(
     session: Session,
+    cancellable: bool,
     run: &F,
 ) -> (bool, anyhow::Result<SyncStats>, SessionHandle)
 where
@@ -1243,7 +1248,14 @@ where
     let (send, recv, mut handle) = session.into_parts();
     let executor_result = run(send, recv).await;
     let transfer_failed = executor_result.is_err();
-    let finished = handle.finish(executor_result).await;
+    let finished = if cancellable {
+        // The session was ended locally (Ctrl-C, the watch cap): the peer's
+        // channel died as a consequence, so its exit status is expected to
+        // be non-zero — not an error.
+        handle.finish_after_local_cancel(executor_result).await
+    } else {
+        handle.finish(executor_result).await
+    };
     (transfer_failed, finished, handle)
 }
 
@@ -1266,6 +1278,7 @@ pub(crate) async fn run_session_with_deploy<F, Fut>(
     binaries_dir: Option<&Path>,
     client: &mut RemoteClient,
     jump: Option<&JumpHost>,
+    cancellable: bool,
     run: F,
 ) -> anyhow::Result<SyncStats>
 where
@@ -1275,7 +1288,7 @@ where
         ) -> Fut,
     Fut: std::future::Future<Output = anyhow::Result<SyncStats>>,
 {
-    let (transfer_failed, result, mut handle) = run_session_once(session, &run).await;
+    let (transfer_failed, result, mut handle) = run_session_once(session, cancellable, &run).await;
     let rejected = result.as_ref().is_err_and(|e| {
         e.downcast_ref::<crate::Error>()
             .is_some_and(|ce| matches!(ce, crate::Error::HandshakeRejected { .. }))
@@ -1307,7 +1320,7 @@ where
         let session = client
             .deploy_and_open_session(remote, remote_path, server_args, &source, jump)
             .await?;
-        let (_, result, _) = run_session_once(session, &run).await;
+        let (_, result, _) = run_session_once(session, cancellable, &run).await;
         return result;
     }
     result
