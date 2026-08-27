@@ -34,8 +34,7 @@ the remote — the first sync just works against a fresh account.
 
 ### On your machine
 
-Recommend
-ust need to be required in your PC
+Recommend! but Rust need to be required in your PC
 ```bash
 cargo install cp2 
 ```
