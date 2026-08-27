@@ -417,7 +417,7 @@ first — of the eight, **two can sync over ssh at all**:
 | sparsync | no drop-in ssh sync — needs a `serve`/`enroll`/auth mesh |
 | zsync-rs | HTTP delta client — no ssh at all |
 | robosync, rusync | do **not parse** `user@host:path` at all — they copy into a literal local directory named `user@host:path` under the working directory (rc=0, "9 bytes transferred", no ssh connection — verified in sshd's journal) |
-| copia | library, no CLI |
+| copia | library |
 
 Why pxs wins the large-edit scenario but loses elsewhere: its "delta" is a
 byte-compare, not a hash delta — fixed 128 KiB blocks, mmap'd and compared

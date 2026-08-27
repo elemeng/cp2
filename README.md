@@ -100,21 +100,12 @@ everything on the remote runs as *your* account.
 - **Sends only what changed** — FastCDC chunking + BLAKE3: a one-byte edit in
   a 50 GB file transfers kilobytes, not gigabytes, and large files stream in
   bounded memory — size never becomes a RAM problem.
-- **Zero server setup on same-platform remotes** — the first sync deploys a
-  matching binary automatically: no install, no sudo, no PATH fiddling. A
-  different platform needs cp2 installed on the remote once — the error
-  lists the three ways (`cargo install cp2 --locked`, the prebuilt release
-  tarball, or building from source) — and a prebuilt sidecar next to the
-  client is picked up automatically.
 - **Verification you can trust** — `--verify` proves the destination bytes
   match the source; `--remove-source-files` frees the source disk only after
   the copy is hash-verified and fsynced.
 - **rsync semantics, minus the setup** — `-a`, `--delete`, `--backup`,
   excludes, `--no-*` opt-outs, exit code 23. If you know rsync, you already
   know cp2.
-- **One password prompt per run** — Unix multiplexes the run over a single
-  ssh connection; Windows uses the built-in pure-Rust SSH client. You
-  authenticate once, not once per session.
 - **Realtime watch** — `-W` monitors a folder and syncs changes as they
   happen (event-driven push, server-driven pull), with an optional duration
   cap.

@@ -11,11 +11,12 @@ documentation = "https://docs.rs/cp2"
 readme = "README.md"
 keywords = ["sync", "rsync", "ssh", "backup", "file-sync"]
 categories = ["command-line-utilities", "filesystem"]
-# Dev-only content: CI workflows, release scripts, benchmark trees, and the
-# build-output directory stay out of the published crate. `/target` is
-# anchored to the package root (gitignore-style) so `src/target/` is not
-# matched.
-exclude = [".github/", "scripts/", "/target", "bench/", "AGENTS.md", ".zcode"]
+# Dev-only content: CI workflows, release scripts, benchmark trees,
+# agent/tooling directories (.zcode, .mimosa), the repo instructions
+# (AGENTS.md), and the build-output directory stay out of the published
+# crate. `/target` is anchored to the package root (gitignore-style) so
+# `src/target/` is not matched.
+exclude = [".github/", "scripts/", "/target", "bench/", "AGENTS.md", ".zcode", ".mimosa"]
 
 [features]
 default = []
