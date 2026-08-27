@@ -1208,6 +1208,11 @@ fn remote_glob_needs_expansion(root: &Path, pattern: &str) -> Result<bool> {
 ///   `--files-from` layout) and share one filesystem root; entries are
 ///   mirrored under the destination from that root.
 fn resolve_pull_roots(root: &Path, paths: &[String]) -> Result<(PathBuf, Vec<PathBuf>)> {
+    // An empty list (a malformed peer frame) must be an error, not an
+    // index-out-of-bounds panic on `roots[0]` below.
+    if paths.is_empty() {
+        return Err(Error::Other("pull request has no paths".to_string()));
+    }
     if paths.len() == 1 {
         let (base, matches) = expand_remote_glob(root, &paths[0])?.ok_or_else(|| {
             Error::Other(format!("no files match remote source pattern '{}'", paths[0]))
