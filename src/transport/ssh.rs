@@ -73,32 +73,24 @@ pub struct SshChild {
 /// never blocks; for a pathologically full pipe the thread blocks and the
 /// child's stderr pipe fills again (the same stall `Stdio::inherit()` would
 /// have had) — the drain's point is that the protocol no longer rides on it.
-///
-/// Unix only: the stall is a ControlMaster-mux phenomenon (Windows rides the
-/// russh transport, where remote stderr is consumed as channel events).
-#[cfg(unix)]
 fn drain_child_stderr(stderr: tokio::process::ChildStderr) {
-    use std::os::fd::{AsRawFd, FromRawFd};
-    // tokio exposes the pipe read end only as an AsyncRead handle (no
-    // `into_std` for stderr); take ownership of the descriptor and re-wrap
-    // it as a std file, forgetting the handle so it does not close the fd.
-    let fd = stderr.as_raw_fd();
-    // SAFETY: we own this descriptor — the handle is forgotten right below,
-    // so no double close; tokio's poll registration for it dies with the
-    // handle.
-    let mut pipe = unsafe { std::fs::File::from_raw_fd(fd) };
-    std::mem::forget(stderr);
-    // The descriptor is non-blocking (tokio sets it so); make it blocking
-    // again — the read then wakes the instant bytes arrive, so the last
-    // forward (the server's end-of-run summary) is written before the
-    // client process exits rather than racing a poll-sleep.
-    // SAFETY: F_GETFL/F_SETFL on the pipe read end this process owns; the
-    // flags are only re-applied to the same descriptor, minus the
-    // non-blocking bit.
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-    if flags >= 0 {
-        unsafe { libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK) };
-    }
+    // Take the pipe's read end out of tokio's hands: `into_owned_fd` /
+    // `into_owned_handle` deregister the reactor's poll registration for the
+    // descriptor (grabbing the raw fd with `mem::forget` would instead leak
+    // the epoll interest and its driver slab entry) and restore blocking
+    // mode, so the thread's read wakes the instant bytes arrive — the last
+    // forward (the server's end-of-run summary) lands before the client
+    // process exits instead of racing a poll-sleep.
+    #[cfg(unix)]
+    let mut pipe: std::fs::File = match stderr.into_owned_fd() {
+        Ok(fd) => fd.into(),
+        Err(_) => return,
+    };
+    #[cfg(not(unix))]
+    let mut pipe: std::fs::File = match stderr.into_owned_handle() {
+        Ok(handle) => handle.into(),
+        Err(_) => return,
+    };
     let _ = std::thread::Builder::new()
         .name("cp2-ssh-stderr".to_string())
         .spawn(move || {
@@ -116,34 +108,6 @@ fn drain_child_stderr(stderr: tokio::process::ChildStderr) {
                             return;
                         }
                     }
-                }
-            }
-        });
-}
-
-/// Non-unix fallback (Windows system-ssh is unsupported anyway): the
-/// descriptor stays non-blocking, so an empty pipe is polled with a brief
-/// pause instead of spinning.
-#[cfg(not(unix))]
-fn drain_child_stderr(stderr: tokio::process::ChildStderr) {
-    use std::io::{Read, Write};
-    let _ = std::thread::Builder::new()
-        .name("cp2-ssh-stderr".to_string())
-        .spawn(move || {
-            let mut buf = [0u8; 8192];
-            let mut sink = std::io::stderr();
-            loop {
-                match stderr.read(&mut buf) {
-                    Ok(0) => return,
-                    Ok(n) => {
-                        if sink.write_all(&buf[..n]).is_err() {
-                            return;
-                        }
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        std::thread::sleep(std::time::Duration::from_millis(5));
-                    }
-                    Err(_) => return,
                 }
             }
         });
@@ -268,7 +232,6 @@ pub async fn spawn_ssh(
         .stderr(if cfg!(unix) { Stdio::piped() } else { Stdio::inherit() });
 
     let mut child = cmd.spawn().map_err(Error::Io)?;
-    #[cfg(unix)]
     if let Some(stderr) = child.stderr.take() {
         drain_child_stderr(stderr);
     }
@@ -369,7 +332,6 @@ pub fn spawn_ssh_preamble(
         .stderr(if cfg!(unix) { Stdio::piped() } else { Stdio::inherit() });
 
     let mut child = cmd.spawn().map_err(Error::Io)?;
-    #[cfg(unix)]
     if let Some(stderr) = child.stderr.take() {
         drain_child_stderr(stderr);
     }
@@ -1160,7 +1122,6 @@ pub async fn push_remote_binary(
         .stderr(if cfg!(unix) { Stdio::piped() } else { Stdio::inherit() })
         .spawn()
         .map_err(Error::Io)?;
-    #[cfg(unix)]
     if let Some(stderr) = child.stderr.take() {
         drain_child_stderr(stderr);
     }
@@ -1215,7 +1176,6 @@ pub async fn push_remote_binary_and_serve(
         .stdout(Stdio::piped())
         .stderr(if cfg!(unix) { Stdio::piped() } else { Stdio::inherit() });
     let mut child = cmd.spawn().map_err(Error::Io)?;
-    #[cfg(unix)]
     if let Some(stderr) = child.stderr.take() {
         drain_child_stderr(stderr);
     }
