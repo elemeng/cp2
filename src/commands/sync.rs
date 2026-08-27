@@ -1126,9 +1126,23 @@ fn deploy_source(
         })
         .collect::<Vec<_>>()
         .join(" or ");
+    let triple = candidates.first().copied().unwrap_or("<triple>");
+    let exe_suffix = if triple.contains("windows") { ".exe" } else { "" };
+    let sidecar_name = format!("cp2-{triple}{exe_suffix}");
+    let client_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(std::path::Path::to_path_buf))
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    // The "download from the releases page" step is one-time: the sync then
+    // deploys the sidecar automatically, forever (build fingerprints match
+    // until the code changes again).
     anyhow::bail!(
-        "remote is {os}/{arch}: download {names} for cp2 v{} from                 the GitHub releases page and place it next to this binary or in                 --binaries-dir, or pass --no-auto-install",
-        env!("CARGO_PKG_VERSION")
+        "remote is {os}/{arch}: no matching sidecar ({names}). \
+         Build it once (every sync after this deploys it automatically): \
+         cargo build --release --target {triple} && cp target/{triple}/release/cp2{exe_suffix} \
+         {}/{}",
+        client_dir.display(),
+        sidecar_name,
     )
 }
 
@@ -1156,10 +1170,13 @@ async fn deploy_remote_binary(
     match client.check_version(remote, remote_path, os, jump).await {
         Ok(Some((_, Some(fp)))) if fp == BUILD_FINGERPRINT => Ok(()),
         Ok(None) => Err(anyhow::anyhow!(
-            "deployed cp2 to {remote} at {remote_path}, but it does not report a version"
+            "deployed cp2 to {remote} at {remote_path}, but it does not report a version — \
+             a truncated push, or the remote's glibc is older than this build's (build the \
+             musl sidecar once; every sync after this deploys it automatically)"
         )),
         Ok(Some((v, fp))) => Err(anyhow::anyhow!(
-            "deployed cp2 to {remote} at {remote_path}, but it reports              v{v} (build {fp:?}); expected build {BUILD_FINGERPRINT}"
+            "deployed cp2 to {remote} at {remote_path}, but it reports v{v} (build {fp:?}); \
+             expected build {BUILD_FINGERPRINT}"
         )),
         Err(e) => Err(anyhow::anyhow!(
             "failed to verify the deployed cp2 on {remote}: {e}"

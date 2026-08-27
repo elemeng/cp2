@@ -226,8 +226,12 @@ same-platform remote gets the running binary (which needs the local glibc — a
 remote with an older one fails at load time, `GLIBC_2.xx not found`). The
 platform is detected from the session's preamble (`uname -s -m`, falling back
 to `cmd /c echo %PROCESSOR_ARCHITECTURE%` on Windows). Nothing is downloaded
-at sync time — if a cross-platform sidecar is missing, cp2 tells you to fetch
-it from the GitHub releases page and drop it in one of those two places.
+at sync time — if a cross-platform sidecar is missing, cp2 fails with the
+exact one-time command to build it (`cargo build --release --target <triple>
+&& cp ...` next to the client), and every subsequent sync deploys it
+automatically. The sidecar is the only manual step the zero-setup promise
+excludes: same-platform remotes (the common case) deploy the running binary
+with zero interaction.
 
 Build Linux sidecars with a static libc (the default glibc build only runs on
 glibc systems):

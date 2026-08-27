@@ -21,7 +21,12 @@ already have.
   files stream in bounded memory (a 100 GB file never needs 100 GB of RAM).
 - **Zero-setup server** — cp2 deploys a matching binary to the remote
   automatically on first sync. `cp2 SRC user@host:DEST` just works against a
-  fresh account: no install, no sudo, no PATH setup.
+  fresh account: no install, no sudo, no PATH setup. The zero-interaction
+  promise holds for same-platform remotes (local binary in, matching build
+  out); a **different platform** or a **remote with an older glibc** than
+  your build needs a one-time sidecar — the error tells you the exact
+  `cargo build --target ...` command, and every sync after that deploys
+  automatically.
 - **One password prompt** — on Unix the run's ssh sessions multiplex over a
   single `ControlMaster` connection, so with password auth you authenticate
   once per run. On Windows (where OpenSSH's multiplexing socket is broken,
