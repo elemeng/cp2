@@ -7,12 +7,9 @@
 #                                 (large-first / large-edit / small-first /
 #                                 small-idle), cp2 rsync scp sy pxs by
 #                                 default; one run each, rc recorded
-#   bench.sh mixed [tool ...]    the ≈10 GiB / 100 K-file tree (70 K small
-#                                 1-16 KiB, 27 K medium, 3 K large 1-2 MiB),
-#                                 default cp2 vs rsync: fresh / second /
-#                                 edit / integrity — the same tree is
-#                                 selectable in the other suites (MIXED=1 on
-#                                 compare/remote, MODE=mixed on single)
+#   (MIXED=1 turns compare into the ≈10 GiB / 100 K-file phase table:
+#    fresh / second / edit / integrity for the same tools; MODE=mixed on
+#    single and MIXED=1 on remote select the same tree there)
 #   bench.sh single               the delta-focused runs (MODE=large|small:
 #                                 fresh / edit A+B / insert / idle, cp2 vs
 #                                 rsync)
@@ -155,7 +152,52 @@ cmd_compare() { # [tool ...] — the four-scenario cross-tool table
         esac
     done
     if [ "$MIXED" = 1 ]; then
-        cmd_mixed "${TOOLS[@]}"
+        # The mixed-tree phases as a table: fresh / second / edit /
+        # integrity (the pristine tree for the first two, the mutated
+        # hardlink copy for the edit — one destination per tool).
+        local SRC="$WORK/mixed-src" RW="$WORK/.rw" tool s
+        local -A RESULTS RCS
+        gen_mixed_tree "$SRC"
+        mkdir -p "$RW"
+        cp -al "$SRC"/. "$RW/"
+        local RD="$REMOTE_BASE/$$/mixed/dst"
+
+        for tool in "${TOOLS[@]}"; do
+            ssh "$REMOTE" "mkdir -p ~/$RD/$tool"
+            t=$(timeit "$tool fresh" -- bash -c 'push_impl "$@"' _ "$tool" "$SRC" "$RD/$tool")
+            RESULTS["$tool fresh"]=$t
+            RCS["$tool fresh"]=$(cat "$WORK/$tool fresh.rc")
+            t=$(timeit "$tool second" -- bash -c 'push_impl "$@"' _ "$tool" "$SRC" "$RD/$tool")
+            RESULTS["$tool second"]=$t
+            RCS["$tool second"]=$(cat "$WORK/$tool second.rc")
+        done
+        mutate_mixed_tree "$RW"
+        for tool in "${TOOLS[@]}"; do
+            t=$(timeit "$tool edit" -- bash -c 'push_impl "$@"' _ "$tool" "$RW" "$RD/$tool")
+            RESULTS["$tool edit"]=$t
+            RCS["$tool edit"]=$(cat "$WORK/$tool edit.rc")
+        done
+
+        printf "\n%-8s %10s %10s %10s   %s\n" tool fresh second edit integrity
+        for tool in "${TOOLS[@]}"; do
+            # rsync's checksum dry-run lists only files that would be
+            # transferred (deliberately-deleted sources are not listed
+            # without --delete): 0 differing = byte-identical.
+            local diffs
+            diffs=$(rsync -rltc --dry-run "$RW/" "$REMOTE:$RD/$tool/" 2>/dev/null | grep -cE '^[-A-Za-z].*\.bin$' || true)
+            printf "%-8s %9ss %9ss %9ss   %s differing" \
+                "$tool" \
+                "${RESULTS[$tool fresh]}" \
+                "${RESULTS[$tool second]}" \
+                "${RESULTS[$tool edit]}" \
+                "$diffs"
+            local bad=""
+            for s in fresh second edit; do
+                [ "${RCS[$tool $s]}" != "0" ] && bad="$bad $s(rc=${RCS[$tool $s]})"
+            done
+            [ -n "$bad" ] && printf "  rc!=0:$bad"
+            printf "\n"
+        done
         return
     fi
 
@@ -271,66 +313,6 @@ for i in range(n_s + n_m + n_l + 1, n_s + n_m + n_l + 201):
 for i in rng.sample(range(1, n_s + n_m + n_l + 1), min(100, n_s)):
     os.remove(path(i))
 EOF
-}
-
-# ---------------------------------------------------------------------------
-cmd_mixed() { # [tool ...] — the mixed-tree phases: fresh / second / edit /
-              # integrity, one destination per tool. The default tools are
-              # cp2 and rsync; `bench.sh compare MIXED=1 [tool ...]` and
-              # `bench.sh single MODE=mixed` run the same phases.
-    local -a MTOOLS=("$@")
-    [ "${#MTOOLS[@]}" -gt 0 ] || MTOOLS=(cp2 rsync)
-    local SRC="$WORK/mixed-src" RW="$WORK/.rw" tool
-
-    gen_mixed_tree "$SRC"
-    mkdir -p "$RW"
-    cp -al "$SRC"/. "$RW/"      # hardlink copies: mutate $RW, keep $SRC pristine
-
-    for tool in "${MTOOLS[@]}"; do
-        [ "$tool" = cp2 ] || [ "$tool" = rsync ] || command -v "$tool" >/dev/null \
-            || { echo "missing tool: $tool" >&2; exit 1; }
-    done
-
-    local RD="$REMOTE_BASE/$$/mixed/dst"
-
-    echo "== fresh =="
-    for tool in "${MTOOLS[@]}"; do
-        ssh "$REMOTE" "mkdir -p ~/$RD/$tool"
-        case "$tool" in
-            cp2)   run "$tool fresh" -- "$CP2_BIN" "$SRC" "$REMOTE:$RD/$tool" ;;
-            rsync) run "$tool fresh" -- rsync -rpt "$SRC/" "$REMOTE:$RD/$tool/" ;;
-            *)     run "$tool fresh" -- bash -c 'push_impl "$@"' _ "$tool" "$SRC" "$RD/$tool" ;;
-        esac
-    done
-
-    echo "== second =="
-    for tool in "${MTOOLS[@]}"; do
-        case "$tool" in
-            cp2)   run "$tool second" -- "$CP2_BIN" "$SRC" "$REMOTE:$RD/$tool" ;;
-            rsync) run "$tool second" -- rsync -rpt "$SRC/" "$REMOTE:$RD/$tool/" ;;
-            *)     run "$tool second" -- bash -c 'push_impl "$@"' _ "$tool" "$SRC" "$RD/$tool" ;;
-        esac
-    done
-
-    echo "== edit =="
-    mutate_mixed_tree "$RW"
-    for tool in "${MTOOLS[@]}"; do
-        case "$tool" in
-            cp2)   run "$tool edit" -- "$CP2_BIN" "$RW" "$REMOTE:$RD/$tool" ;;
-            rsync) run "$tool edit" -- rsync -rpt "$RW/" "$REMOTE:$RD/$tool/" ;;
-            *)     run "$tool edit" -- bash -c 'push_impl "$@"' _ "$tool" "$RW" "$RD/$tool" ;;
-        esac
-    done
-
-    echo "== integrity =="
-    # rsync's checksum dry-run reads both sides and lists only files that
-    # would be transferred (the source's deliberately-deleted files are not
-    # listed without --delete): 0 differing = byte-identical.
-    for tool in "${MTOOLS[@]}"; do
-        local diffs
-        diffs=$(rsync -rltc --dry-run "$RW/" "$REMOTE:$RD/$tool/" 2>/dev/null | grep -cE '^[-A-Za-z].*\.bin$' || true)
-        echo "$tool integrity: $diffs differing files"
-    done
 }
 
 # ---------------------------------------------------------------------------
@@ -517,7 +499,6 @@ suite="${1:-compare}"
 shift || true
 case "$suite" in
     compare) cmd_compare "$@" ;;
-    mixed)   cmd_mixed "$@" ;;
     single)  cmd_single ;;
     remote)  cmd_remote ;;
     *) echo "unknown suite: $suite (compare | mixed | single | remote)" >&2; exit 1 ;;

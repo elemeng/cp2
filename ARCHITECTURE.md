@@ -307,8 +307,8 @@ to `REMOTE`, default `whoami@localhost`):
 
 | Suite | What it measures |
 |-------|------------------|
-| `compare [tool ...]` | cp2 vs rsync vs scp vs the ssh-capable studied crates (sy, pxs by default) through four push scenarios, all in one run, per-tool runs bounded by a timeout with rc recorded |
-| `mixed [tool ...]` | ≈10 GiB / 100 K files (70 K small 1-16 KiB, 27 K medium 64-384 KiB, 3 K large 1-2 MiB) over ssh, default cp2 vs rsync: `fresh` / `second` / `edit` / `integrity` phases — the tree is the same one `MIXED=1` / `MODE=mixed` select in the other suites |
+| `compare [tool ...]` | cp2 vs rsync vs scp vs the ssh-capable studied crates (sy, pxs by default) through four push scenarios, all in one run, per-tool runs bounded by a timeout with rc recorded; with `MIXED=1`, the same tools run the ≈10 GiB / 100 K-file phase table (fresh / second / edit / integrity) instead |
+| `single` | the delta engine's value, cp2 vs rsync: `MODE=large` (one 1 GiB file: fresh / edit A+B / insert / idle), `MODE=small` (8192 files: fresh / edit / idle), or `MODE=mixed` (the mixed tree) — the mixed tree is otherwise produced only by `compare MIXED=1` |
 | `single` | the delta engine's value, cp2 vs rsync: `MODE=large` (one 1 GiB file: fresh / edit A+B / insert / idle), `MODE=small` (8192 files: fresh / edit / idle), or `MODE=mixed` (the mixed tree) |
 | `remote` | cp2 vs rsync push to a **real** remote (set `REMOTE=user@host`): fresh / idle / edit, `RUNS`-averaged, MiB/s from each tool's own transferred-volume summary (`MIXED=1` uses the mixed tree) |
 
@@ -326,12 +326,13 @@ to `REMOTE`, default `whoami@localhost`):
 
 Run it yourself: `bench/bench.sh compare` (needs ssh key auth to the
 target; `REMOTE=user@host` for a real network, `LARGE_TOTAL_MB=256` to
-shorten). `bench.sh mixed` and `bench.sh single` cover the large-tree and
-delta scenarios; `bench.sh remote` (with `REMOTE` set) repeats the daily
-flows against a real link. The cross-tool timing table lives in the
+shorten). `bench.sh compare MIXED=1` runs the large-tree phases (fresh /
+second / edit / integrity, any tools) and `bench.sh single` the delta
+scenarios, with `MODE=mixed` selecting the same tree; `bench.sh remote`
+(with `REMOTE` set) repeats the daily flows against a real link. The cross-tool timing table lives in the
 README's Performance comparison section.
 
-### Example results (`bench.sh mixed`, 2026-08-26, Fedora 44 NVMe)
+### Example results (`bench.sh compare MIXED=1`, 2026-08-26, Fedora 44 NVMe)
 
 The mixed tree is ≈10 GiB / 100 K files (70 K small 1-16 KiB, 27 K medium
 64-384 KiB, 3 K large 1-2 MiB), phases over unchanged sources:
