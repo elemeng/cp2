@@ -11,3 +11,6 @@
 
 # Local test artifacts (large copied trees)
 /123/
+
+# Mimosa security-scan working state
+/.mimosa/
