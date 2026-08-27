@@ -12,10 +12,13 @@ use crate::target::{Location, RemoteTarget};
 use crate::transport::ssh::{default_remote_path, local_platform, sidecar_candidates, sidecar_path};
 use crate::transport::{JumpHost, RemoteClient, Session, SessionHandle, Transport};
 use anyhow::Result;
-use tokio::io::{AsyncRead, AsyncWrite};
-use zeroize::Zeroize;
+use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use terminal_size::{terminal_size, Width};
+use tokio::io::{AsyncRead, AsyncWrite};
+use unicode_width::UnicodeWidthStr;
+use zeroize::Zeroize;
 
 /// Execute a sync between two locations, inferring push/pull direction.
 ///
@@ -1405,21 +1408,23 @@ fn print_itemize(stats: &SyncStats) {
 /// in-flight file shows one in-place row whose percentage grows `0%`→`100%`
 /// until the summary row replaces it.
 ///
-/// The in-place redraw clears the row before painting (`\r` + erase-line)
-/// and is throttled to ~10/s: on a fast link the per-chunk reports arrive
-/// thousands of times per second, and a redraw (write + flush) per report
-/// would make the transfer itself terminal-bound. The same clear lands
-/// before the pending summary rows are flushed, so they get fresh rows of
-/// their own instead of gluing onto the live progress. The per-file
-/// summary rows are never throttled.
+/// A terminal is drawn with indicatif: one reused bar is the live row
+/// (repainted at a fixed ~10 Hz regardless of how fast the per-chunk
+/// reports arrive, so the transfer never becomes terminal-bound), the
+/// summary rows are printed above it through the bar's `MultiProgress`,
+/// and long paths are elided to the terminal width so the live row cannot
+/// wrap. Away from a terminal the summary rows go straight to stdout,
+/// batched into one write per flush so a 100 K-file transfer does not pay
+/// a syscall per file — indicatif's draw target is hidden there and would
+/// drop the rows.
 fn install_progress(options: &mut ExecutorOptions) {
     use std::io::IsTerminal;
     let interactive = std::io::stdout().is_terminal();
+    let width = terminal_size().map(|(Width(w), _)| w as usize);
     let state = std::sync::Arc::new(std::sync::Mutex::new(ProgressState::default()));
+    let mp = MultiProgress::with_draw_target(ProgressDrawTarget::stdout_with_hz(10));
     options.progress = Some(Arc::new(move |path: &str, done: u64, total: u64, files_total: u64| {
         use std::fmt::Write as _;
-        use std::io::Write;
-        let mut out = std::io::stdout();
         let mut st = state.lock().unwrap();
         let now = std::time::Instant::now();
         // The speed's byte counter: the per-file done deltas (the reported
@@ -1445,52 +1450,53 @@ fn install_progress(options: &mut ExecutorOptions) {
             // (the byte counter is already delta-based).
             if st.completed_paths.insert(path.to_string()) {
                 st.completed += 1;
-                // Summary row: the file's ordinal and the run's total, then
-                // 100% + rate + size + elapsed (dnf-style). Rows are
-                // batched: on a 100 K-file transfer the per-line write
-                // syscall alone costs seconds, and the batch path reports
-                // whole batches at once anyway.
                 let completed = st.completed;
                 let speed = st.windowed_speed(now);
                 let elapsed = now.saturating_duration_since(started);
-                let _ = writeln!(
-                    st.pending,
-                    "[{completed}/{files_total}] {path} 100% | {} | {} | {}",
-                    human_speed(speed),
-                    human_bytes(total),
-                    fmt_elapsed(elapsed)
+                // Summary row: the file's ordinal and the run's total, then
+                // 100% + rate + size + elapsed (dnf-style).
+                let row = fit_row(
+                    width,
+                    &format!("[{completed}/{files_total}] "),
+                    path,
+                    &format!(
+                        " 100% | {} | {} | {}",
+                        human_speed(speed),
+                        human_bytes(total),
+                        fmt_elapsed(elapsed)
+                    ),
                 );
-                if st.pending.len() >= PROGRESS_BATCH_BYTES
-                    || now.duration_since(st.last_flush) >= PROGRESS_BATCH_AGE
-                    || st.completed == files_total
-                {
-                    // Clear the live in-place row first so the summary rows
-                    // land on fresh rows of their own instead of gluing onto
-                    // the progress still on screen.
-                    if interactive {
-                        let _ = write!(out, "\r\x1b[2K");
+                if interactive {
+                    // Printed above the live bar: the row becomes permanent
+                    // history while the bar keeps painting the in-flight
+                    // file below it.
+                    let _ = mp.println(row);
+                    if completed == files_total {
+                        // Last file: retire the bar so the post-run summary
+                        // lines land on a clean screen.
+                        if let Some(bar) = &st.bar {
+                            bar.finish_and_clear();
+                        }
                     }
-                    let _ = write!(out, "{}", st.pending);
-                    st.pending.clear();
-                    st.last_flush = now;
+                } else {
+                    // Not a terminal: indicatif's draw target is hidden and
+                    // would drop the rows, so write them directly. Batched:
+                    // on a 100 K-file transfer the per-line write syscall
+                    // alone costs seconds, and the batch path reports whole
+                    // batches at once anyway.
+                    let _ = writeln!(st.pending, "{row}");
+                    if st.pending.len() >= PROGRESS_BATCH_BYTES
+                        || now.duration_since(st.last_flush) >= PROGRESS_BATCH_AGE
+                        || st.completed == files_total
+                    {
+                        use std::io::Write;
+                        let _ = write!(std::io::stdout(), "{}", st.pending);
+                        st.pending.clear();
+                        st.last_flush = now;
+                    }
                 }
             }
-        } else if interactive {
-            // The redraw overwrites the current line — any pending summary
-            // rows must land first (on a cleared row) so the display stays
-            // clean.
-            if !st.pending.is_empty() {
-                let _ = write!(out, "\r\x1b[2K{}", st.pending);
-                st.pending.clear();
-                st.last_flush = std::time::Instant::now();
-            }
-            if st
-                .last_redraw
-                .is_some_and(|t| now.duration_since(t) < std::time::Duration::from_millis(100))
-            {
-                return;
-            }
-            st.last_redraw = Some(now);
+} else if interactive {
             // Integer percent; `checked` arithmetic degrades to 100% on
             // overflow or a zero total (byte counts stay far below
             // u64::MAX / 100 anyway).
@@ -1500,26 +1506,58 @@ fn install_progress(options: &mut ExecutorOptions) {
                 .unwrap_or(100);
             let speed = st.windowed_speed(now);
             let remaining = files_total.saturating_sub(st.completed);
-            let _ = write!(
-                out,
-                "\r\x1b[2K[{}/{}] {} {}% {} / {}  {}  ({} left)",
-                st.completed + 1,
-                files_total,
-                path,
+            // The ordinal `[pos/len]` is rendered by the bar's template, so
+            // it is budgeted in the width fit but not part of the message.
+            let ordinal = format!("[{}/{}] ", st.completed + 1, files_total);
+            let suffix = format!(
+                " {}% {} / {}  {}  ({} left)",
                 pct,
                 human_bytes(done),
                 human_bytes(total),
                 human_speed(speed),
                 remaining
             );
-            let _ = out.flush();
+            let msg = match width {
+                Some(w) => {
+                    let fixed = ordinal.width() + suffix.width();
+                    format!("{}{suffix}", elide_path(path, w.saturating_sub(fixed)))
+                }
+                None => format!("{path}{suffix}"),
+            };
+            // The live row: one reused bar, repainted in place by indicatif.
+            // Created lazily — a run with nothing in flight draws nothing —
+            // and fully initialized (style, position, message) before it is
+            // added: `MultiProgress::add` draws the bar immediately, so an
+            // uninitialized bar would flash a bare `[pos/len]` frame.
+            if st.bar.is_none() {
+                // Hidden target: a standalone bar's ticker would paint its
+                // first frame immediately (burst throttle), racing the
+                // initialization below — the terminal would flash a bare
+                // `[pos/len]` row. Re-parented to the MultiProgress with
+                // `add`, which swaps in the remote draw target.
+                let bar = ProgressBar::with_draw_target(
+                    Some(files_total),
+                    ProgressDrawTarget::hidden(),
+                );
+                bar.set_style(ProgressStyle::with_template("[{pos}/{len}] {msg}").expect(
+                    "static template",
+                ));
+                bar.set_position(st.completed + 1);
+                bar.set_message(msg.clone());
+                st.bar = Some(mp.add(bar));
+            }
+            if let Some(bar) = st.bar.as_ref() {
+                bar.set_position(st.completed + 1);
+                bar.set_message(msg);
+            }
         }
     }));
 }
 
 /// Display state for the progress reporter: the completed-file count (the
-/// `[index/total]` numerator), the transferred bytes for the speed, and the
-/// redraw throttle.
+/// `[index/total]` numerator), the transferred bytes for the speed, and
+/// the live bar (created lazily, only when a file is actually in flight —
+/// a run with nothing to transfer draws nothing).
 struct ProgressState {
     start: std::time::Instant,
     completed: u64,
@@ -1531,14 +1569,16 @@ struct ProgressState {
     /// Paths already counted as completed (a file's completion can be
     /// reported twice — the wrapper's final write plus the explicit call).
     completed_paths: std::collections::HashSet<String>,
-    last_redraw: Option<std::time::Instant>,
+    /// The one reused live row (terminal mode only).
+    bar: Option<ProgressBar>,
     /// Bytes and timestamp for the windowed (since-last-readout) speed
     /// readout.
     last_speed_bytes: u64,
     last_speed_at: std::time::Instant,
-    /// Pending per-file summary rows. On a large transfer the per-line
-    /// write syscalls alone cost seconds per 100 K files, so rows are
-    /// batched and flushed on a size or time budget instead.
+    /// Pending per-file summary rows (non-terminal mode). On a large
+    /// transfer the per-line write syscalls alone cost seconds per 100 K
+    /// files, so rows are batched and flushed on a size or time budget
+    /// instead.
     pending: String,
     last_flush: std::time::Instant,
 }
@@ -1588,7 +1628,7 @@ impl Default for ProgressState {
             bytes: 0,
             files: std::collections::HashMap::new(),
             completed_paths: std::collections::HashSet::new(),
-            last_redraw: None,
+            bar: None,
             last_speed_bytes: 0,
             last_speed_at: now,
             pending: String::new(),
@@ -1614,6 +1654,52 @@ fn human_speed(bytes_per_sec: f64) -> String {
 fn fmt_elapsed(d: std::time::Duration) -> String {
     let secs = d.as_secs();
     format!("{:02}m{:02}s", secs / 60, secs % 60)
+}
+
+/// Assemble a progress row that fits the terminal: `prefix + path +
+/// suffix`, eliding the path's middle when the fixed parts plus the path
+/// exceed `width`. `width == None` (no terminal dimensions) leaves the
+/// path intact.
+fn fit_row(width: Option<usize>, prefix: &str, path: &str, suffix: &str) -> String {
+    let Some(w) = width else {
+        return format!("{prefix}{path}{suffix}");
+    };
+    let fixed = UnicodeWidthStr::width(prefix) + UnicodeWidthStr::width(suffix);
+    format!("{prefix}{}{suffix}", elide_path(path, w.saturating_sub(fixed)))
+}
+
+/// Elide the middle of `path` until it fits `available` columns, keeping
+/// the head and the tail (the file name matters most), joined by "…".
+/// Returned unchanged when it already fits. Widths count display columns
+/// (CJK glyphs are two wide), matching the terminal size.
+fn elide_path(path: &str, available: usize) -> String {
+    use unicode_width::UnicodeWidthChar;
+    if UnicodeWidthStr::width(path) <= available || available <= 2 {
+        return path.to_string();
+    }
+    // Head keeps 2/5 of the budget, the tail 3/5 (minus the "…").
+    let budget = available - 1;
+    let head = budget * 2 / 5;
+    let tail = budget - head;
+    let mut head_s = String::new();
+    let mut w = 0;
+    for c in path.chars() {
+        w += UnicodeWidthChar::width(c).unwrap_or(0);
+        if w > head {
+            break;
+        }
+        head_s.push(c);
+    }
+    let mut tail_s = String::new();
+    let mut w = 0;
+    for c in path.chars().rev() {
+        w += UnicodeWidthChar::width(c).unwrap_or(0);
+        if w > tail {
+            break;
+        }
+        tail_s.push(c);
+    }
+    format!("{head_s}…{}", tail_s.chars().rev().collect::<String>())
 }
 
 /// Format a byte count for progress display (1024-based K/M/G/T).
@@ -1794,5 +1880,44 @@ mod tests {
                 .iter()
                 .any(|p| p.file_name().unwrap().to_str() == Some(".hidden"))
         );
+    }
+
+    #[test]
+    fn elide_path_fits_or_keeps_the_name_tail() {
+        // Short paths are returned unchanged.
+        assert_eq!(elide_path("short.txt", 40), "short.txt");
+        // Long paths are elided to the budget, tail (the file name) intact.
+        let long = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/name.txt";
+        for budget in [16usize, 24, 32, 48] {
+            let elided = elide_path(long, budget);
+            let w = elided.width();
+            assert!(w <= budget, "width {w} > {budget}: {elided}");
+            assert!(elided.ends_with("name.txt"), "name tail lost: {elided}");
+            assert!(elided.contains('…') || long.width() <= budget);
+        }
+        // Tiny budgets still produce a fitting (if minimal) elision.
+        let tiny = elide_path("12345678", 4);
+        assert_eq!(tiny.width(), 4, "{tiny}");
+    }
+
+    #[test]
+    fn fit_row_budgets_the_fixed_parts() {
+        let row = fit_row(
+            Some(40),
+            "[1/5] ",
+            "envs/miniforge3/pyarrow/libarrow.so.2400",
+            " 100% | 9.3M/s | 52.7M | 00m04s",
+        );
+        assert!(row.width() <= 40, "{row}");
+        assert!(row.starts_with("[1/5] "), "{row}");
+        assert!(row.ends_with("100% | 9.3M/s | 52.7M | 00m04s"), "{row}");
+        // No terminal dimensions → full path, nothing elided.
+        let unbounded = fit_row(
+            None,
+            "[1/5] ",
+            "envs/miniforge3/pyarrow/libarrow.so.2400",
+            " 100%",
+        );
+        assert!(unbounded.contains("envs/miniforge3/pyarrow/libarrow.so.2400"), "{unbounded}");
     }
 }

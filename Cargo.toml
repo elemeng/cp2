@@ -60,6 +60,9 @@ num_cpus = "1.17"
 zeroize = "1"
 soft-canonicalize = { version = "0.5.6", features = ["dunce"] }
 typed-path = "0.12.3"
+indicatif = "0.17"
+terminal_size = "0.4.4"
+unicode-width = "0.2"
 
 [dev-dependencies]
 tempfile = "3.27"
