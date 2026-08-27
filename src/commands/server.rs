@@ -72,13 +72,22 @@ pub async fn execute(options: &ExecutorOptions) -> Result<()> {
         Err(e) => {
             // Best-effort: tell the peer why we are aborting before the
             // stream closes — the peer's `from_peer` surfaces `Frame::Error`
-            // as a real error instead of a bare EOF.
-            let mut out = tokio::io::stdout();
-            let _ = stream::send_frame(
-                &mut out,
-                &Frame::Error {
-                    message: e.to_string(),
-                },
+            // as a real error instead of a bare EOF. The fdio dup made the
+            // shared stdout description non-blocking (O_NONBLOCK is a
+            // per-description flag), so the write must go through an
+            // EAGAIN-aware handle — `tokio::io::stdout()` would fail with
+            // WouldBlock under backpressure and the peer would get a bare
+            // EOF. Bounded: a peer that never drains must not stall the
+            // abort forever.
+            let mut out = error_stdout();
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                stream::send_frame(
+                    &mut out,
+                    &Frame::Error {
+                        message: e.to_string(),
+                    },
+                ),
             )
             .await;
             return Err(e.into());
@@ -106,7 +115,11 @@ pub async fn execute(options: &ExecutorOptions) -> Result<()> {
 
 /// Best-effort diagnostics on the serve path: clear the blocking flag on
 /// fd 2 so a stderr write can never stall the protocol (see `execute`).
-/// Only stderr changes — stdin/stdout carry the protocol and stay blocking.
+/// Only stderr is switched here; stdout's description is already
+/// non-blocking through the fdio dup (`O_NONBLOCK` is per open file
+/// description, so it is shared with the dup'd reactor handle), and
+/// stdin's description is likewise shared with its dup — both stay
+/// EAGAIN-aware, which the protocol handles.
 #[cfg(unix)]
 fn make_stderr_non_blocking() {
     // SAFETY: F_GETFL/F_SETFL on our own stderr descriptor; the flags are
@@ -115,6 +128,26 @@ fn make_stderr_non_blocking() {
     if flags >= 0 {
         unsafe { libc::fcntl(libc::STDERR_FILENO, libc::F_SETFL, flags | libc::O_NONBLOCK) };
     }
+}
+
+/// A fresh protocol writer for the error path. The fdio dup made stdout's
+/// open file description non-blocking, so the frame must go through an
+/// EAGAIN-aware handle (the reactor waits for writability); a plain
+/// `tokio::io::stdout()` would fail with `WouldBlock` the moment the peer
+/// stops draining — exactly the state after a mid-transfer abort — and the
+/// peer would get a bare EOF instead of the error frame.
+#[cfg(unix)]
+fn error_stdout() -> Box<dyn tokio::io::AsyncWrite + Unpin + Send> {
+    match fdio::FdWrite::stdout() {
+        Ok(w) => Box::new(w) as Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
+        Err(_) => Box::new(tokio::io::stdout()),
+    }
+}
+
+/// Non-unix: no fdio dups, stdout's description stays blocking.
+#[cfg(not(unix))]
+fn error_stdout() -> Box<dyn tokio::io::AsyncWrite + Unpin + Send> {
+    Box::new(tokio::io::stdout())
 }
 
 /// Raw-fd epoll adapters for the server's stdio (Unix).
@@ -140,8 +173,11 @@ mod fdio {
     use tokio::io::unix::AsyncFd;
     use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-    /// A duplicate of `fd`, marked non-blocking (the reactor requires it;
-    /// the original fd is untouched).
+    /// A duplicate of `fd`, marked non-blocking (the reactor requires it).
+    /// Note that `O_NONBLOCK` is a flag of the *open file description*, which
+    /// `dup` shares — so the original `fd` becomes non-blocking too. The
+    /// protocol's readers/writers all use EAGAIN-aware handles, so this is
+    /// by design; anything writing `fd` directly must handle `WouldBlock`.
     fn dup_nonblocking(fd: RawFd) -> io::Result<OwnedFd> {
         // SAFETY: `dup` takes a valid fd and returns a fresh one we own.
         let duped = unsafe { libc::dup(fd) };
