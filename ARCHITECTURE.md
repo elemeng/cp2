@@ -331,8 +331,13 @@ shorten). `bench.sh compare MIXED=1` runs the large-tree phases (fresh /
 second / edit / integrity, any tools) and `bench.sh single` the delta
 scenarios, with `MODE=mixed` selecting the same tree; `bench.sh daily`
 (with `REMOTE` set) is the daily-flow perspective over a real link.
-Every cell repeats `RUNS` times (default 3) and is reported as mean ± sd;
-`JSON=1` adds a machine-readable record set per cell. The cross-tool timing table lives in the
+Every cell repeats `RUNS` times (default 3) and is reported as mean ± sd,
+with controlled variables keeping the comparison fair: identical trees and
+isolated per-tool destinations, page-cache warm (or uniformly cold with
+`WARM=0`), the tool order rotated per scenario (no slot bias from
+time-correlated drift), and `WARMUP` repetitions (default 0) that discard
+one-time setup from the statistics. `JSON=1` adds a machine-readable
+record set per cell. The cross-tool timing table lives in the
 README's Performance comparison section.
 
 ### Example results (`bench.sh compare MIXED=1`, 2026-08-26, Fedora 44 NVMe)

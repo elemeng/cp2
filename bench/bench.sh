@@ -15,6 +15,13 @@
 #     edit    one destination, source        — every run is a real delta
 #             re-mutated before each run
 #
+#   Control variables (comparisons stay fair): identical generated trees
+#   per tool, isolated per-tool destinations, page-cache warm (or uniformly
+#   cold with WARM=0), the tool order ROTATES per scenario so
+#   time-correlated drift cannot favor a measurement slot, WARMUP
+#   repetitions (default 0) discard one-time setup from the statistics,
+#   and every run is bounded and rc-recorded.
+#
 #   Every suite runs on localhost or over a real network — REMOTE selects
 #   the ssh target (whoami@localhost by default, user@host for real runs).
 #
@@ -41,7 +48,12 @@
 #   REMOTE_BASE         remote scratch dir under the account home
 #   WORK                local scratch dir (default: a fresh mktemp, removed
 #                       unless KEEP_WORK=1)
-#   RUNS                repetitions per cell (default 3; 1 = fastest)
+#   RUNS                repetitions per cell kept in the statistics
+#                       (default 3; 1 = fastest)
+#   WARMUP              extra first repetitions per cell, discarded from
+#                       the statistics (default 0; 1+ absorbs one-time
+#                       setup — the deploy probe, master creation — so
+#                       the cells measure steady state)
 #   WARM                1 = pre-warm the page cache before each run
 #                       (default 1); 0 = cold-cache runs
 #   JSON                1 = additionally print a machine-readable record
@@ -63,6 +75,7 @@ CP2_BIN="${CP2_BIN:-$REPO/target/release/cp2}"
 WORK="${WORK:-$(mktemp -d "${TMPDIR:-$HOME/.cache}/cp2-bench.XXXXXX")}"
 KEEP_WORK="${KEEP_WORK:-0}"
 RUNS="${RUNS:-3}"
+WARMUP="${WARMUP:-0}"
 WARM="${WARM:-1}"
 JSON="${JSON:-0}"
 RUN_TIMEOUT="${RUN_TIMEOUT:-300}"
@@ -127,8 +140,9 @@ warm() { find "$1" -type f -exec cat {} + > /dev/null 2>&1 || true; }
 #   Prints "mean sd rc bytes" (sample SD over the run times; rc = worst).
 measure() {
     local label="$1" tool="$2" src="$3" rd="$4" mutate="${5:-}" per_run="${6:-0}"
-    local i t rc b times="" rcs="" bytes="" t0 t1 dest
-    for i in $(seq 1 "$RUNS"); do
+    local i j t rc b t0 t1 dest times="" rcs="" bytes=""
+    local -a tarr rarr barr
+    for i in $(seq 1 $((RUNS + WARMUP))); do
         [ -n "$mutate" ] && "$mutate"
         [ "$WARM" = 1 ] && warm "$src"
         dest="$rd"; [ "$per_run" = 1 ] && dest="$rd/r$i"
@@ -143,7 +157,11 @@ measure() {
         t1=$(date +%s.%N)
         t=$(awk "BEGIN{printf \"%.3f\", $t1 - $t0}")
         b=$(volume_of "$tool" "$WORK/$label.$i.log")
-        times="$times $t"; rcs="$rcs $rc"; bytes="$bytes $b"
+        tarr+=("$t"); rarr+=("$rc"); barr+=("$b")
+    done
+    # Discard the warmup repetitions (one-time setup) from the statistics.
+    for ((j = WARMUP; j < ${#tarr[@]}; j++)); do
+        times="$times ${tarr[$j]}"; rcs="$rcs ${rarr[$j]}"; bytes="$bytes ${barr[$j]}"
     done
     # Mean, sample SD, min, max of the run times (sd 0 for a single run).
     read -r mean sd minx maxx <<< "$(awk -v t="$times" 'BEGIN {
@@ -287,18 +305,25 @@ cmd_compare() { # [tool ...] — four scenarios, or the mixed phases with MIXED=
         cp -al "$SRC"/. "$RW/"       # hardlink copies: mutate $RW, keep $SRC
         for tool in "${TOOLS[@]}"; do
             ssh "$REMOTE" "mkdir -p ~/$RD/$tool"
-            read -r mean sd minx maxx rc bytes <<< "$(measure "$tool fresh" "$tool" "$SRC" "$RD/$tool" "" 1)"
-            RESULTS["$tool fresh"]="$mean $sd $rc"
-            read -r mean sd minx maxx rc bytes <<< "$(measure "$tool second" "$tool" "$SRC" "$RD/$tool/r1")"
-            RESULTS["$tool second"]="$mean $sd $rc"
-            emit_json compare "$tool" fresh "$mean" "$sd" "$minx" "$maxx" "$RUNS" "$rc" "$bytes"
-            emit_json compare "$tool" second "$mean" "$sd" "$minx" "$maxx" "$RUNS" "$rc" "$bytes"
         done
         mutate_mixed_here() { mutate_mixed_tree "$RW"; }
-        for tool in "${TOOLS[@]}"; do
-            read -r mean sd minx maxx rc bytes <<< "$(measure "$tool edit" "$tool" "$RW" "$RD/$tool/r1" mutate_mixed_here)"
-            RESULTS["$tool edit"]="$mean $sd $rc"
-            emit_json compare "$tool" edit "$mean" "$sd" "$minx" "$maxx" "$RUNS" "$rc" "$bytes"
+        # Rotate the tool order per phase (control-variable interleaving).
+        local k off tool
+        off=0
+        for phase in fresh second edit; do
+            for ((k = 0; k < ${#TOOLS[@]}; k++)); do
+                tool="${TOOLS[$(((off + k) % ${#TOOLS[@]}))]}"
+                local src="$SRC" rd="$RD/$tool" per=1
+                case "$phase" in
+                    # second/edit re-sync the first fresh destination.
+                    second) src="$SRC"; rd="$RD/$tool/r1"; per=0 ;;
+                    edit)   src="$RW"; rd="$RD/$tool/r1"; per=0 ;;
+                esac
+                read -r mean sd minx maxx rc bytes <<< "$(measure "$tool $phase" "$tool" "$src" "$rd" mutate_mixed_here "$per")"
+                RESULTS["$tool $phase"]="$mean $sd $rc"
+                emit_json compare "$tool" "$phase" "$mean" "$sd" "$minx" "$maxx" "$RUNS" "$rc" "$bytes"
+            done
+            off=$((off + 1))
         done
 
         printf "\n%-8s %12s %12s %12s   %s\n" tool fresh second edit integrity
@@ -332,16 +357,29 @@ cmd_compare() { # [tool ...] — four scenarios, or the mixed phases with MIXED=
 
     local RD="$REMOTE_BASE/$$/compare"
     ssh "$REMOTE" "mkdir -p ~/$RD"
+    # Control-variable setup: identical per-tool sources and isolated remote
+    # dests before any measurement.
+    declare -A LARGE_SRC
     for tool in "${TOOLS[@]}"; do
-        local large="$WORK/$tool-large"
-        cp -r "$WORK/large" "$large"
+        LARGE_SRC[$tool]="$WORK/$tool-large"
+        cp -r "$WORK/large" "${LARGE_SRC[$tool]}"
         ssh "$REMOTE" "mkdir -p ~/$RD/$tool/large ~/$RD/$tool/small"
-        # The edit mutation closes over this tool's copy (the measure hook
-        # is called argument-free).
-        mutate_large_here() {
-            dd if=/dev/urandom of="$large/data1.bin" bs=1M seek=$((LARGE_TOTAL_MB / 4)) count=1 conv=notrunc status=none
-        }
-        for s in large-first large-edit small-first small-idle; do
+    done
+    # The tool order rotates per scenario (each scenario starts with a
+    # different tool), so time-correlated drift cannot systematically
+    # favor whoever is measured first or last.
+    local s k off tool
+    local -a SCENARIOS=(large-first large-edit small-first small-idle)
+    off=0
+    for s in "${SCENARIOS[@]}"; do
+        for ((k = 0; k < ${#TOOLS[@]}; k++)); do
+            tool="${TOOLS[$(((off + k) % ${#TOOLS[@]}))]}"
+            local large="${LARGE_SRC[$tool]}"
+            # The edit mutation closes over this tool's copy (the measure
+            # hook is called argument-free).
+            mutate_large_here() {
+                dd if=/dev/urandom of="$large/data1.bin" bs=1M seek=$((LARGE_TOTAL_MB / 4)) count=1 conv=notrunc status=none
+            }
             case "$s" in
                 large-first) read -r mean sd minx maxx rc bytes <<< "$(measure "$tool $s" "$tool" "$large" "$RD/$tool/large" "" 1)" ;;
                 large-edit)  read -r mean sd minx maxx rc bytes <<< "$(measure "$tool $s" "$tool" "$large" "$RD/$tool/large/r1" mutate_large_here)" ;;
@@ -351,6 +389,7 @@ cmd_compare() { # [tool ...] — four scenarios, or the mixed phases with MIXED=
             RESULTS["$tool $s"]="$mean $sd $rc"
             emit_json compare "$tool" "$s" "$mean" "$sd" "$minx" "$maxx" "$RUNS" "$rc" "$bytes"
         done
+        off=$((off + 1))
     done
 
     printf "\n%-8s %14s %14s %14s %14s   %s\n" tool large-first large-edit small-first small-idle integrity
@@ -393,10 +432,12 @@ cmd_compare() { # [tool ...] — four scenarios, or the mixed phases with MIXED=
     done
     printf "\n"
     echo
-    echo "notes: mean ± sd over $RUNS runs; page cache warmed before each run"
-    echo "       (WARM=$WARM); every run bounded by a ${RUN_TIMEOUT}s timeout with rc"
-    echo "       recorded; integrity = files a checksum dry-run would re-transfer"
-    echo "       (0 = byte-identical)."
+    echo "notes: mean ± sd over $RUNS runs (${WARMUP} warmup repetitions discarded"
+    echo "       when WARMUP>0); page cache warmed before each run (WARM=$WARM); the"
+    echo "       tool order rotates per scenario (control-variable interleaving, so"
+    echo "       time-correlated drift cannot favor a slot); every run bounded by a"
+    echo "       ${RUN_TIMEOUT}s timeout with rc recorded; integrity = files a checksum"
+    echo "       dry-run would re-transfer (0 = byte-identical)."
 }
 
 # ---------------------------------------------------------------------------
@@ -447,35 +488,41 @@ cmd_single() { # MODE=large|small|mixed — delta scenarios, cp2 vs rsync
         done
     }
 
-    one_row() { # name mutate_fn — a cp2 and an rsync cell side by side
-        local name="$1" mutate="${2:-}" out mean sd rc
+    one_row() { # name mutate_fn lead_tool — a cp2 and an rsync cell side
+                 # by side; the lead alternates per row (ABBA ordering)
+        local name="$1" mutate="${2:-}" lead="${3:-cp2}" mean sd minx maxx rc
         local cpm rsx
-        cpm=$(measure "$name-cp2" cp2 "$SRC" "$RD/cp2" "$mutate" 1)
-        rsx=$(measure "$name-rsync" rsync "$SRC" "$RD/rsync" "$mutate" 1)
-        read -r mean sd rc <<< "$cpm"
+        if [ "$lead" = rsync ]; then
+            rsx=$(measure "$name-rsync" rsync "$SRC" "$RD/rsync" "$mutate" 1)
+            cpm=$(measure "$name-cp2" cp2 "$SRC" "$RD/cp2" "$mutate" 1)
+        else
+            cpm=$(measure "$name-cp2" cp2 "$SRC" "$RD/cp2" "$mutate" 1)
+            rsx=$(measure "$name-rsync" rsync "$SRC" "$RD/rsync" "$mutate" 1)
+        fi
+        read -r mean sd minx maxx rc <<< "$cpm"
         printf "%-10s cp2 %13s" "$name" "$(cell "$mean" "$sd")"
-        read -r mean sd rc <<< "$rsx"
+        read -r mean sd minx maxx rc <<< "$rsx"
         printf "   rsync %13s\n" "$(cell "$mean" "$sd")"
-        read -r mean sd rc <<< "$cpm"
+        read -r mean sd minx maxx rc <<< "$cpm"
         emit_json single cp2 "$name" "$mean" "$sd" "$minx" "$maxx" "$RUNS" "$rc" 0
-        read -r mean sd rc <<< "$rsx"
+        read -r mean sd minx maxx rc <<< "$rsx"
         emit_json single rsync "$name" "$mean" "$sd" "$minx" "$maxx" "$RUNS" "$rc" 0
     }
 
-    one_row fresh1 ""
-    one_row fresh2 ""
+    one_row fresh1 "" cp2
+    one_row fresh2 "" rsync
     mutate_mixed_src() { mutate_mixed_tree "$SRC"; }
     if [ "$MODE" = mixed ]; then
-        one_row edit mutate_mixed_src
+        one_row edit mutate_mixed_src cp2
     elif [ "$MODE" = large ]; then
-        one_row editA mutate_large_src
-        one_row editB mutate_large_src_b
-        one_row insert mutate_large_insert
+        one_row editA mutate_large_src cp2
+        one_row editB mutate_large_src_b rsync
+        one_row insert mutate_large_insert cp2
     else
-        one_row editA mutate_small_a
-        one_row editB mutate_small_b
+        one_row editA mutate_small_a cp2
+        one_row editB mutate_small_b rsync
     fi
-    one_row idle ""
+    one_row idle "" rsync""
     echo
     echo "notes: fresh = per-run destination (a full transfer each repetition);"
     echo "       edit/insert re-apply the mutation before every run (each"
@@ -539,9 +586,10 @@ cmd_daily() { # daily-flow perspective: fresh / idle / edit, MiB/s
     one_cell fresh cp2 1
     one_cell fresh rsync 1
     # idle: the no-op scan; edit: re-mutated before every run — both over
-    # the one destination.
-    one_cell idle cp2 0
+    # the first fresh destination. The leading tool alternates per
+    # scenario (ABBA ordering).
     one_cell idle rsync 0
+    one_cell idle cp2 0
     one_cell "edit($EDIT_FILES)" cp2 0 mutate_edit_files
     one_cell "edit($EDIT_FILES)" rsync 0 mutate_edit_files
     echo
