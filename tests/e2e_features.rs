@@ -135,34 +135,19 @@ async fn sparse_push_without_flag_allocates() {
 #[cfg(unix)]
 #[tokio::test]
 async fn xattr_preserved_with_flag() {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
     let src = tempfile::tempdir().unwrap();
     let dst = tempfile::tempdir().unwrap();
     let file = src.path().join("a.txt");
     tokio::fs::write(&file, b"x").await.unwrap();
-    let cpath = CString::new(file.as_os_str().as_bytes()).unwrap();
-    let name = CString::new("user.cp2_test").unwrap();
-    assert_eq!(
-        unsafe {
-            libc::setxattr(
-                cpath.as_ptr(),
-                name.as_ptr(),
-                b"hello xattr".as_ptr().cast(),
-                11,
-                0,
-            )
-        },
-        0,
-        "set the source xattr"
-    );
+    let name = "user.cp2_test".to_string();
+    let value: Vec<u8> = b"hello xattr".to_vec();
+    cp2::platform::fs::apply_xattrs(&file, &[(name.clone(), value.clone())])
+        .expect("set the source xattr");
 
     // Without `-X` nothing travels.
     push_tree(src.path(), dst.path(), &default_options()).await;
-    let dpath = CString::new(dst.path().join("a.txt").as_os_str().as_bytes()).unwrap();
-    assert_eq!(
-        unsafe { libc::getxattr(dpath.as_ptr(), name.as_ptr(), std::ptr::null_mut(), 0) },
-        -1,
+    assert!(
+        cp2::platform::fs::collect_xattrs(&dst.path().join("a.txt")).is_empty(),
         "xattrs are not copied without -X"
     );
 
@@ -173,13 +158,11 @@ async fn xattr_preserved_with_flag() {
     let mut options = default_options();
     options.xattrs = true;
     push_tree_with_server_args(src.path(), dst.path(), &options, &["--xattrs"]).await;
-    let mut buf = vec![0u8; 64];
-    let n = unsafe {
-        libc::getxattr(dpath.as_ptr(), name.as_ptr(), buf.as_mut_ptr().cast(), buf.len())
-    };
-    assert!(n > 0, "the xattr must be present on the destination");
-    buf.truncate(usize::try_from(n).unwrap_or(0) as usize);
-    assert_eq!(buf, b"hello xattr");
+    let got = cp2::platform::fs::collect_xattrs(&dst.path().join("a.txt"));
+    assert!(
+        got.iter().any(|(n, v)| *n == name && *v == value),
+        "the xattr must be present on the destination: {got:?}"
+    );
 }
 #[cfg(unix)]
 #[tokio::test]
@@ -418,29 +401,16 @@ async fn rollsum_pull_roundtrips() {
 #[cfg(unix)]
 #[tokio::test]
 async fn xattrs_on_pull_roundtrip() {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
     // The pull *sender* is the server: -X must ride its argv so the xattrs
     // are collected and sent; the client receiver applies them.
     let serve = tempfile::tempdir().unwrap();
     let restore = tempfile::tempdir().unwrap();
     let file = serve.path().join("a.txt");
     tokio::fs::write(&file, b"x").await.unwrap();
-    let cpath = CString::new(file.as_os_str().as_bytes()).unwrap();
-    let name = CString::new("user.cp2_pull").unwrap();
-    assert_eq!(
-        unsafe {
-            libc::setxattr(
-                cpath.as_ptr(),
-                name.as_ptr(),
-                b"pulled value".as_ptr().cast(),
-                12,
-                0,
-            )
-        },
-        0,
-        "set the source xattr"
-    );
+    let name = "user.cp2_pull".to_string();
+    let value: Vec<u8> = b"pulled value".to_vec();
+    cp2::platform::fs::apply_xattrs(&file, &[(name.clone(), value.clone())])
+        .expect("set the source xattr");
 
     let mut options = default_options();
     options.xattrs = true;
@@ -453,13 +423,10 @@ async fn xattrs_on_pull_roundtrip() {
     drop(executor);
     let _ = child.wait().await;
 
-    let dpath = CString::new(restore.path().join("a.txt").as_os_str().as_bytes()).unwrap();
-    let mut buf = vec![0u8; 64];
-    let n = unsafe {
-        libc::getxattr(dpath.as_ptr(), name.as_ptr(), buf.as_mut_ptr().cast(), buf.len())
-    };
-    assert!(n > 0, "the xattr must be present after the pull");
-    buf.truncate(usize::try_from(n).unwrap_or(0) as usize);
-    assert_eq!(buf, b"pulled value");
+    let got = cp2::platform::fs::collect_xattrs(&restore.path().join("a.txt"));
+    assert!(
+        got.iter().any(|(n, v)| *n == name && *v == value),
+        "the xattr must be present after the pull: {got:?}"
+    );
 }
 

@@ -265,6 +265,8 @@ async fn delete_flag_removes_stale_files() {
     assert!(dst.path().join("keep.txt").exists());
     assert!(!dst.path().join("stale.txt").exists());
 }
+// No Windows counterpart: there are no mode bits — a read-only file is still
+// readable, so an "unreadable source" state cannot be constructed.
 #[cfg(unix)]
 #[tokio::test]
 async fn unreadable_source_skipped_not_fatal() {
@@ -855,7 +857,6 @@ async fn existing_only_updates_present_files_on_push_and_pull() {
     );
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn ignore_times_forces_equal_time_size_transfer_on_push_and_pull() {
     // Same size AND same mtime, different content: the quick check calls it
@@ -891,7 +892,6 @@ async fn ignore_times_forces_equal_time_size_transfer_on_push_and_pull() {
     assert_eq!(std::fs::read(restore.path().join("f.bin")).unwrap(), data2);
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn checksum_catches_equal_time_size_tamper_on_push_and_pull() {
     // Same size + same mtime, different content: the size+mtime quick check

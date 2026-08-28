@@ -1976,25 +1976,11 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn scan_captures_xattrs_when_enabled() {
-        use std::ffi::CString;
-        use std::os::unix::ffi::OsStrExt;
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("a.txt");
         tokio::fs::write(&file, b"x").await.unwrap();
-        let cpath = CString::new(file.as_os_str().as_bytes()).unwrap();
-        let name = CString::new("user.cp2_scan").unwrap();
-        assert_eq!(
-            unsafe {
-                libc::setxattr(
-                    cpath.as_ptr(),
-                    name.as_ptr(),
-                    b"v".as_ptr().cast(),
-                    1,
-                    0,
-                )
-            },
-            0
-        );
+        crate::platform::fs::apply_xattrs(&file, &[("user.cp2_scan".to_string(), b"v".to_vec())])
+            .expect("set the source xattr");
 
         // Off by default: no xattrs on the wire.
         let manifest = Scanner::new(ScanOptions::default())

@@ -124,6 +124,11 @@ pub fn set_future_mtime(path: &Path) {
         .and_then(|f| f.set_times(std::fs::FileTimes::new().set_modified(time)));
 }
 
+/// Set a symlink's *own* mtime (Unix only): `utimensat` with
+/// `AT_SYMLINK_NOFOLLOW`. No Windows counterpart — std's `FileTimes` follows
+/// reparse points, so a link's own timestamp is not settable portably, and
+/// the only callers are Unix link-materialization tests.
+#[cfg(unix)]
 pub fn set_link_mtime(path: &Path, secs: i64) {
     use std::os::unix::ffi::OsStrExt;
     let cpath = std::ffi::CString::new(path.as_os_str().as_bytes()).expect("no NUL in path");
@@ -154,14 +159,18 @@ pub async fn wait_until(mut cond: impl FnMut() -> bool, timeout: std::time::Dura
     panic!("condition not met within {timeout:?}");
 }
 
+/// Pin a file's mtime to an exact (sec, nsec) pair. Portable: std maps this
+/// to `utimensat` on Unix (full nanosecond precision) and `SetFileTime` on
+/// Windows (FILETIME's 100 ns granularity — sub-100 ns remainders round
+/// away, which is why the exact-nanosecond test stays Unix-gated).
 pub fn set_file_mtime_ns(path: &Path, sec: i64, nsec: i64) {
-    use std::os::unix::ffi::OsStrExt;
-    let cpath = std::ffi::CString::new(path.as_os_str().as_bytes()).expect("no NUL in path");
-    let ts = libc::timespec {
-        tv_sec: sec,
-        tv_nsec: nsec,
-    };
-    let times = [ts, ts];
-    let rc = unsafe { libc::utimensat(libc::AT_FDCWD, cpath.as_ptr(), times.as_ptr(), 0) };
-    assert_eq!(rc, 0, "set file mtime");
+    let secs = u64::try_from(sec).expect("mtime seconds must be non-negative");
+    let nanos = u32::try_from(nsec).expect("mtime nanoseconds must be non-negative");
+    let time = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::new(secs, nanos);
+    std::fs::File::options()
+        .write(true)
+        .open(path)
+        .expect("open for mtime pin")
+        .set_times(std::fs::FileTimes::new().set_modified(time))
+        .expect("set file mtime");
 }

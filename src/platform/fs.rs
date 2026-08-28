@@ -14,6 +14,8 @@
 //!
 //! Adapted from pxs `tools/staging.rs` + `net/protocol.rs`.
 
+#[cfg(unix)]
+use std::ffi::{c_char, c_void, CStr};
 use std::fs::File;
 use std::io;
 use std::path::Path;
@@ -233,6 +235,70 @@ pub fn preallocate(file: &File, size: u64) -> io::Result<()> {
     }
 }
 
+/// macOS's xattr API appends arguments Linux/BSD lack: `listxattr` takes an
+/// `options` flag and `getxattr`/`setxattr` take `position` + `flags` (all
+/// zero for plain path-relative access). The helpers below pair the shapes.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn xattr_list_size(path: &CStr) -> isize {
+    // SAFETY: `path` is a valid NUL-terminated string; `null` is the
+    // size-probe form.
+    unsafe { libc::listxattr(path.as_ptr(), std::ptr::null_mut(), 0) }
+}
+#[cfg(target_os = "macos")]
+fn xattr_list_size(path: &CStr) -> isize {
+    // SAFETY: `path` is a valid NUL-terminated string; `null` is the
+    // size-probe form.
+    unsafe { libc::listxattr(path.as_ptr(), std::ptr::null_mut(), 0, 0) }
+}
+#[cfg(all(unix, not(target_os = "macos")))]
+fn xattr_list(path: &CStr, list: *mut c_char, len: usize) -> isize {
+    // SAFETY: `path` is a valid NUL-terminated string; `list` is writable
+    // for `len` bytes.
+    unsafe { libc::listxattr(path.as_ptr(), list, len) }
+}
+#[cfg(target_os = "macos")]
+fn xattr_list(path: &CStr, list: *mut c_char, len: usize) -> isize {
+    // SAFETY: `path` is a valid NUL-terminated string; `list` is writable
+    // for `len` bytes.
+    unsafe { libc::listxattr(path.as_ptr(), list, len, 0) }
+}
+#[cfg(all(unix, not(target_os = "macos")))]
+fn xattr_get_size(path: &CStr, name: &CStr) -> isize {
+    // SAFETY: `path` and `name` are valid NUL-terminated strings; `null`
+    // is the size-probe form.
+    unsafe { libc::getxattr(path.as_ptr(), name.as_ptr(), std::ptr::null_mut(), 0) }
+}
+#[cfg(target_os = "macos")]
+fn xattr_get_size(path: &CStr, name: &CStr) -> isize {
+    // SAFETY: `path` and `name` are valid NUL-terminated strings; `null`
+    // is the size-probe form.
+    unsafe { libc::getxattr(path.as_ptr(), name.as_ptr(), std::ptr::null_mut(), 0, 0, 0) }
+}
+#[cfg(all(unix, not(target_os = "macos")))]
+fn xattr_get(path: &CStr, name: &CStr, value: *mut c_void, len: usize) -> isize {
+    // SAFETY: `path` and `name` are valid NUL-terminated strings; `value`
+    // is writable for `len` bytes.
+    unsafe { libc::getxattr(path.as_ptr(), name.as_ptr(), value, len) }
+}
+#[cfg(target_os = "macos")]
+fn xattr_get(path: &CStr, name: &CStr, value: *mut c_void, len: usize) -> isize {
+    // SAFETY: `path` and `name` are valid NUL-terminated strings; `value`
+    // is writable for `len` bytes.
+    unsafe { libc::getxattr(path.as_ptr(), name.as_ptr(), value, len, 0, 0) }
+}
+#[cfg(all(unix, not(target_os = "macos")))]
+fn xattr_set(path: &CStr, name: &CStr, value: *const c_void, len: usize) -> libc::c_int {
+    // SAFETY: `path` and `name` are valid NUL-terminated strings; `value`
+    // is readable for `len` bytes.
+    unsafe { libc::setxattr(path.as_ptr(), name.as_ptr(), value, len, 0) }
+}
+#[cfg(target_os = "macos")]
+fn xattr_set(path: &CStr, name: &CStr, value: *const c_void, len: usize) -> libc::c_int {
+    // SAFETY: `path` and `name` are valid NUL-terminated strings; `value`
+    // is readable for `len` bytes.
+    unsafe { libc::setxattr(path.as_ptr(), name.as_ptr(), value, len, 0, 0) }
+}
+
 /// Collect the path's extended attributes (`--xattrs`): name/value pairs for
 /// every readable attribute. Best-effort — an unreadable attribute (or an
 /// attribute list that cannot be read at all, e.g. on a filesystem without
@@ -248,15 +314,12 @@ pub fn collect_xattrs(path: &Path) -> Vec<(String, Vec<u8>)> {
         let Ok(cpath) = CString::new(path.as_os_str().as_bytes()) else {
             return Vec::new();
         };
-        // SAFETY: `cpath` is a valid NUL-terminated path; `null` is the
-        // size-probe form.
-        let size = unsafe { libc::listxattr(cpath.as_ptr(), std::ptr::null_mut(), 0) };
+        let size = xattr_list_size(&cpath);
         if size <= 0 {
             return Vec::new();
         }
         let mut buf = vec![0u8; usize::try_from(size).unwrap_or(0)];
-        // SAFETY: `buf` has `size` bytes; the kernel writes at most that many.
-        let n = unsafe { libc::listxattr(cpath.as_ptr(), buf.as_mut_ptr().cast(), buf.len()) };
+        let n = xattr_list(&cpath, buf.as_mut_ptr().cast(), buf.len());
         if n <= 0 {
             return Vec::new();
         }
@@ -268,24 +331,13 @@ pub fn collect_xattrs(path: &Path) -> Vec<(String, Vec<u8>)> {
             let Ok(name) = std::ffi::CString::new(name) else {
                 continue;
             };
-            // SAFETY: `cpath` and `name` are valid; `null` probes the size.
-            let vsize = unsafe {
-                libc::getxattr(cpath.as_ptr(), name.as_ptr(), std::ptr::null_mut(), 0)
-            };
+            let vsize = xattr_get_size(&cpath, &name);
             if vsize <= 0 {
                 continue;
             }
             let mut value = vec![0u8; usize::try_from(vsize).unwrap_or(0)];
-            // SAFETY: `value` has `vsize` bytes; the kernel writes at most
-            // that many. A concurrent remove may shrink it (ERANGE) — skip.
-            let vn = unsafe {
-                libc::getxattr(
-                    cpath.as_ptr(),
-                    name.as_ptr(),
-                    value.as_mut_ptr().cast(),
-                    value.len(),
-                )
-            };
+            // A concurrent remove may shrink the value (ERANGE) — skip.
+            let vn = xattr_get(&cpath, &name, value.as_mut_ptr().cast(), value.len());
             if vn <= 0 {
                 continue;
             }
@@ -326,17 +378,7 @@ pub fn apply_xattrs(path: &Path, xattrs: &[(String, Vec<u8>)]) -> io::Result<()>
             let Ok(cname) = std::ffi::CString::new(name.as_str()) else {
                 continue;
             };
-            // SAFETY: `cpath` and `cname` are valid NUL-terminated strings;
-            // `value` is a valid byte slice.
-            let rc = unsafe {
-                libc::setxattr(
-                    cpath.as_ptr(),
-                    cname.as_ptr(),
-                    value.as_ptr().cast(),
-                    value.len(),
-                    0,
-                )
-            };
+            let rc = xattr_set(&cpath, &cname, value.as_ptr().cast(), value.len());
             if rc != 0 && first_err.is_none() {
                 first_err = Some(io::Error::last_os_error());
             }

@@ -1,6 +1,7 @@
 mod common;
 use common::*;
 
+#[cfg(unix)]
 #[tokio::test]
 async fn symlink_push_and_retarget() {
     use std::os::unix::ffi::OsStrExt;

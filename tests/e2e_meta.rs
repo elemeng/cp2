@@ -313,22 +313,14 @@ async fn archive_remove_source_files_keeps_specials() {
     assert!(src.path().join("pipe").exists());
     assert!(dst.path().join("pipe").exists());
 }
-#[cfg(unix)]
 #[tokio::test]
 async fn no_times_leaves_transfer_time_and_uses_size_only_check() {
-    use std::os::unix::ffi::OsStrExt;
-    use std::os::unix::fs::MetadataExt;
     let src = tempfile::tempdir().unwrap();
     let dst = tempfile::tempdir().unwrap();
     let file = src.path().join("a.txt");
     tokio::fs::write(&file, b"payload").await.unwrap();
-    // Pin the source mtime to a far-past value.
-    let c = std::ffi::CString::new(file.as_os_str().as_bytes()).unwrap();
-    let past = libc::timespec { tv_sec: 946_684_800, tv_nsec: 0 }; // 2000-01-01
-    assert_eq!(
-        unsafe { libc::utimensat(libc::AT_FDCWD, c.as_ptr(), [past, past].as_ptr(), 0) },
-        0
-    );
+    // Pin the source mtime to a far-past value (2000-01-01).
+    set_file_mtime_ns(&file, 946_684_800, 0);
 
     let mut options = default_options();
     options.preserve_times = false;
@@ -345,7 +337,8 @@ async fn no_times_leaves_transfer_time_and_uses_size_only_check() {
     let dst_meta = std::fs::metadata(dst.path().join("a.txt")).unwrap();
     let src_meta = std::fs::metadata(&file).unwrap();
     assert_ne!(
-        dst_meta.mtime(), src_meta.mtime(),
+        dst_meta.modified().unwrap(),
+        src_meta.modified().unwrap(),
         "without -t the destination must not carry the source mtime"
     );
 
@@ -453,6 +446,8 @@ async fn mode_clears_setuid_setgid_sticky() {
         & 0o7777;
     assert_eq!(sticky_mode, 0o777, "sticky bit must be cleared (rwxrwxrwx only)");
 }
+// No Windows counterpart: FILETIME carries 100 ns granularity, so the exact
+// 123_456_789 ns remainder cannot be represented (nor asserted) there.
 #[cfg(unix)]
 #[tokio::test]
 async fn nanosecond_mtime_preserved_by_default_and_archive() {
@@ -635,7 +630,6 @@ async fn max_delete_on_pull_aborts_excess() {
     }
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn no_times_on_pull_leaves_transfer_time() {
     // rlpt opt-out on the pull: the restore mtime must be the transfer time,
