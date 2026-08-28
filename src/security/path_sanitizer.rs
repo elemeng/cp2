@@ -155,7 +155,14 @@ mod tests {
         let sanitizer = PathSanitizer::new(temp.path()).unwrap();
         let result = sanitizer.join("subdir/file.txt");
         assert!(result.is_ok());
-        assert!(result.unwrap().starts_with(temp.path()));
+        // The sanitizer anchors on the soft-canonicalized root: std
+        // canonicalize keeps 8.3 short names and a `\\?\` prefix on Windows,
+        // and macOS resolves `/var` → `/private/var`.
+        assert!(
+            result
+                .unwrap()
+                .starts_with(soft_canonicalize(temp.path()).unwrap())
+        );
     }
 
     #[test]
@@ -187,7 +194,10 @@ mod tests {
         // parent component.
         let temp = TempDir::new().unwrap();
         let sanitizer = PathSanitizer::new(temp.path()).unwrap();
-        let root = temp.path().canonicalize().unwrap();
+        // The containment root must be normalized the same way the sanitizer
+        // normalizes its own root (std canonicalize diverges on Windows:
+        // `\\?\` verbatim prefix plus 8.3 short names).
+        let root = soft_canonicalize(temp.path()).unwrap();
         let mut rng = FuzzRng::new(0x5A17_1E2E_0F0D_CAFE);
         for _ in 0..2_000 {
             let s = rng.string(48);

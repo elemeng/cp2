@@ -545,6 +545,11 @@ fn expand_source(pattern: &str) -> anyhow::Result<Option<(PathBuf, Vec<PathBuf>)
     }
     matches.sort();
     let base = static_prefix_dir(pattern);
+    // The glob crate strips a leading `./` from its matches ("src/a.rs",
+    // never "./src/a.rs"); normalize the static prefix the same way so the
+    // base is always a true prefix of every match. An empty base (a "./"
+    // pattern like "./*.rs") stays empty — a universal prefix.
+    let base = base.strip_prefix("./").unwrap_or(&base).to_path_buf();
     Ok(Some((base, matches)))
 }
 
@@ -1815,15 +1820,19 @@ mod tests {
 
     #[test]
     fn expand_source_literal_path_wins() {
-        let dir = tempfile::tempdir().unwrap();
-        // A path that literally exists is never treated as a pattern, even
-        // with metacharacters in the name.
-        fs::write(dir.path().join("a*b"), b"x").unwrap();
-        let literal = format!("{}/a*b", dir.path().display());
-        assert!(expand_source(&literal).unwrap().is_none());
-
         // No metacharacters: not a pattern, even when the path does not exist.
         assert!(expand_source("/nonexistent/plain/path").unwrap().is_none());
+
+        // A path that literally exists is never treated as a pattern, even
+        // with metacharacters in the name. Windows filenames cannot contain
+        // `*`, so the file cannot be created there — unix-only.
+        #[cfg(unix)]
+        {
+            let dir = tempfile::tempdir().unwrap();
+            fs::write(dir.path().join("a*b"), b"x").unwrap();
+            let literal = format!("{}/a*b", dir.path().display());
+            assert!(expand_source(&literal).unwrap().is_none());
+        }
     }
 
     #[test]

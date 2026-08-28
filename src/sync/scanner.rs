@@ -7,6 +7,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
+use soft_canonicalize::soft_canonicalize;
 use typed_path::Utf8UnixPathBuf;
 
 use crate::Result;
@@ -406,8 +407,18 @@ impl Scanner {
         let mut roots = roots.to_vec();
         roots.sort();
         let mut accepted: Vec<PathBuf> = Vec::new();
-        // Link classification anchors against the canonical merge base.
-        let ctx = self.context(base);
+        // Link classification anchors against the canonical merge base —
+        // canonicalized exactly as `scan` does: on macOS the base is often
+        // reached through a symlinked prefix (`/var` → `/private/var`), and
+        // a literal root would classify every internal link as external and
+        // dereference it. An empty base (a "./" glob) means the cwd.
+        let ctx_base = if base.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            base
+        };
+        let canonical_base = tokio::fs::canonicalize(ctx_base).await.map_err(crate::Error::Io)?;
+        let ctx = self.context(&canonical_base);
         for root in &roots {
             // Equal to, or inside, an already-accepted root: already covered.
             if accepted.iter().any(|r| root.starts_with(r)) {
@@ -1215,7 +1226,11 @@ fn rel_of_internal_target(link_path: &Path, target: &str, root: &Path) -> String
         return wire_str(&rel.to_string_lossy());
     }
     let Ok(canon) = std::fs::canonicalize(&resolved) else {
-        let normalized = crate::sync::linkpolicy::lexical_normalize(&resolved);
+        // Dangling: resolve the existing prefix (the base may itself be
+        // reached through a symlinked path, e.g. macOS `/var`) and keep the
+        // non-existing tail.
+        let normalized = soft_canonicalize(&resolved)
+            .unwrap_or_else(|_| crate::sync::linkpolicy::lexical_normalize(&resolved));
         return wire_str(&normalized.strip_prefix(root).unwrap_or(&resolved).to_string_lossy());
     };
     wire_str(&canon.strip_prefix(root).unwrap_or(&canon).to_string_lossy())
@@ -2559,9 +2574,12 @@ mod tests {
         );
         assert_eq!(entry.size, 7);
         assert!(entry.dereferenced, "the target is not ours to remove");
+        // The resolved source path is canonicalized (macOS resolves
+        // `/var` → `/private/var`; Windows adds a `\\?\` prefix) — compare
+        // it in the same form.
         assert_eq!(
-            entry.source_path,
-            Some(dir.path().join("target.txt")),
+            entry.source_path.as_ref().map(|p| p.canonicalize().unwrap()),
+            Some(dir.path().join("target.txt").canonicalize().unwrap()),
             "content is read from the target, not the .lnk body"
         );
     }

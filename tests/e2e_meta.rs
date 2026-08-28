@@ -281,8 +281,7 @@ async fn archive_creates_special_files() {
         kind & libc::S_IFMT,
         libc::S_IFIFO,
         "dst pipe must be a fifo"
-    );
-    assert_eq!(meta.mode() & 0o7777, 0o640, "fifo mode preserved");
+    );    assert_eq!(meta.mode() & 0o7777, 0o640, "fifo mode preserved");
 }
 #[cfg(unix)]
 #[tokio::test]

@@ -12,6 +12,7 @@
 #![forbid(unsafe_code)]
 
 use crate::protocol::TargetOs;
+use soft_canonicalize::soft_canonicalize;
 use std::path::{Component, Path, PathBuf};
 use typed_path::{Utf8Component, Utf8UnixPath, Utf8UnixPathBuf};
 
@@ -145,14 +146,20 @@ pub enum LinkClass {
 /// `target` against the canonical scan `root`. Relative targets resolve
 /// against the link's parent; the resolved path is canonicalized when it
 /// exists, so chains of links collapse to their real path. A dangling target
-/// falls back to a lexical (no-filesystem) containment check.
+/// falls back to a containment check over the soft-canonicalized path.
 #[must_use]
 pub fn classify_link(link_path: &Path, target: &str, root: &Path) -> LinkClass {
     let resolved = resolve_target(link_path, target);
     let Ok(real) = std::fs::canonicalize(&resolved) else {
-        // Dangling: decide lexically whether the target stays inside the
-        // root (a dangling internal link is preserved) or escapes it.
-        let normalized = lexical_normalize(&resolved);
+        // Dangling: decide whether the target stays inside the root (a
+        // dangling internal link is preserved) or escapes it.
+        // soft_canonicalize resolves the deepest existing prefix — the
+        // link's directory may itself be reached through a symlinked path
+        // (macOS `/var` → `/private/var`, Windows 8.3 short names) — and
+        // keeps the non-existing tail, so the containment check compares
+        // real prefixes on both sides.
+        let normalized =
+            soft_canonicalize(&resolved).unwrap_or_else(|_| lexical_normalize(&resolved));
         return if normalized.starts_with(root) {
             LinkClass::Internal
         } else {

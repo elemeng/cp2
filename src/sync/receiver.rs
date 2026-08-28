@@ -1871,8 +1871,13 @@ mod tests {
         }
         #[cfg(not(unix))]
         {
-            let _ = (path, mtime);
-            Err(std::io::Error::other("unsupported on this platform"))
+            let secs = u64::try_from(mtime).expect("mtime must be non-negative");
+            let time =
+                std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs);
+            std::fs::File::options()
+                .write(true)
+                .open(path)
+                .and_then(|f| f.set_times(std::fs::FileTimes::new().set_modified(time)))
         }
     }
 
