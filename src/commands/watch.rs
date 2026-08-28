@@ -186,7 +186,7 @@ pub(crate) async fn watch_push(
                     cli.watch_delay
                 );
             }
-            watch_loop(&mut rx, delay, move || {
+            watch_loop(&mut rx, delay, SYNC_ERROR_BACKOFF, move || {
                 let os = Arc::clone(&os);
                 let remote = Arc::clone(&remote);
                 let remote_path = Arc::clone(&remote_path);
@@ -289,12 +289,14 @@ where
 /// - Changes that arrive *while a sync runs* mark the tree dirty; the next
 ///   sync starts immediately after the current one (no debounce).
 /// - A failed sync is logged and the same changes are retried after
-///   [`SYNC_ERROR_BACKOFF`].
+///   `backoff` (production passes [`SYNC_ERROR_BACKOFF`]; tests inject a
+///   short one).
 /// - Ctrl-C ends the loop cleanly; closing `changes` also ends it (used by
 ///   tests and by the parent dropping the sender).
 async fn watch_loop<F, Fut>(
     changes: &mut UnboundedReceiver<()>,
     delay: Duration,
+    backoff: Duration,
     mut sync: F,
 ) -> Result<()>
 where
@@ -351,12 +353,9 @@ where
                     }
                 }
                 Err(e) => {
-                    tracing::warn!(
-                        "watch sync failed: {e}; retrying in {:?}",
-                        SYNC_ERROR_BACKOFF
-                    );
+                    tracing::warn!("watch sync failed: {e}; retrying in {:?}", backoff);
                     tokio::select! {
-                        () = tokio::time::sleep(SYNC_ERROR_BACKOFF) => {}
+                        () = tokio::time::sleep(backoff) => {}
                         _ = tokio::signal::ctrl_c() => return Ok(()),
                     }
                 }
@@ -528,7 +527,7 @@ pub(crate) async fn watch_local(
                     cli.watch_delay
                 );
             }
-            watch_loop(&mut rx, delay, move || {
+            watch_loop(&mut rx, delay, SYNC_ERROR_BACKOFF, move || {
                 let src_path = Arc::clone(&src_path);
                 let dst_path = Arc::clone(&dst_path);
                 let options = Arc::clone(&options);
@@ -666,7 +665,7 @@ mod tests {
         let count = Arc::new(AtomicUsize::new(0));
         let sync_count = count.clone();
         let task = tokio::spawn(async move {
-            watch_loop(&mut rx, test_delay(), move || {
+            watch_loop(&mut rx, test_delay(), Duration::from_millis(10), move || {
                 let sync_count = sync_count.clone();
                 async move {
                     sync_count.fetch_add(1, AtomicOrdering::SeqCst);
@@ -692,7 +691,7 @@ mod tests {
         let sync_count = count.clone();
         let burst_tx = tx.clone();
         let task = tokio::spawn(async move {
-            watch_loop(&mut rx, test_delay(), move || {
+            watch_loop(&mut rx, test_delay(), Duration::from_millis(10), move || {
                 let sync_count = sync_count.clone();
                 let burst_tx = burst_tx.clone();
                 async move {
@@ -711,7 +710,14 @@ mod tests {
         tx.send(()).unwrap();
         // The loop cannot exit cleanly (the closure keeps a sender alive), so
         // cancel it once the resync has happened.
-        let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
+        // The loop cannot exit cleanly (the closure keeps a sender alive), so
+        // wait for the expected resyncs by polling instead of a fixed
+        // window, then cancel it.
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(1_500);
+        while count.load(AtomicOrdering::SeqCst) < 2 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        task.abort();
         assert_eq!(count.load(AtomicOrdering::SeqCst), 2);
     }
 
@@ -724,7 +730,7 @@ mod tests {
         let sync_count = count.clone();
         let burst_tx = tx.clone();
         let task = tokio::spawn(async move {
-            watch_loop(&mut rx, test_delay(), move || {
+            watch_loop(&mut rx, test_delay(), Duration::from_millis(10), move || {
                 let sync_count = sync_count.clone();
                 let burst_tx = burst_tx.clone();
                 async move {
@@ -744,7 +750,14 @@ mod tests {
         tx.send(()).unwrap();
         // The loop cannot exit cleanly (the closure keeps a sender alive), so
         // cancel it once the resync has happened.
-        let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
+        // The loop cannot exit cleanly (the closure keeps a sender alive), so
+        // wait for the expected resyncs by polling instead of a fixed
+        // window, then cancel it.
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(1_500);
+        while count.load(AtomicOrdering::SeqCst) < 2 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        task.abort();
         assert_eq!(
             count.load(AtomicOrdering::SeqCst),
             2,
@@ -758,7 +771,7 @@ mod tests {
         let count = Arc::new(AtomicUsize::new(0));
         let sync_count = count.clone();
         let task = tokio::spawn(async move {
-            watch_loop(&mut rx, test_delay(), move || {
+            watch_loop(&mut rx, test_delay(), Duration::from_millis(10), move || {
                 let sync_count = sync_count.clone();
                 async move {
                     let n = sync_count.fetch_add(1, AtomicOrdering::SeqCst);

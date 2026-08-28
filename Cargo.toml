@@ -106,3 +106,11 @@ too_many_arguments = { level = "warn", priority = 11 }
 # frame-dispatch loops and CLI scripts whose per-unit work is already
 # extracted into helpers.
 too_many_lines = { level = "allow", priority = 11 }
+
+# The integration tests spawn the real `cp2 --server` child and the delta
+# suite re-hashes multi-MB fixtures (FastCDC + BLAKE3), which run ~10x
+# slower in a plain debug build — the transfer-heavy suites dominated wall
+# time. Build the test profile optimized (debug info stays, so failures
+# still symbolize).
+[profile.test]
+opt-level = 3
