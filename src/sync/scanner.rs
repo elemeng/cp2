@@ -1436,7 +1436,10 @@ fn rdev_of(_meta: &std::fs::Metadata) -> Option<u64> {
 #[cfg(unix)]
 fn special_kind(meta: &std::fs::Metadata) -> Option<FileKind> {
     use std::os::unix::fs::MetadataExt;
-    match meta.mode() & libc::S_IFMT {
+    // `mode_t` is u32 on Linux/NetBSD but u16 on Apple/FreeBSD, and the
+    // `S_IF*` constants follow the platform type — compare in `mode_t`.
+    let mode = libc::mode_t::try_from(meta.mode()).expect("mode fits mode_t");
+    match mode & libc::S_IFMT {
         libc::S_IFIFO => Some(FileKind::Fifo),
         libc::S_IFSOCK => Some(FileKind::Socket),
         libc::S_IFBLK => Some(FileKind::BlockDevice),

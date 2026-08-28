@@ -454,6 +454,11 @@ fn apply_mode(_path: &Path, _mode: u32, _is_symlink: bool) -> io::Result<()> {
 /// needs root, and an `EPERM` is surfaced for the caller to skip the entry.
 /// A no-op elsewhere — Windows has no such objects.
 ///
+/// # Panics
+///
+/// Panics if `mode`'s permission bits do not fit the platform's `mode_t`
+/// (u16 on Apple/FreeBSD) — impossible, because they are masked to `0o777`.
+///
 /// # Errors
 ///
 /// Returns an I/O error if the object cannot be created (a non-root
@@ -473,7 +478,10 @@ pub fn create_special(
         // SAFETY: `cpath` is a valid NUL-terminated path for the duration of the call.
         let rc = unsafe {
             if kind == crate::protocol::FileKind::Fifo {
-                libc::mkfifo(cpath.as_ptr(), mode & 0o777)
+                libc::mkfifo(
+                    cpath.as_ptr(),
+                    libc::mode_t::try_from(mode & 0o777).expect("mode fits mode_t"),
+                )
             } else {
                 let type_bit = match kind {
                     crate::protocol::FileKind::Socket => libc::S_IFSOCK,
@@ -488,7 +496,7 @@ pub fn create_special(
                 };
                 libc::mknod(
                     cpath.as_ptr(),
-                    type_bit | (mode & 0o777),
+                    type_bit | libc::mode_t::try_from(mode & 0o777).expect("mode fits mode_t"),
                     rdev.unwrap_or(0) as libc::dev_t,
                 )
             }

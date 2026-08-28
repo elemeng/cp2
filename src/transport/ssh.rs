@@ -1303,14 +1303,15 @@ fn open_pty() -> std::io::Result<(std::fs::File, std::fs::File)> {
     let mut master: libc::c_int = -1;
     let mut slave: libc::c_int = -1;
     // SAFETY: openpty writes the two fds we own; the termios pointers are
-    // NULL, requesting the defaults.
+    // NULL, requesting the defaults. `null_mut`: Linux's libc declares them
+    // `*const`, Apple's `*mut`.
     let rc = unsafe {
         libc::openpty(
             std::ptr::addr_of_mut!(master),
             std::ptr::addr_of_mut!(slave),
             std::ptr::null_mut(),
-            std::ptr::null(),
-            std::ptr::null(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
         )
     };
     if rc != 0 {

@@ -276,8 +276,9 @@ async fn archive_creates_special_files() {
     assert!(exit_status.success(), "server exited with {exit_status}");
 
     let meta = std::fs::symlink_metadata(dst.path().join("pipe")).unwrap();
+    let kind = libc::mode_t::try_from(meta.mode()).expect("mode fits mode_t");
     assert_eq!(
-        meta.mode() & libc::S_IFMT,
+        kind & libc::S_IFMT,
         libc::S_IFIFO,
         "dst pipe must be a fifo"
     );
