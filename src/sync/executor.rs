@@ -6,7 +6,8 @@
 //! `planner`/`strategy`).
 
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -1234,7 +1235,10 @@ fn resolve_pull_roots(root: &Path, paths: &[String]) -> Result<(PathBuf, Vec<Pat
     }
     let mut roots = Vec::with_capacity(paths.len());
     for p in paths {
-        if !p.starts_with('/') {
+        // The sender's own absolute form: `/home/u` from a Unix client, a
+        // drive path (`D:\data`) from a Windows client — both are absolute
+        // server paths on the receiver's platform.
+        if !Path::new(p).is_absolute() {
             return Err(Error::Other(
                 "remote --files-from entries must be absolute paths on the server".to_string(),
             ));
@@ -1253,11 +1257,34 @@ fn resolve_pull_roots(root: &Path, paths: &[String]) -> Result<(PathBuf, Vec<Pat
 }
 
 /// The filesystem root of an absolute path: `/` on Unix, the drive root
-/// (`C:\`) on Windows.
+/// (`C:\`, including the prefix) on Windows.
 fn path_root(path: &Path) -> PathBuf {
-    path.ancestors()
-        .last()
-        .map_or_else(|| PathBuf::from("/"), Path::to_path_buf)
+    let root: PathBuf = path
+        .components()
+        .take_while(|c| matches!(c, Component::Prefix(_) | Component::RootDir))
+        .collect();
+    if root.as_os_str().is_empty() {
+        PathBuf::from("/")
+    } else {
+        root
+    }
+}
+
+/// Expand a glob pattern without letting the glob dependency panic on
+/// malformed input. glob 0.3.4's `to_scope` slices the raw pattern with a
+/// byte offset derived from its own Path-normalized lengths, which diverge
+/// on Windows for some separator-mixed patterns (e.g. `/\..\*`) and panic
+/// out of bounds. Patterns are user- or peer-supplied, so the panic must
+/// surface as an error, never a crash. Returns the matched paths or an error
+/// message for the caller's error type.
+pub(crate) fn glob_expand(pattern: &str) -> std::result::Result<Vec<PathBuf>, String> {
+    catch_unwind(AssertUnwindSafe(|| {
+        glob::glob(pattern)
+            .map_err(|e| format!("invalid glob pattern '{pattern}': {e}"))?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| format!("glob error for '{pattern}': {e}"))
+    }))
+    .map_err(|_| format!("invalid glob pattern '{pattern}'"))?
 }
 
 /// Expand a remote glob pattern (serve-root-relative or absolute) into
@@ -1289,10 +1316,7 @@ fn expand_remote_glob(root: &Path, pattern: &str) -> Result<Option<(PathBuf, Vec
     };
     // The glob fragment relative to the base (from the first metachar on).
     let joined = base_path.join(&pattern[meta_at..]);
-    let matches = glob::glob(&joined.to_string_lossy())
-        .map_err(|e| Error::Other(format!("invalid glob pattern '{pattern}': {e}")))?
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(|e| Error::Other(format!("glob error for '{pattern}': {e}")))?;
+    let matches = glob_expand(&joined.to_string_lossy()).map_err(Error::Other)?;
     if matches.is_empty() {
         return Ok(None);
     }
@@ -1409,21 +1433,6 @@ mod tests {
             } else {
                 rng.string(32)
             };
-
-            // glob 0.3.4 slices the raw pattern with a byte offset derived
-            // from its own Path-normalized form; on Windows the two lengths
-            // diverge for some inputs and the crate panics out of bounds —
-            // a defect in the dependency, not in cp2's handling. Skip such
-            // inputs (when the lengths agree the slice is provably in
-            // bounds).
-            let normalized_len = Path::new(&pattern)
-                .iter()
-                .collect::<std::path::PathBuf>()
-                .to_str()
-                .map(str::len);
-            if normalized_len != Some(pattern.len()) {
-                continue;
-            }
 
             if let Ok(Some((base, matches))) = expand_remote_glob(root.path(), &pattern) {
                 assert!(

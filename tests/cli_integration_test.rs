@@ -139,8 +139,17 @@ fn test_files_from_delete_only_trims_the_listed_paths() {
     // The destination mirrors the listed path from the filesystem root
     // (`/data` → `DST/data`). Prep the mirror with a stale extra inside
     // the listed subtree and an unrelated file outside it.
-    let rel = src.path().strip_prefix(std::path::Path::new("/")).unwrap();
-    let mirror_root = dst.path().join(rel);
+    let root_relative: std::path::PathBuf = src
+        .path()
+        .components()
+        .filter(|c| {
+            !matches!(
+                c,
+                std::path::Component::RootDir | std::path::Component::Prefix(_)
+            )
+        })
+        .collect();
+    let mirror_root = dst.path().join(root_relative);
     std::fs::create_dir_all(mirror_root.join("data")).unwrap();
     std::fs::write(mirror_root.join("data/old.txt"), b"old").unwrap();
     std::fs::write(dst.path().join("unrelated.txt"), b"unrelated").unwrap();

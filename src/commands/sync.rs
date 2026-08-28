@@ -13,7 +13,7 @@ use crate::transport::ssh::{default_remote_path, local_platform, sidecar_candida
 use crate::transport::{JumpHost, RemoteClient, Session, SessionHandle, Transport};
 use anyhow::Result;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use terminal_size::{terminal_size, Width};
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -225,9 +225,10 @@ pub async fn execute(cli: &mut Cli) -> Result<()> {
         })?;
         let mut paths = Vec::new();
         for entry in parse_file_list(&content) {
-            // Wire-slash check (server paths are Unix-absolute): the client's
-            // own Path::is_absolute would apply local drive rules instead.
-            if !entry.starts_with('/') {
+            // Absolute server paths, in the sender's own form: a Unix client
+            // writes `/home/u/...`, a Windows client its drive paths
+            // (`D:\...`) — both stay absolute on the receiver's platform.
+            if !Path::new(&entry).is_absolute() {
                 anyhow::bail!("remote --files-from entries must be absolute paths, got '{entry}'");
             }
             paths.push(entry);
@@ -241,7 +242,9 @@ pub async fn execute(cli: &mut Cli) -> Result<()> {
         options.delete_scope = options
             .remote_paths
             .iter()
-            .map(|p| p.trim_start_matches('/').to_string())
+            .map(Path::new)
+            .filter_map(|p| p.strip_prefix(path_root(p)).ok())
+            .map(|s| s.to_string_lossy().replace('\\', "/"))
             .collect();
     }
 
@@ -488,11 +491,17 @@ fn parse_file_list(content: &str) -> Vec<String> {
 }
 
 /// The filesystem root of an absolute path: `/` on Unix, the drive root
-/// (`C:\`) on Windows.
+/// (`C:\`, including the prefix) on Windows.
 fn path_root(path: &Path) -> PathBuf {
-    path.ancestors()
-        .last()
-        .map_or_else(|| PathBuf::from("/"), Path::to_path_buf)
+    let root: PathBuf = path
+        .components()
+        .take_while(|c| matches!(c, Component::Prefix(_) | Component::RootDir))
+        .collect();
+    if root.as_os_str().is_empty() {
+        PathBuf::from("/")
+    } else {
+        root
+    }
 }
 
 /// Whether `s` contains a glob metacharacter (`*`, `?`, or `[`).
@@ -536,10 +545,8 @@ fn expand_source(pattern: &str) -> anyhow::Result<Option<(PathBuf, Vec<PathBuf>)
     if !has_glob_metachars(pattern) || Path::new(pattern).exists() {
         return Ok(None);
     }
-    let mut matches: Vec<PathBuf> = glob::glob(pattern)
-        .map_err(|e| anyhow::anyhow!("invalid glob pattern '{pattern}': {e}"))?
-        .collect::<Result<_, _>>()
-        .map_err(|e| anyhow::anyhow!("glob error for '{pattern}': {e}"))?;
+    let mut matches: Vec<PathBuf> = crate::sync::executor::glob_expand(pattern)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
     if matches.is_empty() {
         anyhow::bail!("no files match source pattern '{pattern}'");
     }

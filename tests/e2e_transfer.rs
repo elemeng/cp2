@@ -677,13 +677,24 @@ async fn remote_files_from_pull_merges_absolute_paths() {
     ];
     let stats = pull_tree(serve.path(), restore.path(), &options).await;
     assert_eq!(stats.files_received, 2);
-    // Mirrored at the absolute path minus the leading `/`.
+    // Mirrored at the absolute path minus its filesystem root (`/` on
+    // Unix, the drive prefix+root on Windows).
     let abs1 = d1.join("a.txt");
     let abs2 = d2.join("b.txt");
-    let rel1 = abs1.strip_prefix("/").unwrap();
-    let rel2 = abs2.strip_prefix("/").unwrap();
+    let root_relative = |p: &std::path::Path| -> std::path::PathBuf {
+        p.components()
+            .filter(|c| {
+                !matches!(
+                    c,
+                    std::path::Component::RootDir | std::path::Component::Prefix(_)
+                )
+            })
+            .collect()
+    };
+    let rel1 = root_relative(&abs1);
+    let rel2 = root_relative(&abs2);
     assert_eq!(
-        std::fs::read(restore.path().join(rel1)).unwrap(),
+        std::fs::read(restore.path().join(&rel1)).unwrap(),
         b"a",
         "{} must land at {}",
         d1.join("a.txt").display(),
