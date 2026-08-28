@@ -633,3 +633,33 @@ async fn delete_protects_policy_skipped_links() {
     );
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn ignore_existing_pull_preserves_dest_file_over_link() {
+    // Pull mirror of the push case: the server-side planner must honor
+    // --ignore-existing (riding the PullRequest frame) and leave the
+    // restore-side regular file alone even though the source is a symlink.
+    let serve = tempfile::tempdir().unwrap();
+    let restore = tempfile::tempdir().unwrap();
+    tokio::fs::write(serve.path().join("target.txt"), b"t")
+        .await
+        .unwrap();
+    std::os::unix::fs::symlink("target.txt", serve.path().join("data.txt")).unwrap();
+    tokio::fs::write(restore.path().join("data.txt"), b"orig-file")
+        .await
+        .unwrap();
+
+    let mut options = default_options();
+    options.ignore_existing = true;
+    pull_tree(serve.path(), restore.path(), &options).await;
+    let meta = std::fs::symlink_metadata(restore.path().join("data.txt")).unwrap();
+    assert!(
+        meta.file_type().is_file(),
+        "--ignore-existing on pull must keep the existing file over the source link"
+    );
+    assert_eq!(
+        std::fs::read(restore.path().join("data.txt")).unwrap(),
+        b"orig-file"
+    );
+}
+

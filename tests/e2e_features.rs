@@ -384,3 +384,82 @@ async fn push_rollsum_engine_roundtrip() {
     );
 }
 
+#[tokio::test]
+async fn rollsum_pull_roundtrips() {
+    // The pull sender is the server: it must chunk-roll only when its own
+    // argv carries --rollsum (the flag is not in the PullRequest frame —
+    // both peers derive it from the same CLI).
+    let serve = tempfile::tempdir().unwrap();
+    let restore = tempfile::tempdir().unwrap();
+    let data = pseudo_random(4 * 1024 * 1024);
+    tokio::fs::write(serve.path().join("data.bin"), &data)
+        .await
+        .unwrap();
+
+    let mut options = default_options();
+    options.rollsum = true;
+    let (mut child, send, recv) = spawn_server_with_args(serve.path(), &["--rollsum"]);
+    let mut executor = Executor::new(send, recv);
+    executor
+        .pull(restore.path(), &options)
+        .await
+        .expect("pull failed");
+    drop(executor);
+    let exit_status = child.wait().await.expect("wait server");
+    assert!(exit_status.success(), "server exited with {exit_status}");
+
+    assert_eq!(
+        std::fs::read(restore.path().join("data.bin")).unwrap(),
+        data,
+        "rollsum pull must reconstruct byte-exactly"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn xattrs_on_pull_roundtrip() {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    // The pull *sender* is the server: -X must ride its argv so the xattrs
+    // are collected and sent; the client receiver applies them.
+    let serve = tempfile::tempdir().unwrap();
+    let restore = tempfile::tempdir().unwrap();
+    let file = serve.path().join("a.txt");
+    tokio::fs::write(&file, b"x").await.unwrap();
+    let cpath = CString::new(file.as_os_str().as_bytes()).unwrap();
+    let name = CString::new("user.cp2_pull").unwrap();
+    assert_eq!(
+        unsafe {
+            libc::setxattr(
+                cpath.as_ptr(),
+                name.as_ptr(),
+                b"pulled value".as_ptr().cast(),
+                12,
+                0,
+            )
+        },
+        0,
+        "set the source xattr"
+    );
+
+    let mut options = default_options();
+    options.xattrs = true;
+    let (mut child, send, recv) = spawn_server_with_args(serve.path(), &["--xattrs"]);
+    let mut executor = Executor::new(send, recv);
+    executor
+        .pull(restore.path(), &options)
+        .await
+        .expect("pull failed");
+    drop(executor);
+    let _ = child.wait().await;
+
+    let dpath = CString::new(restore.path().join("a.txt").as_os_str().as_bytes()).unwrap();
+    let mut buf = vec![0u8; 64];
+    let n = unsafe {
+        libc::getxattr(dpath.as_ptr(), name.as_ptr(), buf.as_mut_ptr().cast(), buf.len())
+    };
+    assert!(n > 0, "the xattr must be present after the pull");
+    buf.truncate(usize::try_from(n).unwrap_or(0) as usize);
+    assert_eq!(buf, b"pulled value");
+}
+

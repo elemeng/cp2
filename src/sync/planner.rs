@@ -254,6 +254,7 @@ impl Planner {
                             if !src.is_dir
                                 && src.link_target.is_none()
                                 && !Self::is_special(src.kind)
+                                && !self.flag_forced_skip(src, dst_entry)
                                 && self.attrs_differ(src, dst_entry)
                             {
                                 plan.meta.push(Self::task_for(src, SyncAction::MetaOnly));
@@ -379,6 +380,18 @@ impl Planner {
         let perms = self.config.preserve_perms && (src.mode & PERM) != (dst.mode & PERM);
         let times = self.config.preserve_times && !Self::times_match(src, dst);
         perms || times
+    }
+
+    /// Whether a `Skip` was forced by a decision flag (`--update` on a newer
+    /// destination, `--ignore-existing` on any existing file) rather than by
+    /// the content quick check. Such files are deliberately outside the
+    /// run's scope, so the metadata-only pass must not touch them either:
+    /// rsync leaves `-u`/`--ignore-existing` skips alone, while an attr pass
+    /// would rewind a newer file's mtime to the source's (the mirror of
+    /// `compare`'s own flag checks — keep both in sync).
+    fn flag_forced_skip(&self, src: &FileEntry, dst: &FileEntry) -> bool {
+        (self.config.update_only && dst.mtime_sec > src.mtime_sec)
+            || (self.config.ignore_existing && !src.is_dir && !dst.is_dir)
     }
 
     /// Whether the destination entry already holds the source's content — the
@@ -574,6 +587,32 @@ mod tests {
         .plan(&src, &same);
         assert_eq!(plan2.meta.len(), 0, "type bits are not a perm drift");
         assert_eq!(plan2.skips.len(), 1);
+    }
+
+    #[test]
+    fn update_and_ignore_existing_skips_never_meta_update() {
+        // rsync -u skips newer destination files *completely*: a metadata-
+        // only pass would rewind the newer file's mtime to the source's.
+        // Same for --ignore-existing ("do nothing to existing files"). The
+        // flag-forced skips must stay plain skips even when attrs drift.
+        let mut dst = entry("a.txt", 10, 100, None);
+        dst.mode = 0o600;
+        dst.mtime_sec = 200; // newer than the source (100)
+        let src = manifest(vec![entry("a.txt", 10, 100, None)]);
+        let dst_manifest = manifest(vec![dst]);
+        for update in [false, true] {
+            let plan = Planner::new(PlannerConfig {
+                update_only: update,
+                ignore_existing: !update,
+                ..PlannerConfig::default()
+            })
+            .plan(&src, &dst_manifest);
+            assert!(
+                plan.meta.is_empty(),
+                "flag-forced skip must not become a meta update (update_only={update}): {plan:?}"
+            );
+            assert_eq!(plan.skips.len(), 1);
+        }
     }
 
     #[test]

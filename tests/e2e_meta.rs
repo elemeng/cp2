@@ -543,3 +543,192 @@ async fn metadata_only_update_applies_drifted_mode() {
         assert_eq!(stats.files_sent, 0, "unchanged run must not re-apply");
     }
 }
+
+#[tokio::test]
+async fn backup_on_pull_keeps_previous_version() {
+    // The pull receiver is the client: --backup must keep the replaced file
+    // as <name>~ there too, not only on push.
+    let serve = tempfile::tempdir().unwrap();
+    let restore = tempfile::tempdir().unwrap();
+    tokio::fs::write(serve.path().join("keep.txt"), b"v2-longer")
+        .await
+        .unwrap();
+    tokio::fs::write(restore.path().join("keep.txt"), b"v1")
+        .await
+        .unwrap();
+
+    let mut options = default_options();
+    options.backup = true;
+    pull_tree(serve.path(), restore.path(), &options).await;
+    assert_eq!(
+        std::fs::read(restore.path().join("keep.txt")).unwrap(),
+        b"v2-longer"
+    );
+    assert_eq!(
+        std::fs::read(restore.path().join("keep.txt~")).unwrap(),
+        b"v1",
+        "--backup must keep the previous version on pull"
+    );
+}
+
+#[tokio::test]
+async fn verify_on_pull_hashes_the_received_bytes() {
+    // On pull the *server* is the sender: --verify must ride its argv so the
+    // IndexRequest asks the client receiver to hash every applied file
+    // (remove-source-files relies on the same wiring).
+    let serve = tempfile::tempdir().unwrap();
+    let restore = tempfile::tempdir().unwrap();
+    let data = pseudo_random(3 * 1024 * 1024);
+    tokio::fs::write(serve.path().join("big.bin"), &data)
+        .await
+        .unwrap();
+
+    let mut options = default_options();
+    options.verify = true;
+    let (mut child, send, recv) = spawn_server_with_args(serve.path(), &["--verify"]);
+    let mut executor = Executor::new(send, recv);
+    let stats = executor
+        .pull(restore.path(), &options)
+        .await
+        .expect("verified pull failed");
+    drop(executor);
+    let exit_status = child.wait().await.expect("wait server");
+    assert!(exit_status.success(), "server exited with {exit_status}");
+    assert_eq!(stats.files_received, 1);
+    assert_eq!(
+        std::fs::read(restore.path().join("big.bin")).unwrap(),
+        data
+    );
+}
+
+#[tokio::test]
+async fn max_delete_on_pull_aborts_excess() {
+    // The pull receiver is the client: --max-delete must be enforced by the
+    // delete-executing side there too (on push that's the server receiver).
+    let serve = tempfile::tempdir().unwrap();
+    let restore = tempfile::tempdir().unwrap();
+    tokio::fs::write(serve.path().join("keep.txt"), b"keep")
+        .await
+        .unwrap();
+    // Restore side carries five stale extras the pull would delete.
+    for i in 0..5 {
+        tokio::fs::write(restore.path().join(format!("stale{i}.txt")), b"s")
+            .await
+            .unwrap();
+    }
+
+    let mut options = default_options();
+    options.delete = true;
+    options.max_delete = Some(2);
+    let (mut child, send, recv) = spawn_server(serve.path());
+    let mut executor = Executor::new(send, recv);
+    let err = executor.pull(restore.path(), &options).await.unwrap_err();
+    drop(executor);
+    let _ = child.wait().await;
+    assert!(
+        err.to_string().contains("max-delete"),
+        "expected max-delete error, got: {err}"
+    );
+    // The abort came before any deletion.
+    for i in 0..5 {
+        assert!(restore.path().join(format!("stale{i}.txt")).exists());
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn no_times_on_pull_leaves_transfer_time() {
+    // rlpt opt-out on the pull: the restore mtime must be the transfer time,
+    // not the source's ancient value (server sender scans with --no-times,
+    // client receiver applies no mtime).
+    let serve = tempfile::tempdir().unwrap();
+    let restore = tempfile::tempdir().unwrap();
+    tokio::fs::write(serve.path().join("f.txt"), b"x")
+        .await
+        .unwrap();
+    set_file_mtime_ns(&serve.path().join("f.txt"), 1_000_000, 0);
+
+    let mut options = default_options();
+    options.preserve_times = false;
+    let (mut child, send, recv) = spawn_server_with_args(serve.path(), &["--no-times"]);
+    let mut executor = Executor::new(send, recv);
+    executor
+        .pull(restore.path(), &options)
+        .await
+        .expect("pull failed");
+    drop(executor);
+    let _ = child.wait().await;
+    let restored = std::fs::metadata(restore.path().join("f.txt")).unwrap();
+    assert!(
+        restored.modified().unwrap() > std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000),
+        "--no-times must leave the transfer time, not the source mtime"
+    );
+}
+
+#[tokio::test]
+async fn no_recursive_on_pull_skips_subdirectories() {
+    let serve = tempfile::tempdir().unwrap();
+    let restore = tempfile::tempdir().unwrap();
+    tokio::fs::create_dir(serve.path().join("sub")).await.unwrap();
+    tokio::fs::write(serve.path().join("sub/inner.txt"), b"i")
+        .await
+        .unwrap();
+    tokio::fs::write(serve.path().join("top.txt"), b"t")
+        .await
+        .unwrap();
+
+    let mut options = default_options();
+    options.recursive = false;
+    let (mut child, send, recv) = spawn_server_with_args(serve.path(), &["--no-recursive"]);
+    let mut executor = Executor::new(send, recv);
+    executor
+        .pull(restore.path(), &options)
+        .await
+        .expect("pull failed");
+    drop(executor);
+    let _ = child.wait().await;
+    assert_eq!(
+        std::fs::read(restore.path().join("top.txt")).unwrap(),
+        b"t"
+    );
+    assert!(
+        !restore.path().join("sub/inner.txt").exists(),
+        "--no-recursive must skip the subdirectory on pull"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn archive_on_pull_creates_special_files() {
+    use std::os::unix::fs::FileTypeExt;
+    // The pull *sender* is the server: it must scan-and-send specials only
+    // when its own argv carries --archive; the client receiver creates them.
+    let serve = tempfile::tempdir().unwrap();
+    let restore = tempfile::tempdir().unwrap();
+    std::fs::File::create(serve.path().join("fifo")).unwrap();
+    std::fs::remove_file(serve.path().join("fifo")).unwrap();
+    unsafe {
+        libc::mkfifo(
+            std::ffi::CString::new(serve.path().join("fifo").to_str().unwrap().as_bytes())
+                .unwrap()
+                .as_ptr(),
+            0o600,
+        );
+    }
+
+    let mut options = default_options();
+    options.archive = true;
+    let (mut child, send, recv) = spawn_server_with_args(serve.path(), &["--archive"]);
+    let mut executor = Executor::new(send, recv);
+    executor
+        .pull(restore.path(), &options)
+        .await
+        .expect("pull failed");
+    drop(executor);
+    let _ = child.wait().await;
+    let meta = std::fs::symlink_metadata(restore.path().join("fifo")).unwrap();
+    assert!(
+        meta.file_type().is_fifo(),
+        "-a on a pull must recreate the fifo"
+    );
+}

@@ -742,3 +742,244 @@ async fn multi_batch_push_verify_acks_every_batch() {
     }
     assert_eq!(landed, 200);
 }
+
+#[tokio::test]
+async fn update_skips_newer_destination_on_push_and_pull() {
+    // rsync -u: a destination file newer than the source is left alone —
+    // content *and* mtime (a metadata-only pass must not rewind it). The
+    // decision flag rides the PullRequest frame, so the pull direction
+    // (server-side planner) must honor it too.
+    let src = tempfile::tempdir().unwrap();
+    let dst = tempfile::tempdir().unwrap();
+    tokio::fs::write(src.path().join("f.txt"), b"v1-src")
+        .await
+        .unwrap();
+    tokio::fs::write(dst.path().join("f.txt"), b"v2-dst")
+        .await
+        .unwrap();
+    set_future_mtime(&dst.path().join("f.txt"));
+
+    let mut options = default_options();
+    options.update_only = true;
+    let stats = push_tree(src.path(), dst.path(), &options).await;
+    assert_eq!(stats.files_sent, 0, "newer destination must be skipped");
+    assert_eq!(std::fs::read(dst.path().join("f.txt")).unwrap(), b"v2-dst");
+    assert!(
+        std::fs::metadata(dst.path().join("f.txt"))
+            .unwrap()
+            .modified()
+            .unwrap()
+            > std::fs::metadata(src.path().join("f.txt"))
+                .unwrap()
+                .modified()
+                .unwrap(),
+        "-u must not rewind the newer destination's mtime"
+    );
+
+    let serve = tempfile::tempdir().unwrap();
+    let restore = tempfile::tempdir().unwrap();
+    tokio::fs::write(serve.path().join("f.txt"), b"v1-src")
+        .await
+        .unwrap();
+    tokio::fs::write(restore.path().join("f.txt"), b"v2-restore")
+        .await
+        .unwrap();
+    set_future_mtime(&restore.path().join("f.txt"));
+    let stats = pull_tree(serve.path(), restore.path(), &options).await;
+    assert_eq!(stats.files_received, 0, "newer restore file must be skipped");
+    assert_eq!(
+        std::fs::read(restore.path().join("f.txt")).unwrap(),
+        b"v2-restore"
+    );
+    assert!(
+        std::fs::metadata(restore.path().join("f.txt"))
+            .unwrap()
+            .modified()
+            .unwrap()
+            > std::fs::metadata(serve.path().join("f.txt"))
+                .unwrap()
+                .modified()
+                .unwrap(),
+        "-u on pull must not rewind the newer restore mtime"
+    );
+}
+
+#[tokio::test]
+async fn existing_only_updates_present_files_on_push_and_pull() {
+    // rsync --existing: files already present are updated, missing ones are
+    // not created — symmetric across directions.
+    let src = tempfile::tempdir().unwrap();
+    let dst = tempfile::tempdir().unwrap();
+    tokio::fs::write(src.path().join("a.txt"), b"new-a")
+        .await
+        .unwrap();
+    tokio::fs::write(src.path().join("b.txt"), b"new-b")
+        .await
+        .unwrap();
+    // Different size (not a same-second equal-size coincidence — the quick
+    // check must see a genuine update).
+    tokio::fs::write(dst.path().join("a.txt"), b"old")
+        .await
+        .unwrap();
+
+    let mut options = default_options();
+    options.existing = true;
+    let stats = push_tree(src.path(), dst.path(), &options).await;
+    assert_eq!(stats.files_sent, 1, "only the present file transfers");
+    assert_eq!(std::fs::read(dst.path().join("a.txt")).unwrap(), b"new-a");
+    assert!(
+        !dst.path().join("b.txt").exists(),
+        "--existing must not create b.txt"
+    );
+
+    let serve = tempfile::tempdir().unwrap();
+    let restore = tempfile::tempdir().unwrap();
+    tokio::fs::write(serve.path().join("a.txt"), b"new-a")
+        .await
+        .unwrap();
+    tokio::fs::write(serve.path().join("b.txt"), b"new-b")
+        .await
+        .unwrap();
+    tokio::fs::write(restore.path().join("a.txt"), b"old")
+        .await
+        .unwrap();
+    let stats = pull_tree(serve.path(), restore.path(), &options).await;
+    assert_eq!(stats.files_received, 1, "only the present file transfers");
+    assert_eq!(
+        std::fs::read(restore.path().join("a.txt")).unwrap(),
+        b"new-a"
+    );
+    assert!(
+        !restore.path().join("b.txt").exists(),
+        "--existing must not create b.txt"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn ignore_times_forces_equal_time_size_transfer_on_push_and_pull() {
+    // Same size AND same mtime, different content: the quick check calls it
+    // in sync; --ignore-times forces the transfer regardless. On pull the
+    // flag rides the frame to the server-side planner.
+    let data1 = pseudo_random(4096);
+    let mut data2 = data1.clone();
+    data2[100] ^= 0xFF;
+
+    let src = tempfile::tempdir().unwrap();
+    let dst = tempfile::tempdir().unwrap();
+    tokio::fs::write(src.path().join("f.bin"), &data2).await.unwrap();
+    tokio::fs::write(dst.path().join("f.bin"), &data1).await.unwrap();
+    set_file_mtime_ns(&src.path().join("f.bin"), 1_700_000_000, 0);
+    set_file_mtime_ns(&dst.path().join("f.bin"), 1_700_000_000, 0);
+
+    let mut options = default_options();
+    options.ignore_times = true;
+    push_tree(src.path(), dst.path(), &options).await;
+    assert_eq!(
+        std::fs::read(dst.path().join("f.bin")).unwrap(),
+        data2,
+        "--ignore-times must re-send the equal-mtime/size file"
+    );
+
+    let serve = tempfile::tempdir().unwrap();
+    let restore = tempfile::tempdir().unwrap();
+    tokio::fs::write(serve.path().join("f.bin"), &data2).await.unwrap();
+    tokio::fs::write(restore.path().join("f.bin"), &data1).await.unwrap();
+    set_file_mtime_ns(&serve.path().join("f.bin"), 1_700_000_000, 0);
+    set_file_mtime_ns(&restore.path().join("f.bin"), 1_700_000_000, 0);
+    pull_tree(serve.path(), restore.path(), &options).await;
+    assert_eq!(std::fs::read(restore.path().join("f.bin")).unwrap(), data2);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn checksum_catches_equal_time_size_tamper_on_push_and_pull() {
+    // Same size + same mtime, different content: the size+mtime quick check
+    // skips (control run leaves the stale bytes), --checksum re-hashes and
+    // repairs. Both directions — the flag rides the pull frame.
+    let data1 = pseudo_random(4096);
+    let mut data2 = data1.clone();
+    data2[200] ^= 0xAA;
+
+    let src = tempfile::tempdir().unwrap();
+    let dst = tempfile::tempdir().unwrap();
+    tokio::fs::write(src.path().join("f.bin"), &data2).await.unwrap();
+    tokio::fs::write(dst.path().join("f.bin"), &data1).await.unwrap();
+    set_file_mtime_ns(&src.path().join("f.bin"), 1_700_000_000, 0);
+    set_file_mtime_ns(&dst.path().join("f.bin"), 1_700_000_000, 0);
+
+    // Control: without -c the equal quick check skips, leaving the stale bytes.
+    push_tree(src.path(), dst.path(), &default_options()).await;
+    assert_eq!(
+        std::fs::read(dst.path().join("f.bin")).unwrap(),
+        data1,
+        "size+mtime quick check must skip the tampered file"
+    );
+    let mut options = default_options();
+    options.checksum = true;
+    push_tree(src.path(), dst.path(), &options).await;
+    assert_eq!(std::fs::read(dst.path().join("f.bin")).unwrap(), data2);
+
+    // Pull side, same shape.
+    let serve = tempfile::tempdir().unwrap();
+    let restore = tempfile::tempdir().unwrap();
+    tokio::fs::write(serve.path().join("f.bin"), &data2).await.unwrap();
+    tokio::fs::write(restore.path().join("f.bin"), &data1).await.unwrap();
+    set_file_mtime_ns(&serve.path().join("f.bin"), 1_700_000_000, 0);
+    set_file_mtime_ns(&restore.path().join("f.bin"), 1_700_000_000, 0);
+    pull_tree(serve.path(), restore.path(), &default_options()).await;
+    assert_eq!(
+        std::fs::read(restore.path().join("f.bin")).unwrap(),
+        data1,
+        "pull quick check must skip too"
+    );
+    pull_tree(serve.path(), restore.path(), &options).await;
+    assert_eq!(std::fs::read(restore.path().join("f.bin")).unwrap(), data2);
+}
+
+#[tokio::test]
+async fn compressed_pull_roundtrips() {
+    // On a pull the *server* is the sender and must compress because the
+    // client asked (the flag rides the PullRequest frame), the client
+    // receiver decompresses the self-describing frames.
+    let serve = tempfile::tempdir().unwrap();
+    let restore = tempfile::tempdir().unwrap();
+    let data = vec![0x42u8; 512 * 1024];
+    tokio::fs::write(serve.path().join("zeros.bin"), &data)
+        .await
+        .unwrap();
+    let mut options = default_options();
+    options.compress = true;
+    pull_tree(serve.path(), restore.path(), &options).await;
+    assert_eq!(
+        std::fs::read(restore.path().join("zeros.bin")).unwrap(),
+        data
+    );
+}
+
+#[tokio::test]
+async fn bwlimit_pull_throttles_the_wire() {
+    // The bandwidth cap rides the PullRequest frame to the server-side
+    // sender. A 4 MiB file at a 1 MiB/s cap cannot finish instantly; the
+    // lower-bound assertion can only flake in one direction (catching a
+    // limiter that never engaged).
+    let serve = tempfile::tempdir().unwrap();
+    let restore = tempfile::tempdir().unwrap();
+    let data = pseudo_random(4 * 1024 * 1024);
+    tokio::fs::write(serve.path().join("big.bin"), &data)
+        .await
+        .unwrap();
+    let mut options = default_options();
+    options.bwlimit = Some(1024 * 1024);
+    let start = std::time::Instant::now();
+    pull_tree(serve.path(), restore.path(), &options).await;
+    let elapsed = start.elapsed();
+    assert_eq!(
+        std::fs::read(restore.path().join("big.bin")).unwrap(),
+        data
+    );
+    assert!(
+        elapsed >= std::time::Duration::from_secs(3),
+        "pull finished in {elapsed:?} — the bwlimit on the pull sender did not engage"
+    );
+}
