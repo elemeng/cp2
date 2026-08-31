@@ -168,7 +168,12 @@ async fn remove_source_files_keeps_receiver_skipped_sources() {
     // still removed.
     let src = tempfile::tempdir().unwrap();
     let dst = tempfile::tempdir().unwrap();
-    let long_name = "y".repeat(240);
+    // 244 chars: the staged form `.y…y.cp2.{pid}.{counter}.tmp` (+12+pid+
+    // counter) then exceeds the 255-byte/UTF-16 per-component limit on every
+    // OS regardless of pid width, while the plain source name stays under it.
+    // The previous 240 left the skip dependent on pid width (252+pid ≤ 255
+    // for short pids), failing intermittently on the Linux CI runner.
+    let long_name = "y".repeat(244);
     tokio::fs::write(src.path().join(&long_name), vec![0xCD; 64])
         .await
         .unwrap();

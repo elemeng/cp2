@@ -296,7 +296,12 @@ async fn long_path_skipped_not_fatal() {
     let src = tempfile::tempdir().unwrap();
     let dst = tempfile::tempdir().unwrap();
 
-    let long_name = "y".repeat(240);
+    // 244 chars: the staged temp (`.y…y.cp2.{pid}.{counter}.tmp`, +12+pid+
+    // counter) exceeds the 255-byte/UTF-16 per-component limit on every OS
+    // regardless of pid width, while the plain source name stays under it
+    // (240 left the skip dependent on pid width — a short pid fit under
+    // NAME_MAX on the Linux CI runner).
+    let long_name = "y".repeat(244);
     tokio::fs::write(src.path().join(&long_name), vec![0xCD; 64])
         .await
         .unwrap();
