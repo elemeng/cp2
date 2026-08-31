@@ -250,6 +250,7 @@ fn install_prepared_path(prepared_path: &Path, final_path: &Path, backup: bool) 
 /// Clear the read-only attribute on `path` so the file can be replaced by a
 /// rename (Windows only; see `install_prepared_path`).
 #[cfg(windows)]
+#[allow(clippy::permissions_set_readonly_false)]
 fn clear_readonly_attribute(path: &Path) -> io::Result<()> {
     let mut perms = std::fs::metadata(path)?.permissions();
     if perms.readonly() {

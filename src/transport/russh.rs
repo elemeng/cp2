@@ -1070,7 +1070,7 @@ async fn exec_capture(
                 };
                 match msg {
                     ChannelMsg::Data { data } => stdout.extend_from_slice(&data),
-                    ChannelMsg::ExtendedData { data, ext } if ext == 1 => {
+                    ChannelMsg::ExtendedData { data, ext: 1 } => {
                         stderr.extend_from_slice(&data);
                     }
                     ChannelMsg::ExitStatus { exit_status } => code = Some(exit_status),
@@ -1153,14 +1153,13 @@ pub(crate) async fn check_version_on(
     sudo: Sudo,
     sudo_password: Option<&str>,
 ) -> anyhow::Result<Option<(String, Option<String>)>> {
-    let mut command = match remote_os {
-        "windows" => remote_command(remote_os, &format!("{remote_path} --version")),
+    let mut command = if remote_os == "windows" {
+        remote_command(remote_os, &format!("{remote_path} --version"))
+    } else {
         // POSIX branch: quote the user-supplied path so shell metacharacters
         // in `--remote-path` cannot inject into the remote command.
-        _ => {
-            let path = sh_quote(remote_path);
-            format!("test -x {path} && {path} --version")
-        }
+        let path = sh_quote(remote_path);
+        format!("test -x {path} && {path} --version")
     };
     let stdin_payload = match sudo {
         Sudo::NonInteractive => {
@@ -1354,8 +1353,7 @@ pub(crate) async fn open_preamble_on(
                 eof_trigger: Some(eof_tx),
             },
         ))),
-        Ok(None) => Ok(None),
-        Err(_) => Ok(None),
+        Ok(None) | Err(_) => Ok(None),
     }
 }
 

@@ -12,7 +12,7 @@
 //! Detection per platform: Linux reads `/sys/dev/block/<maj>:<min>/queue/
 //! rotational` (device-mapper/md/loop aggregates via `slaves/`); Windows
 //! queries `IOCTL_STORAGE_QUERY_PROPERTY` (seek-penalty) on the path's
-//! volume handle — no admin rights or PowerShell needed; macOS shells out to
+//! volume handle — no admin rights or `PowerShell` needed; macOS shells out to
 //! Apple's `diskutil info` (`Solid State` field). Other platforms report
 //! `Unknown`.
 
@@ -178,6 +178,7 @@ use windows_sys::Win32::Foundation::HANDLE;
 /// path without a local volume, permissions, exotic filesystems) →
 /// [`StorageClass::Unknown`].
 #[cfg(target_os = "windows")]
+#[allow(clippy::cast_possible_truncation)]
 fn detect_storage_windows(path: &Path) -> StorageClass {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
@@ -250,6 +251,7 @@ fn detect_storage_windows(path: &Path) -> StorageClass {
 /// (`true` = rotating disk, `false` = SSD/NVMe) via
 /// `IOCTL_STORAGE_QUERY_PROPERTY` / `StorageDeviceSeekPenaltyProperty`.
 #[cfg(target_os = "windows")]
+#[allow(clippy::cast_possible_truncation)]
 fn query_seek_penalty(handle: HANDLE) -> Option<bool> {
     use windows_sys::Win32::System::IO::DeviceIoControl;
     use windows_sys::Win32::System::Ioctl::{
@@ -271,11 +273,11 @@ fn query_seek_penalty(handle: HANDLE) -> Option<bool> {
         DeviceIoControl(
             handle,
             IOCTL_STORAGE_QUERY_PROPERTY,
-            &raw const query as *const _ as *const core::ffi::c_void,
+            (&raw const query).cast::<core::ffi::c_void>(),
             core::mem::size_of::<STORAGE_PROPERTY_QUERY>() as u32,
-            &raw mut descriptor as *mut _ as *mut core::ffi::c_void,
+            (&raw mut descriptor).cast::<core::ffi::c_void>(),
             core::mem::size_of::<DEVICE_SEEK_PENALTY_DESCRIPTOR>() as u32,
-            &mut bytes_returned,
+            &raw mut bytes_returned,
             std::ptr::null_mut(),
         )
     };

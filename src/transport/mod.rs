@@ -1016,6 +1016,7 @@ pub struct PreambleSession {
 }
 
 /// Transport-specific session teardown state.
+#[allow(clippy::large_enum_variant)]
 pub enum SessionHandle {
     /// The spawned `ssh` process.
     Ssh(tokio::process::Child),

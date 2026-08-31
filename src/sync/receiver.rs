@@ -1871,9 +1871,7 @@ mod tests {
         }
         #[cfg(not(unix))]
         {
-            let secs = u64::try_from(mtime).expect("mtime must be non-negative");
-            let time =
-                std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs);
+            let time = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(mtime);
             std::fs::File::options()
                 .write(true)
                 .open(path)

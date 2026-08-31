@@ -1194,15 +1194,15 @@ pub async fn push_remote_binary_and_serve(
     Ok((child, stdin, stdout))
 }
 
-/// The Windows deploy command: PowerShell creates the parent directory,
+/// The Windows deploy command: `PowerShell` creates the parent directory,
 /// writes the base64 stdin to a temp file (`cp2-$PID.b64` — unique per
 /// deploy, so concurrent runs do not collide on a shared name and a dead
 /// session leaves no misleading fixed-name litter), `certutil -decode`
 /// decodes it into place, and the temp is removed. Wrapped in `cmd /c` so
 /// `%USERPROFILE%` in the path expands under either default shell.
 ///
-/// The path is embedded in PowerShell single quotes, which is *not* shell
-/// escaping: `remote_path` must not contain a `'` (the PowerShell string
+/// The path is embedded in `PowerShell` single quotes, which is *not* shell
+/// escaping: `remote_path` must not contain a `'` (the `PowerShell` string
 /// delimiter) or a `"` (the surrounding `cmd` quoting) — the CLI documents
 /// this constraint for `--remote-path` on Windows remotes.
 pub(crate) fn windows_push_command(remote_path: &str) -> String {

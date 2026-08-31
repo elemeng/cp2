@@ -71,6 +71,7 @@ pub fn remove_file_any(path: &Path) -> io::Result<()> {
                 // The read-only attribute blocks deletion on Windows.
                 if let Ok(meta) = std::fs::metadata(path) {
                     let mut perms = meta.permissions();
+                    #[allow(clippy::permissions_set_readonly_false)]
                     perms.set_readonly(false);
                     let _ = std::fs::set_permissions(path, perms);
                 }
@@ -157,6 +158,7 @@ pub(crate) fn atime_nsecs(meta: &std::fs::Metadata) -> u32 {
 ///
 /// Returns an I/O error when the chown fails (EPERM as a non-root receiver,
 /// EPERM/EACCES on a read-only filesystem, ...).
+#[allow(clippy::unnecessary_wraps)]
 pub(crate) fn apply_owner(
     path: &Path,
     uid: Option<u32>,
@@ -445,6 +447,7 @@ fn apply_mode(path: &Path, mode: u32, is_symlink: bool) -> io::Result<()> {
 }
 
 #[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps)]
 fn apply_mode(_path: &Path, _mode: u32, _is_symlink: bool) -> io::Result<()> {
     Ok(())
 }

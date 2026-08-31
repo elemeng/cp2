@@ -1,4 +1,7 @@
 mod common;
+// Every test in this file is `#[cfg(unix)]`, so on Windows the helpers
+// re-exported by `common` are unused.
+#[allow(unused_imports)]
 use common::*;
 
 #[cfg(unix)]
