@@ -626,10 +626,7 @@ fn apply_times(
     // `filetime` crate uses), so directory mtimes are preserved on all
     // platforms instead of only Unix.
     #[cfg(windows)]
-    if std::fs::symlink_metadata(path)
-        .map(|m| m.is_dir())
-        .unwrap_or(false)
-    {
+    if std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir()) {
         use std::os::windows::fs::OpenOptionsExt;
         const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
         let dir = OpenOptions::new()

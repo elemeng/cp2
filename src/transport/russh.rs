@@ -74,7 +74,7 @@ impl client::Handler for ClientHandler {
         &mut self,
         server_public_key: &ssh_key::PublicKey,
     ) -> Result<bool, Self::Error> {
-        host_key_ok(&self.host, self.port, server_public_key)
+        std::future::ready(host_key_ok(&self.host, self.port, server_public_key)).await
     }
 
     async fn auth_banner(
@@ -87,7 +87,7 @@ impl client::Handler for ClientHandler {
             let _ = stderr.write_all(banner.as_bytes());
             let _ = stderr.flush();
         }
-        Ok(())
+        std::future::ready(Ok(())).await
     }
 }
 
@@ -321,12 +321,10 @@ fn sha1(data: &[u8]) -> [u8; 20] {
         0x1032_5476,
         0xC3D2_E1F0,
     ];
-    let mut chunks = data.chunks_exact(64);
-    for block in &mut chunks {
-        let block: &[u8; 64] = block.try_into().unwrap();
+    let (blocks, rem_bytes) = data.as_chunks::<64>();
+    for block in blocks {
         sha1_compress(&mut state, block);
     }
-    let rem_bytes = chunks.remainder();
     let rem = rem_bytes.len();
     let bit_len = u64::try_from(data.len())
         .unwrap_or(u64::MAX)
@@ -344,7 +342,8 @@ fn sha1(data: &[u8]) -> [u8; 20] {
         sha1_compress(&mut state, &tail);
     }
     let mut digest = [0u8; 20];
-    for (word, slot) in state.iter().zip(digest.chunks_exact_mut(4)) {
+    let (digest_words, _) = digest.as_chunks_mut::<4>();
+    for (word, slot) in state.iter().zip(digest_words) {
         slot.copy_from_slice(&word.to_be_bytes());
     }
     digest
@@ -354,8 +353,9 @@ fn sha1(data: &[u8]) -> [u8; 20] {
 /// state.
 fn sha1_compress(state: &mut [u32; 5], block: &[u8; 64]) {
     let mut words = [0u32; 80];
-    for (word, bytes) in words[..16].iter_mut().zip(block.chunks_exact(4)) {
-        *word = u32::from_be_bytes(bytes.try_into().unwrap());
+    let (word_bytes, _) = block.as_chunks::<4>();
+    for (word, bytes) in words[..16].iter_mut().zip(word_bytes) {
+        *word = u32::from_be_bytes(*bytes);
     }
     for idx in 16..80 {
         words[idx] = (words[idx - 3] ^ words[idx - 8] ^ words[idx - 14] ^ words[idx - 16])
@@ -1499,5 +1499,54 @@ impl AsyncRead for RxBytes {
         buf.put_slice(&self.current[..n]);
         self.current = self.current.slice(n..);
         Poll::Ready(Ok(()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Decode a fixed 40-hex-char string into a `[u8; 20]`.
+    fn unhex(s: &str) -> [u8; 20] {
+        assert_eq!(s.len(), 40);
+        let mut out = [0u8; 20];
+        for (i, byte) in out.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).unwrap();
+        }
+        out
+    }
+
+    #[test]
+    fn sha1_known_vectors() {
+        assert_eq!(
+            sha1(b""),
+            unhex("da39a3ee5e6b4b0d3255bfef95601890afd80709")
+        );
+        assert_eq!(
+            sha1(b"abc"),
+            unhex("a9993e364706816aba3e25717850c26c9cd0d89d")
+        );
+        // 60 bytes: the final block overflows 56, exercising the two-block
+        // tail branch of `sha1`.
+        assert_eq!(
+            sha1(&[b'a'; 60]),
+            unhex("13d956033d9af449bfe2c4ef78c17c20469c4bf1")
+        );
+    }
+
+    #[test]
+    fn hmac_sha1_rfc2202_case1() {
+        // RFC 2202 test case 1: key = 0x0b × 20, data = "Hi There".
+        let key = [0x0bu8; 20];
+        assert!(hmac_sha1_verify(
+            &key,
+            &unhex("b617318655057264e28bc0b6fb378c8ef146be00"),
+            b"Hi There"
+        ));
+        assert!(!hmac_sha1_verify(
+            &key,
+            &unhex("b617318655057264e28bc0b6fb378c8ef146be00"),
+            b"Hi Therf"
+        ));
     }
 }
