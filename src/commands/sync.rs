@@ -1223,7 +1223,10 @@ async fn deploy_remote_binary(
 /// flow (the platform was read from the in-band preamble, the session is
 /// ready for the executor) or the classic two-session resolution (probe,
 /// then open the session as usual).
-#[expect(clippy::large_enum_variant, reason = "Merged carries the opened Session by design")]
+// The Merged variant carries the opened Session by design; the size ratio
+// crosses the lint's threshold only on some platforms (not macOS), so an
+// allow keeps every OS clean.
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum Ensured {
     /// One ssh session carrying the platform preamble and the sync; a
     /// stale/missing server binary is recovered by a deploy and one retry.

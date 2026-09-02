@@ -497,6 +497,7 @@ pub fn create_special(
                         ))
                     }
                 };
+                #[allow(clippy::cast_possible_truncation)]
                 libc::mknod(
                     cpath.as_ptr(),
                     type_bit | libc::mode_t::try_from(mode & 0o777).expect("mode fits mode_t"),
