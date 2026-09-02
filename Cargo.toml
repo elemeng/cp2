@@ -29,6 +29,13 @@ path = "src/lib.rs"
 name = "cp2"
 path = "src/main.rs"
 
+# The Windows setup helper (one-window GUI: check/enable the OpenSSH Server
+# feature + firewall rule). Lives outside `src/` so the build.rs source
+# fingerprint (and with it the wire Hello) stays untouched by GUI edits.
+[[bin]]
+name = "cp2-setup"
+path = "setup/main.rs"
+
 [dependencies]
 tokio = { version = "1.53", features = ["rt-multi-thread", "fs", "io-util", "io-std", "macros", "sync", "time", "process", "signal", "net"] }
 libc = "0.2"
@@ -73,6 +80,15 @@ windows-sys = { version = "0.61", features = [
     "Win32_Storage_FileSystem",
     "Win32_System_IO",
     "Win32_System_Ioctl",
+    # The cp2-setup GUI helper (setup/main.rs).
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Controls",
+    "Win32_UI_Shell",
+    "Win32_UI_HiDpi",
+    "Win32_Graphics_Gdi",
+    "Win32_Security",
+    "Win32_System_Threading",
+    "Win32_System_LibraryLoader",
 ] }
 # The russh transport (pure-Rust SSH client) replaces the system `ssh`
 # process on Windows, where OpenSSH's ControlMaster multiplexing is broken
