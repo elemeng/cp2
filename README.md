@@ -4,18 +4,25 @@
 [![docs.rs](https://docs.rs/cp2/badge.svg)](https://docs.rs/cp2)
 [![License](https://img.shields.io/crates/l/cp2.svg)](https://crates.io/crates/cp2)
 
-**Copy and sync files locally or between machines — ultra fast, verified,
-private, and is very easy to setup.**
+**Copy and sync files locally or between machines — ultra fast, verifiable,
+private, and very easy to set up.**
 
 cp2 is a modern `cp`/`rsync`-style tool in one pure-Rust binary for **Linux**,
 **macOS**, and **Windows**. It sends only the bytes that actually changed,
-verifies what it writes, and watches folders in realtime; a same-platform
-remote needs nothing installed — the first sync deploys cp2 there
-automatically.
+verifies what it writes, and watches folders in realtime; a same-platform 
+remote needs nothing installed — the first sync automatically deploys cp2 there
+(if libc is compatible).
 
 - **Install:** one binary, or `cargo install cp2`
 - **First sync:** `cp2 ./photos user@server:backup`
 - **Watch mode (sync in realtime):** `cp2 -W ./photos user@server:backup`
+
+> **Status:** cp2 started as a personal tool to copy and sync files between a
+> Windows laptop, a Linux workstation, and a Mac. It is under active
+> development — it works pretty well for everyday use, but bugs may remain,
+> and its developers and contributors cannot guarantee the safety of your
+> data. Back up what matters, and run a dry run (`cp2 -n`) before your first
+> real sync.
 
 ## Contents
 
@@ -164,7 +171,7 @@ cp2 --verify --remove-source-files /data user@host:storage
 ```
 
 Source files are deleted only after the destination is hash-verified and
-fsynced — safe for clearing an instrument's storage.
+fsynced — made for clearing an instrument's storage.
 
 ### Sync only what matches
 
@@ -376,6 +383,7 @@ source headers, and their retained copyright lines live in
 | pxs | BSD-3-Clause | Staged-file sink / atomic commit (adapted, `src/platform/staging.rs`) |
 | librsync | MIT/Apache-2.0 | Delta-algorithm background (studied) |
 | rusync | BSD-3-Clause | rsync-style CLI/protocol study |
+| ripsync | MIT/Apache-2.0 | rsync protocol study |
 | zsync-rs | MIT | rsync-compatible delta study |
 | msy | MIT | Sync-pipeline study |
 | syncz | MIT | Sync-protocol study |
