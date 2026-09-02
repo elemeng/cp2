@@ -5,7 +5,7 @@
 [![License](https://img.shields.io/crates/l/cp2.svg)](https://crates.io/crates/cp2)
 
 **Copy and sync files locally or between machines — ultra fast, verified,
-private, and with zero server setup.**
+private, and is very easy to setup.**
 
 cp2 is a modern `cp`/`rsync`-style tool in one pure-Rust binary for **Linux**,
 **macOS**, and **Windows**. It sends only the bytes that actually changed,
@@ -103,6 +103,11 @@ cp2 -W ./photos user@server:backup
 
 Your existing SSH credentials are used as-is (key, agent, or password);
 everything on the remote runs as *your* account.
+
+The remote must run an SSH server (sshd) — on Linux and macOS it usually
+already does; on Windows it is the optional **OpenSSH Server** feature:
+enable it once and allow its port through the firewall. cp2's auto-deploy
+installs the cp2 binary on the remote, not the SSH server itself.
 
 ## Why cp2?
 
@@ -212,12 +217,15 @@ syncs as a top-level entry of one run:
 cp2 './src/*.rs' user@host:backup      # backup/a.rs, backup/b.rs
 cp2 'src/**/x.rs' ./restore            # restore/a/x.rs (structure under src kept)
 cp2 './*' user@host:backup --exclude target
+cp2 'user@host:data/*.iso' ./restore   # a pull glob expands on the server
 ```
 
-Only local sources expand (remote-side expansion isn't supported); a path
-that literally exists is never treated as a pattern; and the wildcard
-matches dotfiles like rsync's (use `--exclude` to drop `.git`, `target`,
-...). `--watch` needs a single directory source, not a glob.
+A quoted glob expands on either side: a local source is expanded by cp2
+before the sync, a remote source (`user@host:data/*.iso`) by the server
+during the pull. A path that literally exists is never treated as a
+pattern; and the wildcard matches dotfiles like rsync's (use `--exclude`
+to drop `.git`, `target`, ...). `--watch` needs a single directory
+source, not a glob.
 
 ### File lists
 
@@ -234,10 +242,12 @@ cp2 --files-from manifests/microscopy.txt user@host:backup
 
 One absolute path per line — Unix and Windows line endings both work, blank
 lines are skipped, and paths may contain spaces. Entries may be files or
-directories (directories recurse), and each file syncs exactly once; missing
-entries are warned about and skipped. Local entries only. With `--delete`,
-only destination content under the listed paths is removed (rsync scope) —
-files sitting next to them are left alone.
+directories (directories recurse), and each file syncs exactly once. The
+list is read on the machine you run cp2 on: for a push the entries are
+local absolute paths (missing entries are warned about and skipped); for a
+pull they are absolute paths on the server, scanned and mirrored from
+there. With `--delete`, only destination content under the listed paths is
+removed (rsync scope) — files sitting next to them are left alone.
 
 ## Defaults
 

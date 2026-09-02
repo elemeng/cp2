@@ -82,9 +82,9 @@ pub async fn execute(cli: &mut Cli) -> Result<()> {
 
     // A directory source can expand into several top-level entries of one
     // run: a quoted glob (`'./*.rs'`) or a `--files-from` list. Remote
-    // sources are never expanded — the remote side has no such support, and
-    // a remote path that literally contains `*` fails with a normal
-    // not-found error.
+    // sources are not expanded here: a remote glob (or a remote
+    // `--files-from` list) travels as the pull path(s) and is expanded
+    // server-side (`resolve_pull_roots` in the executor).
     let source_multi: Option<(PathBuf, Vec<PathBuf>)> = match &src {
         Location::Local(path) => {
             if let Some(list_file) = &cli.files_from {
