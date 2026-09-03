@@ -1,10 +1,12 @@
-# cp2-setup — Windows sshd + firewall setup helper: implementation status
+# cp2-setup — Windows sshd + firewall setup helper: implementation record
 
-**Paused mid-implementation (2026-09-02).** This file records where the
-`cp2-setup` GUI helper stands, what has been verified, the one critical
-compile defect left in the code, and the exact windows-sys 0.61 API shapes
-needed to fix it — so work can resume on a real Windows machine without
-re-deriving anything.
+**Implemented 2026-09-03 on a real Windows/MSVC machine.** The `win` module
+was rewritten to the windows-sys 0.61 raw-pointer API, `cp2-setup`
+compiles on Windows, `cargo clippy --all-targets -- -D warnings` is clean,
+and the 6 parser tests pass. This file keeps the verified API shapes and
+the decisions already made so follow-up work (UAT, packaging tweaks) needs
+no re-derivation. What is genuinely left is UAT on real Windows 10/11 and
+CI validation on the next tagged release.
 
 ## What the feature is
 
@@ -22,35 +24,35 @@ painless.
 
 | Item | Status |
 |---|---|
-| `setup/main.rs` exists, new file | ✅ written (uncommitted) |
-| `Cargo.toml`: `[[bin]] cp2-setup` + extra windows-sys features | ✅ edited (uncommitted) |
-| Linux stub build (`cargo build --bin cp2-setup`) | ✅ passes |
-| Unit tests (`cargo test --bin cp2-setup`) — 6 parser/status tests | ✅ all pass on Linux |
-| Linux clippy (`cargo clippy --bin cp2-setup -- -D warnings`) | ✅ clean |
-| **Windows compile of the `win` module** | ❌ **NOT verified — known to be broken, see below** |
-| Packaging (build-release.sh / release.yml / install.sh) | ⏳ not done |
-| Docs (README note / AGENTS.md layout) | ⏳ not done |
+| `setup/main.rs` exists, new file | ✅ written |
+| `Cargo.toml`: `[[bin]] cp2-setup` + extra windows-sys features | ✅ edited (incl. `Win32_UI_Input_KeyboardAndMouse` — `EnableWindow` lives there in 0.61) |
+| Linux stub build | ✅ passes |
+| Unit tests (`cargo test --bin cp2-setup`) — 6 parser/status tests | ✅ all pass on Linux and Windows |
+| Clippy (`cargo clippy --all-targets -- -D warnings`) | ✅ clean on Windows/MSVC |
+| **Windows compile of the `win` module (rewritten to 0.61)** | ✅ compiles on Windows/MSVC x86_64 |
+| Packaging (build-release.sh / release.yml / install.sh) | ✅ done |
+| Docs (README note / AGENTS.md layout) | ✅ done |
 | Real-machine UAT | ⏳ not done |
 
-Everything is uncommitted (working tree: `setup/main.rs` new, `Cargo.toml`
-modified).
+Everything above is committed in the merge `fcef307` (together with the
+setup scaffold itself); the win-module rewrite is part of the follow-up
+commit.
 
-## ⚠ The one known blocker: windows-sys 0.61 API style mismatch
+## The windows-sys 0.61 API rewrite (done 2026-09-03)
 
-The `win` module inside `setup/main.rs` was written assuming the
-windows-sys **0.60-style** API (handle types as `Option<HWND>` params,
-`HWND(pub *mut c_void)` tuple structs). The vendored crate is
-**windows-sys 0.61.2**, which uses **raw-pointer type aliases and plain
-(non-`Option`) parameters**:
+The `win` module was written assuming the windows-sys **0.60-style** API
+(handle types as `Option<HWND>` params, `HWND(pub *mut c_void)` tuple
+structs); the vendored crate is **windows-sys 0.61.2**, which uses
+**raw-pointer type aliases and plain (non-`Option`) parameters**:
 
 - `pub type HWND = *mut core::ffi::c_void;` (same for `HINSTANCE`,
   `HMODULE`, `HMENU`, `HICON`, `HCURSOR`, `HBRUSH`, `HGDIOBJ`, `HANDLE`)
 - `WPARAM = usize`, `LPARAM = isize`, `LRESULT = isize`, `BOOL = i32`
-- functions take `HWND` values directly — **pass `std::ptr::null()`/raw
+- functions take `HWND` values directly — **pass `std::ptr::null_mut()`/raw
   handles, never `None`/`Some(...)`**
 - `ShellExecuteW(..., lpparameters: PCWSTR, ...)` — **not** `Option<PCWSTR>`
 - `CreateWindowExW(..., hwndparent: HWND, hmenu: HMENU, ..., lpparam:
-  *const c_void)` — no options; menu IDs cast `IDC_ENABLE as *mut c_void`
+  *const c_void)` — no options; menu IDs cast `IDC_ENABLE as HMENU`
 - `WNDCLASSW.lpfnWndProc: WNDPROC` where
   `WNDPROC = Option<unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT>`
   (a safe `extern "system" fn` item coerces to the unsafe fn pointer)
@@ -59,25 +61,39 @@ windows-sys **0.60-style** API (handle types as `Option<HWND>` params,
 - `COLOR_WINDOW` lives in **`Win32::Graphics::Gdi`** (type
   `SYS_COLOR_INDEX` = i32), **not** WindowsAndMessaging
 - `ES_MULTILINE`/`ES_READONLY`/`ES_AUTOVSCROLL` live in
-  **`Win32::UI::WindowsAndMessaging`** (i32), `EM_SETSEL`/`EM_REPLACESEL`
-  in `Win32::UI::Controls` (u32)
+  **`Win32::UI::WindowsAndMessaging`** (i32 — cast to `u32` to combine with
+  `WS_*`), `EM_SETSEL`/`EM_REPLACESEL` in `Win32::UI::Controls` (u32)
 - `OpenProcessToken(HANDLE, TOKEN_ACCESS_MASK, *mut HANDLE) -> BOOL`;
   `GetTokenInformation(HANDLE, TOKEN_INFORMATION_CLASS, *mut c_void, u32,
   *mut u32) -> BOOL`; `TokenElevation = 20`, `TOKEN_QUERY = 8`
 
-Consequences for the rewrite:
-1. Every `Option<HWND>`/`Some(...)`/`None` call site and every `.0`
-   field access (`hwnd.0.is_null()` → `hwnd.is_null()`,
+What changed in the rewrite:
+1. Every `Option<HWND>`/`Some(...)`/`None` call site and every `.0` field
+   access (`hwnd.0.is_null()` → `hwnd.is_null()`,
    `r.0 > 32` → `r as usize > 32`, `font.0 as usize` → `font as usize`)
-   must change.
+   was rewritten.
 2. **`HWND` (a raw pointer) is not `Send`** — the worker thread moves the
-   window handle into `std::thread::spawn`. Wrap it:
-   `#[derive(Clone, Copy)] struct Hwnd(HWND); unsafe impl Send for Hwnd {}`
-   (sound: the worker only uses the value in `PostMessageW`), and store
-   `Hwnd` in the `Ui` struct so `static UI: Mutex<Option<Ui>>` stays valid.
+   window handle into `std::thread::spawn`. Wrapped as
+   `#[derive(Clone, Copy)] struct Hwnd(HWND); unsafe impl Send for Hwnd {}`,
+   stored in the `Ui` struct so `static UI: Mutex<Option<Ui>>` stays valid.
+   **Gotcha:** closures capture field-precisely, so `hwnd.0` inside the
+   worker closure captures just the raw pointer (not `Send`). The closure
+   must use a `Hwnd::post(self, ...)` method (receiver by value forces
+   whole-struct capture).
 3. `ShellExecuteW` success check: `r as usize > 32`.
 4. `GetModuleHandleW(std::ptr::null())` returns `HMODULE` (same alias type
    as `HINSTANCE`) — usable directly.
+5. Miscellaneous compile fixes discovered on the first real Windows build:
+   `EnableWindow` lives in **`Win32::UI::Input::KeyboardAndMouse`** (was
+   unresolved; added the `Win32_UI_Input_KeyboardAndMouse` feature);
+   `HBRUSH` is a `Gdi` alias, not a `Foundation` tuple struct;
+   `encode_wide` needs `std::ffi::OsStr` + `OsStrExt`, not `&str`; and the
+   `Ui` struct was missing the `enable` field the code used.
+6. Clippy (pedantic) fixes: `if !x { action } else { note }` inverted to
+   `if x { note } else { action }` (`if_not_else`), explicit
+   `std::ptr::from_mut/from_ref` instead of implicit `&mut`→`*mut` pointer
+   coercions, `u32::try_from(size_of::<TOKEN_ELEVATION>())` instead of a
+   truncating `as u32`, and a single `Box::into_raw(boxed) as isize` cast.
 
 Everything else in the file was deliberately verified against the vendored
 source (see "Verified API shapes" in `~/.cargo/registry/src/*/windows-sys-0.61.2/`).
@@ -162,33 +178,16 @@ added: `Win32_UI_WindowsAndMessaging`, `Win32_UI_Controls`, `Win32_UI_Shell`,
 | WNDCLASSW | `{ style: WNDCLASS_STYLES, lpfnWndProc: WNDPROC, cbClsExtra: i32, cbWndExtra: i32, hInstance: HINSTANCE, hIcon: HICON, hCursor: HCURSOR, hbrBackground: HBRUSH, lpszMenuName: PCWSTR, lpszClassName: PCWSTR }` (derives `Default` with Win32_Graphics_Gdi) |
 | Consts | `WS_*`/`WS_EX_CLIENTEDGE`/`CS_*`/`WM_SETFONT=48`/`WM_APP=32768` in WindowsAndMessaging; `ES_*` in WindowsAndMessaging (i32); `EM_*` in Controls (u32); `MB_*` (MESSAGEBOX_STYLE=u32) + `IDYES=6` in WindowsAndMessaging; `COLOR_WINDOW=5` in Graphics::Gdi (SYS_COLOR_INDEX) |
 
-## Remaining work (priority order)
+## Remaining work
 
-1. **Rewrite the `win` module to the 0.61 raw-pointer API** per the table
-   above (fix `Option`/`.0` usage, add the `Hwnd` Send wrapper).
-2. **Compile check** — either on this machine after installing a mingw-w64
-   C toolchain (`dnf install mingw64-gcc`, then
-   `cargo build --target x86_64-pc-windows-gnu --bin cp2-setup`; note the
-   build also needs the getrandom import-library step that requires
-   `x86_64-w64-mingw32-dlltool`), or directly on a real Windows box with
-   the MSVC toolchain (`cargo build --release --bin cp2-setup`). Windows
-   CI (`windows-latest`, msvc) runs clippy + tests and will catch the rest.
-3. **Clippy on the Windows target** (`cargo clippy --all-targets -- -D warnings`).
-4. **Packaging**:
-   - `scripts/build-release.sh`: build + stage
-     `cp2-setup-x86_64-pc-windows-gnu.exe` / `cp2-setup-aarch64-pc-windows-gnu.exe`
-     (add a small `setup_build` step like the existing `build()`; the
-     `build()` helper only copies the `cp2` binary name).
-   - `.github/workflows/release.yml`: add `cp2-setup.exe` to the Windows
-     matrix rows' upload-artifact path and rename it in the assemble step;
-     the loose `binaries/**/cp2.exe` publish glob does not catch it (name
-     mismatch), which is fine — it ships in the tarball.
-   - `scripts/install.sh`: on Windows, optionally also install
-     `cp2-setup.exe` to `~/.cargo/bin` (non-fatal if absent).
-5. **Docs**: README one-liner in the Install section pointing Windows users
-   at cp2-setup.exe (next to the existing "remote must run an SSH server"
-   note); AGENTS.md directory-layout line for `setup/`.
-6. **Real-machine UAT checklist** (Windows 10/11):
+Done since this file was first written: the `win` module rewrite (1),
+the MSVC compile check (2 — ran `cargo build --release --bin cp2-setup`
+on this Windows machine), clippy `-D warnings` on Windows (3), the
+packaging (4, all three scripts), and the docs (5, README + AGENTS.md).
+
+Still open:
+
+1. **Real-machine UAT checklist** (Windows 10/11):
    - fresh box without OpenSSH Server: status shows [MISSING] ×2; Enable →
      UAC → DISM installs (~minutes) → service auto-starts → rule added →
      "All set"; then verify `cp2 user@thatbox:...` push/pull works.
@@ -201,6 +200,9 @@ added: `Win32_UI_WindowsAndMessaging`, `Win32_UI_Controls`, `Win32_UI_Shell`,
      is missing (currently assumed nonzero).
    - Verify `sc query sshd` exit 1060 on a feature-less machine, and
      `sc start sshd` 1056-on-already-running behavior.
+2. **CI validation** — the next tagged release exercises the new
+   release.yml cp2-setup rows (x86_64 msvc native + aarch64 zig cross) and
+   the test job's `cargo test --all-targets` / clippy on all three runners.
 
 ## Behavior notes / gotchas recorded during implementation
 

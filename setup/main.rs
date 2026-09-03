@@ -219,28 +219,31 @@ fn main() {
 
 #[cfg(windows)]
 mod win {
-    use super::core_logic::*;
+    use super::core_logic::{
+        confirm_text, status_report, sc_running_state, sc_start_type, DISM_REBOOT_REQUIRED,
+        SC_ALREADY_RUNNING, SC_SERVICE_DOES_NOT_EXIST, SC_START_AUTO, SshdState, SystemStatus,
+    };
+    use std::os::windows::ffi::OsStrExt;
     use std::sync::Mutex;
-    use windows_sys::Win32::Foundation::{HMENU, HWND, LPARAM, WPARAM};
-    use windows_sys::Win32::Graphics::Gdi::{GetStockObject, DEFAULT_GUI_FONT};
+    use windows_sys::Win32::Foundation::{HANDLE, HWND, LPARAM, WPARAM};
+    use windows_sys::Win32::Graphics::Gdi::{GetStockObject, COLOR_WINDOW, DEFAULT_GUI_FONT};
     use windows_sys::Win32::Security::{
         GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
     };
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
-    use windows_sys::Win32::UI::Controls::{
-        ES_AUTOVSCROLL, ES_MULTILINE, ES_READONLY, EM_REPLACESEL, EM_SETSEL,
-    };
+    use windows_sys::Win32::UI::Controls::{EM_REPLACESEL, EM_SETSEL};
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
     use windows_sys::Win32::UI::Shell::ShellExecuteW;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        COLOR_WINDOW, CreateWindowExW, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT,
-        DefWindowProcW, DispatchMessageW, EnableWindow, GetMessageW, IDC_ARROW,
-        IDI_APPLICATION, IDYES, LoadCursorW, LoadIconW, MB_DEFBUTTON2, MB_ICONINFORMATION,
-        MB_ICONWARNING, MB_OK, MB_YESNO, MessageBoxW, PostMessageW, PostQuitMessage,
-        RegisterClassW, SendMessageW, SetWindowTextW, ShowWindow, SW_SHOWNORMAL,
-        TranslateMessage, WM_APP, WM_CLOSE, WM_COMMAND, WM_SETFONT, WNDCLASSW,
-        WS_CHILD, WS_EX_CLIENTEDGE, WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE,
-        WS_VSCROLL,
+        CreateWindowExW, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, DefWindowProcW,
+        DispatchMessageW, ES_AUTOVSCROLL, ES_MULTILINE, ES_READONLY, GetMessageW,
+        HMENU, IDC_ARROW, IDI_APPLICATION, IDYES, LoadCursorW, LoadIconW, MB_DEFBUTTON2,
+        MB_ICONINFORMATION, MB_ICONWARNING, MB_OK, MB_YESNO, MessageBoxW, PostMessageW,
+        PostQuitMessage, RegisterClassW, SendMessageW, SetWindowTextW, ShowWindow,
+        SW_SHOWNORMAL, TranslateMessage, WM_APP, WM_CLOSE, WM_COMMAND, WM_SETFONT,
+        WNDCLASSW, WS_CHILD, WS_EX_CLIENTEDGE, WS_OVERLAPPEDWINDOW, WS_TABSTOP,
+        WS_VISIBLE, WS_VSCROLL,
     };
 
     /// Fold a captured `Output` into (exit code, stdout+stderr text). Exit
@@ -262,7 +265,7 @@ mod win {
 
     /// The wide NUL-terminated form Windows APIs want.
     fn wide(s: &str) -> Vec<u16> {
-        s.encode_wide().chain(Some(0)).collect()
+        std::ffi::OsStr::new(s).encode_wide().chain(Some(0)).collect()
     }
 
     // ---- probe --------------------------------------------------------------
@@ -309,11 +312,11 @@ mod win {
     /// Whether this process runs with an elevated (administrator) token.
     #[must_use]
     pub fn is_elevated() -> bool {
-        let mut token = 0;
+        let mut token: HANDLE = std::ptr::null_mut();
         // SAFETY: GetCurrentProcess returns a pseudo-handle of the current
         // process; OpenProcessToken writes the real token handle only on
         // success (return value != 0).
-        let ok = unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) };
+        let ok = unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, std::ptr::from_mut(&mut token)) };
         if ok == 0 {
             return false;
         }
@@ -326,9 +329,10 @@ mod win {
             GetTokenInformation(
                 token,
                 TokenElevation,
-                &mut elevation as *mut _ as *mut core::ffi::c_void,
-                std::mem::size_of::<TOKEN_ELEVATION>() as u32,
-                &mut len,
+                std::ptr::from_mut(&mut elevation).cast::<core::ffi::c_void>(),
+                u32::try_from(std::mem::size_of::<TOKEN_ELEVATION>())
+                    .expect("TOKEN_ELEVATION is 4 bytes"),
+                std::ptr::from_mut(&mut len),
             )
         };
         ok != 0 && elevation.TokenIsElevated != 0
@@ -342,20 +346,20 @@ mod win {
         let args_w = wide("--enable");
         let runas = wide("runas");
         // SAFETY: all three strings are NUL-terminated wide strings; "runas"
-        // with `None` parent shows the UAC prompt. A return value > 32 is a
-        // successful spawn (HINSTANCE is a fake "instance" handle for
+        // with a null parent window shows the UAC prompt. A return value > 32
+        // is a successful spawn (HINSTANCE is a fake "instance" handle for
         // ShellExecute, interpreted as an error code otherwise).
         let r = unsafe {
             ShellExecuteW(
-                None,
+                std::ptr::null_mut(),
                 runas.as_ptr(),
                 exe_w.as_ptr(),
-                Some(args_w.as_ptr()),
-                None,
-                1 /* SW_SHOWNORMAL */,
+                args_w.as_ptr(),
+                std::ptr::null(),
+                SW_SHOWNORMAL,
             )
         };
-        if r.0 > 32 {
+        if r as usize > 32 {
             Ok(())
         } else {
             Err(std::io::Error::last_os_error())
@@ -394,7 +398,8 @@ mod win {
             } else {
                 report(&format!("[1/3] FAILED to enable the feature (exit {code})."));
                 report("        Last lines of the output:");
-                for line in out.lines().rev().take(4).rev() {
+                let tail: Vec<_> = out.lines().rev().take(4).collect();
+                for line in tail.iter().rev() {
                     report(line);
                 }
                 report("        Fix the error above, or enable it in Windows");
@@ -423,7 +428,9 @@ mod win {
                             report(&format!("[2/3] sc config failed (exit {code})."));
                         }
                     }
-                    if !running {
+                    if running {
+                        report("[2/3] sshd service already running.");
+                    } else {
                         report("[2/3] starting the sshd service...");
                         let (code, out) = output_of(
                             std::process::Command::new("sc.exe")
@@ -440,8 +447,6 @@ mod win {
                             report("        The service account or host keys may need");
                             report("        attention.");
                         }
-                    } else {
-                        report("[2/3] sshd service already running.");
                     }
                 }
             }
@@ -449,7 +454,9 @@ mod win {
                 report("[2/3] skipped: no sshd service (feature step failed above).");
             }
         }
-        if !state.firewall_rule {
+        if state.firewall_rule {
+            report("[3/3] firewall rule already present.");
+        } else {
             // Delete-then-add: a rule with the same name would otherwise make
             // netsh fail with "already exists"; deleting a missing rule is a
             // non-fatal error we ignore. The add is what matters.
@@ -479,14 +486,13 @@ mod win {
                 report("        done.");
             } else {
                 report(&format!("[3/3] FAILED (exit {code})."));
-                for line in out.lines().rev().take(3).rev() {
+                let tail: Vec<_> = out.lines().rev().take(3).collect();
+                for line in tail.iter().rev() {
                     report(line);
                 }
                 report("        Add it manually: Windows Defender Firewall >");
                 report("        Advanced settings > Inbound rules > New rule.");
             }
-        } else {
-            report("[3/3] firewall rule already present.");
         }
         report("Re-checking...");
         final_report(report, &probe());
@@ -516,10 +522,29 @@ mod win {
     const WM_APP_APPEND: u32 = WM_APP + 1;
     const WM_APP_DONE: u32 = WM_APP + 2;
 
+    /// `HWND` is a raw `*mut c_void`, which is not `Send`; the worker thread
+    /// only ever passes the value to `PostMessageW`, so a `Send` wrapper is
+    /// sound. Stored in `Ui` so the `static UI` stays valid.
+    #[derive(Clone, Copy)]
+    struct Hwnd(HWND);
+    unsafe impl Send for Hwnd {}
+
+    impl Hwnd {
+        /// Post a message to the window from the worker thread. Taking `self`
+        /// by value also makes the worker closure capture the whole `Hwnd`
+        /// (which is `Send`) instead of just the raw handle field.
+        fn post(self, msg: u32, wparam: WPARAM, lparam: LPARAM) {
+            // SAFETY: `self.0` is our own window's handle, valid for the
+            // process lifetime; PostMessageW only queues the message.
+            unsafe { PostMessageW(self.0, msg, wparam, lparam) };
+        }
+    }
+
     /// The controls the window must talk to; the worker thread only posts
     /// messages, so everything else happens on the message-loop thread.
     struct Ui {
-        edit: HWND,
+        edit: Hwnd,
+        enable: Hwnd,
         status: SystemStatus,
         elevated: bool,
     }
@@ -553,7 +578,7 @@ mod win {
         let title = wide(title);
         // SAFETY: both strings are NUL-terminated for the call; the message
         // box is a modal dialog, so the transient buffers are fine.
-        unsafe { MessageBoxW(None, text.as_ptr(), title.as_ptr(), style) }
+        unsafe { MessageBoxW(std::ptr::null_mut(), text.as_ptr(), title.as_ptr(), style) }
     }
 
     /// The Enable button: present the exact plan, then say whether the user
@@ -576,7 +601,7 @@ mod win {
         // (6) on Yes, IDNO (7) on No/Cancel.
         let yes = unsafe {
             MessageBoxW(
-                None,
+                std::ptr::null_mut(),
                 text.as_ptr(),
                 title.as_ptr(),
                 MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2,
@@ -588,25 +613,24 @@ mod win {
     fn start_worker(hwnd: HWND) {
         let (edit, enable) = with_ui(|ui| (ui.edit, ui.enable));
         // SAFETY: EnableWindow on our own child button.
-        unsafe { EnableWindow(enable, 0) };
-        append_text(edit, "\nWorking... (the feature step can take minutes)\n");
+        unsafe { EnableWindow(enable.0, 0) };
+        append_text(edit.0, "\nWorking... (the feature step can take minutes)\n");
+        // The worker thread only posts messages with this handle.
+        let hwnd = Hwnd(hwnd);
         std::thread::spawn(move || {
             let mut report = |line: &str| {
                 let boxed = Box::new(line.to_string());
                 // SAFETY: `boxed` is leaked here and reclaimed by the message
                 // loop when it handles WM_APP_APPEND (Box::from_raw).
-                unsafe {
-                    PostMessageW(
-                        hwnd,
-                        WM_APP_APPEND,
-                        0,
-                        Box::into_raw(boxed) as *mut String as isize,
-                    );
-                }
+                hwnd.post(
+                    WM_APP_APPEND,
+                    0,
+                    Box::into_raw(boxed) as isize,
+                );
             };
             enable_all(&mut report);
             // SAFETY: posts to our own window; WM_APP_DONE carries no data.
-            unsafe { PostMessageW(hwnd, WM_APP_DONE, 0, 0) };
+            hwnd.post(WM_APP_DONE, 0, 0);
         });
     }
 
@@ -657,7 +681,7 @@ mod win {
                 with_ui(|ui| {
                     ui.status = status;
                     // SAFETY: EnableWindow on our own child button.
-                    unsafe { EnableWindow(ui.enable, 1) };
+                    unsafe { EnableWindow(ui.enable.0, 1) };
                 });
                 let st = with_ui(|ui| ui.status.clone());
                 append_text(ui_controls_edit(), "\n");
@@ -677,7 +701,7 @@ mod win {
     }
 
     fn ui_controls_edit() -> HWND {
-        with_ui(|ui| ui.edit)
+        with_ui(|ui| ui.edit.0)
     }
 
     fn gui_main(run_enable: bool) {
@@ -701,18 +725,14 @@ mod win {
             hInstance: hinstance,
             // SAFETY: stock icon/cursor handles never need freeing.
             hIcon: unsafe { LoadIconW(hinstance, IDI_APPLICATION) },
-            hCursor: unsafe { LoadCursorW(None, IDC_ARROW) },
-            hbrBackground: unsafe {
-                // The (COLOR_WINDOW + 1) convention: a system color brush.
-                windows_sys::Win32::Foundation::HBRUSH(
-                    (COLOR_WINDOW + 1) as *mut core::ffi::c_void,
-                )
-            },
+            hCursor: unsafe { LoadCursorW(std::ptr::null_mut(), IDC_ARROW) },
+            // The (COLOR_WINDOW + 1) convention: a system color brush.
+            hbrBackground: (COLOR_WINDOW + 1) as *mut core::ffi::c_void,
             lpszMenuName: std::ptr::null(),
             lpszClassName: class_name.as_ptr(),
         };
         // SAFETY: `wc` is fully initialized and lives for the registration.
-        unsafe { RegisterClassW(&wc) };
+        unsafe { RegisterClassW(std::ptr::from_ref(&wc)) };
 
         let title = wide("cp2-setup - Windows SSH server");
         let hwnd = unsafe {
@@ -725,13 +745,13 @@ mod win {
                 CW_USEDEFAULT,
                 590,
                 440,
-                None,
-                None,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
                 hinstance,
-                None,
+                std::ptr::null(),
             )
         };
-        if hwnd.0.is_null() {
+        if hwnd.is_null() {
             let _ = message_box(
                 "Could not create the setup window.",
                 "cp2-setup",
@@ -745,15 +765,15 @@ mod win {
                 WS_EX_CLIENTEDGE,
                 wide("EDIT").as_ptr(),
                 std::ptr::null(),
-                WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
+                WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE as u32 | ES_READONLY as u32 | ES_AUTOVSCROLL as u32,
                 16,
                 16,
                 558,
                 330,
-                Some(hwnd),
-                None,
+                hwnd,
+                std::ptr::null_mut(),
                 hinstance,
-                None,
+                std::ptr::null(),
             )
         };
         let enable = unsafe {
@@ -766,10 +786,10 @@ mod win {
                 368,
                 230,
                 34,
-                Some(hwnd),
-                Some(HMENU(IDC_ENABLE as *mut core::ffi::c_void)),
+                hwnd,
+                IDC_ENABLE as HMENU,
                 hinstance,
-                None,
+                std::ptr::null(),
             )
         };
         let close = unsafe {
@@ -782,10 +802,10 @@ mod win {
                 368,
                 100,
                 34,
-                Some(hwnd),
-                Some(HMENU(IDC_CLOSE as *mut core::ffi::c_void)),
+                hwnd,
+                IDC_CLOSE as HMENU,
                 hinstance,
-                None,
+                std::ptr::null(),
             )
         };
 
@@ -793,18 +813,20 @@ mod win {
         // lets the control copy the handle for its own use.
         unsafe {
             let font = GetStockObject(DEFAULT_GUI_FONT);
-            SendMessageW(edit, WM_SETFONT, font.0 as usize, 1);
-            SendMessageW(enable, WM_SETFONT, font.0 as usize, 1);
-            SendMessageW(close, WM_SETFONT, font.0 as usize, 1);
+            SendMessageW(edit, WM_SETFONT, font as usize, 1);
+            SendMessageW(enable, WM_SETFONT, font as usize, 1);
+            SendMessageW(close, WM_SETFONT, font as usize, 1);
         }
 
         let status = probe();
+        let report = status_report(&status);
         *UI.lock().unwrap() = Some(Ui {
-            edit,
+            edit: Hwnd(edit),
+            enable: Hwnd(enable),
             status,
             elevated: is_elevated(),
         });
-        set_text(edit, &status_report(&status));
+        set_text(edit, &report);
         // SAFETY: the window was created with WS_VISIBLE but a final show
         // guarantees the first paint happens after the status text is in.
         unsafe { ShowWindow(hwnd, SW_SHOWNORMAL) };
@@ -819,9 +841,9 @@ mod win {
         // WM_QUIT (which our handlers post).
         unsafe {
             let mut msg = std::mem::zeroed();
-            while GetMessageW(&mut msg, None, 0, 0) > 0 {
-                TranslateMessage(&msg);
-                DispatchMessageW(&msg);
+            while GetMessageW(std::ptr::from_mut(&mut msg), std::ptr::null_mut(), 0, 0) > 0 {
+                TranslateMessage(std::ptr::from_ref(&msg));
+                DispatchMessageW(std::ptr::from_ref(&msg));
             }
         }
     }
@@ -850,7 +872,10 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::core_logic::*;
+    use super::core_logic::{
+        confirm_text, planned_actions, sc_running_state, sc_start_type, status_report,
+        SshdState, SystemStatus, SC_START_AUTO,
+    };
 
     fn status(sshd: SshdState, firewall_rule: bool) -> SystemStatus {
         SystemStatus {

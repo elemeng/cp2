@@ -83,6 +83,8 @@ windows-sys = { version = "0.61", features = [
     # The cp2-setup GUI helper (setup/main.rs).
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Controls",
+    # EnableWindow moved here in windows-sys 0.61.
+    "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_Shell",
     "Win32_UI_HiDpi",
     "Win32_Graphics_Gdi",

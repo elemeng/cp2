@@ -58,6 +58,20 @@ DEST="$HOME/.cargo/bin/cp2"
 mkdir -p "$(dirname "$DEST")"
 install -m755 "$SRC" "$DEST"
 
+# ---- optionally: the cp2-setup GUI helper (Windows only) ----
+# cp2-setup.exe is a double-click helper that checks/enables the OpenSSH
+# Server feature + firewall rule on Windows. Not bundled for every archive,
+# so this is non-fatal.
+if [ "$os" = "windows" ]; then
+    for src in "cp2-setup-$arch-pc-windows-gnu.exe" "cp2-setup-$arch-pc-windows-msvc.exe"; do
+        if [ -f "$ARCHIVE/$src" ]; then
+            install -m755 "$ARCHIVE/$src" "$HOME/.cargo/bin/cp2-setup.exe"
+            echo "install: cp2-setup.exe installed to $HOME/.cargo/bin/cp2-setup.exe"
+            break
+        fi
+    done
+fi
+
 # ---- ensure ~/.cargo/bin is on $PATH ----
 line='export PATH="$HOME/.cargo/bin:$PATH"'
 if [ "$os" = "windows" ]; then

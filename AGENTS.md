@@ -1,7 +1,7 @@
 # cp2 (MotorCycle branch)
 
 Rsync-style file-sync tool over SSH with a rsync-style CLI. Single
-`Cargo.toml`, one binary, no workspace overhead.
+`Cargo.toml`, two binaries, no workspace overhead.
 
 ## Directory layout
 
@@ -21,6 +21,7 @@ cp2/
 │   ├── security/           # Path sanitization
 │   ├── sync/               # scanner, linkpolicy, filter, planner, strategy, stats, sender, receiver, executor
 │   └── transport/          # ssh spawner + bandwidth limiter
+├── setup/                  # cp2-setup: Windows sshd+firewall GUI helper (second [[bin]], outside src/ so the build.rs fingerprint stays untouched)
 └── tests/                  # Integration tests (e2e push+pull over --server child, CLI smoke)
 ```
 

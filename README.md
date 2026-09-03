@@ -113,7 +113,8 @@ everything on the remote runs as *your* account.
 
 The remote must run an SSH server (sshd) — on Linux and macOS it usually
 already does; on Windows it is the optional **OpenSSH Server** feature:
-enable it once and allow its port through the firewall. cp2's auto-deploy
+enable it once and allow its port through the firewall (the release
+archive's `cp2-setup.exe` does exactly that with a GUI). cp2's auto-deploy
 installs the cp2 binary on the remote, not the SSH server itself.
 
 ## Why cp2?

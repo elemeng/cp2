@@ -95,6 +95,17 @@ jobs:
           else
             cargo build --release --target "${{ matrix.target }}"
           fi
+      - name: build cp2-setup (Windows rows only)
+        # cp2-setup is the Windows sshd/firewall GUI helper. It has no
+        # --version/--help and would open a window, so it is not
+        # smoke-tested; it just ships in the tarball.
+        if: contains(matrix.target, 'windows')
+        run: |
+          if [ "${{ matrix.zig }}" = "true" ]; then
+            cargo zigbuild --release --bin cp2-setup --target "${{ matrix.target }}"
+          else
+            cargo build --release --bin cp2-setup --target "${{ matrix.target }}"
+          fi
       - name: smoke test the binary on its own platform
         # Skipped for the cross-compiled ARM64 Windows row: no ARM64 Windows
         # host exists on GitHub-hosted runners.
@@ -111,6 +122,8 @@ jobs:
           path: |
             target/${{ matrix.target }}/release/cp2
             target/${{ matrix.target }}/release/cp2.exe
+            target/${{ matrix.target }}/release/cp2-setup
+            target/${{ matrix.target }}/release/cp2-setup.exe
           if-no-files-found: error
 
   assemble:
@@ -134,6 +147,10 @@ jobs:
             else
               mv "$dir/cp2" "$STAGE/cp2-$triple"
             fi
+            # the GUI helper rides along on the Windows rows
+            [ -f "$dir/cp2-setup.exe" ] \
+              && mv "$dir/cp2-setup.exe" "$STAGE/cp2-setup-$triple.exe" \
+              || true
           done
           cp scripts/install.sh "$STAGE/install.sh"
           chmod +x "$STAGE/install.sh"

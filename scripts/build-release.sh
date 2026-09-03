@@ -42,6 +42,23 @@ build() { # target-triple  output-name
 
 NATIVE=$(rustc -vV | sed -n 's/^host: //p')
 
+setup_build() { # target-triple  output-name — like build() but for cp2-setup
+    local target="$1" out="$2"
+    if ! rustup target list --installed | grep -qx "$target"; then
+        echo "skip $target (toolchain not installed): place a prebuilt binary at $STAGE/$out"
+        return
+    fi
+    echo "building $target (cp2-setup)..."
+    if AWS_LC_SYS_PREBUILT_NASM=1 cargo build --release --bin cp2-setup --target "$target" >/dev/null 2>&1; then
+        cp "target/$target/release/cp2-setup.exe" "$STAGE/$out"
+        chmod +x "$STAGE/$out"
+    else
+        echo "skip $target (build failed): place a prebuilt binary at $STAGE/$out"
+        echo "  last build error:"
+        AWS_LC_SYS_PREBUILT_NASM=1 cargo build --release --bin cp2-setup --target "$target" 2>&1 | tail -4 | sed 's/^/    /'
+    fi
+}
+
 # Linux (musl = libc-agnostic, the auto-deploy default)
 build x86_64-unknown-linux-musl cp2-x86_64-unknown-linux-musl
 build aarch64-unknown-linux-musl cp2-aarch64-unknown-linux-musl
@@ -55,6 +72,12 @@ build aarch64-apple-darwin cp2-aarch64-apple-darwin
 # AWS_LC_SYS_PREBUILT_NASM=1 to use the crate's prebuilt x86-64 NASM objects.)
 build x86_64-pc-windows-gnu cp2-x86_64-pc-windows-gnu.exe
 build aarch64-pc-windows-gnu cp2-aarch64-pc-windows-gnu.exe
+# The cp2-setup GUI helper (Windows-only) rides along on the Windows rows.
+# Same toolchain needs as the cp2 builds above: the helper is its own bin,
+# but the package lib (russh/aws-lc) is compiled too.
+setup_build x86_64-pc-windows-gnu cp2-setup-x86_64-pc-windows-gnu.exe
+setup_build aarch64-pc-windows-gnu cp2-setup-aarch64-pc-windows-gnu.exe
+
 # Native build as the gnu/msvc fallback for the local platform
 echo "building native ($NATIVE)..."
 cargo build --release >/dev/null
