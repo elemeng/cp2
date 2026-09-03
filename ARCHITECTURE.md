@@ -192,8 +192,8 @@ against it.
 - `--remove-source-files` deletes a source only after: hashes match, the
   file was fsynced, the renamed dirs were synced (before the `Ack`), and
   both sides re-checked size+mtime (destination after apply, source before
-  delete). A silent wire corruption, a crash, or a mid-sync change never
-  loses data.
+  delete). The source is freed only once every check has passed, so a wire
+  corruption, a crash, or a mid-sync change cannot lose data unnoticed.
 - The quick check (size+mtime) runs first and free; only files that failed
   it enter the delta path.
 

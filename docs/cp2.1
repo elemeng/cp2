@@ -17,8 +17,9 @@ content-defined delta engine (FastCDC chunking + BLAKE3) that sends only
 the bytes that actually changed. One binary, no runtime dependencies
 beyond the
 .B ssh
-client you already have, and zero server setup on a same-platform remote:
-the server binary is auto-deployed on first sync. A different platform
+client you already have, and zero server setup on a same-platform remote
+that runs an SSH server (sshd; the OpenSSH Server feature on Windows,
+enabled once): the server binary is auto-deployed on first sync. A different platform
 needs cp2 installed on the remote once — `cargo install cp2 --locked`, the
 prebuilt release tarball (extract, rename the binary to `cp2`, copy it to
 `~/.cargo/bin`), or a source build (`git clone` + `cargo build --release`).

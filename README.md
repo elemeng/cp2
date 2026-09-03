@@ -4,18 +4,25 @@
 [![docs.rs](https://docs.rs/cp2/badge.svg)](https://docs.rs/cp2)
 [![License](https://img.shields.io/crates/l/cp2.svg)](https://crates.io/crates/cp2)
 
-**Copy and sync files locally or between machines — ultra fast, verified,
-private, and with zero server setup.**
+**Copy and sync files locally or between machines — ultra fast, verifiable,
+private, and very easy to set up.**
 
 cp2 is a modern `cp`/`rsync`-style tool in one pure-Rust binary for **Linux**,
 **macOS**, and **Windows**. It sends only the bytes that actually changed,
-verifies what it writes, and watches folders in realtime; a same-platform
-remote needs nothing installed — the first sync deploys cp2 there
-automatically.
+verifies what it writes, and watches folders in realtime; a same-platform 
+remote needs nothing installed — the first sync automatically deploys cp2 there
+(if libc is compatible).
 
 - **Install:** one binary, or `cargo install cp2`
 - **First sync:** `cp2 ./photos user@server:backup`
 - **Watch mode (sync in realtime):** `cp2 -W ./photos user@server:backup`
+
+> **Status:** cp2 started as a personal tool to copy and sync files between a
+> Windows laptop, a Linux workstation, and a Mac. It is under active
+> development — it works pretty well for everyday use, but bugs may remain,
+> and its developers and contributors cannot guarantee the safety of your
+> data. Back up what matters, and run a dry run (`cp2 -n`) before your first
+> real sync.
 
 ## Contents
 
@@ -104,6 +111,11 @@ cp2 -W ./photos user@server:backup
 Your existing SSH credentials are used as-is (key, agent, or password);
 everything on the remote runs as *your* account.
 
+The remote must run an SSH server (sshd) — on Linux and macOS it usually
+already does; on Windows it is the optional **OpenSSH Server** feature:
+enable it once and allow its port through the firewall. cp2's auto-deploy
+installs the cp2 binary on the remote, not the SSH server itself.
+
 ## Why cp2?
 
 - **Sends only what changed** — FastCDC chunking + BLAKE3: a one-byte edit in
@@ -159,7 +171,7 @@ cp2 --verify --remove-source-files /data user@host:storage
 ```
 
 Source files are deleted only after the destination is hash-verified and
-fsynced — safe for clearing an instrument's storage.
+fsynced — made for clearing an instrument's storage.
 
 ### Sync only what matches
 
@@ -212,12 +224,15 @@ syncs as a top-level entry of one run:
 cp2 './src/*.rs' user@host:backup      # backup/a.rs, backup/b.rs
 cp2 'src/**/x.rs' ./restore            # restore/a/x.rs (structure under src kept)
 cp2 './*' user@host:backup --exclude target
+cp2 'user@host:data/*.iso' ./restore   # a pull glob expands on the server
 ```
 
-Only local sources expand (remote-side expansion isn't supported); a path
-that literally exists is never treated as a pattern; and the wildcard
-matches dotfiles like rsync's (use `--exclude` to drop `.git`, `target`,
-...). `--watch` needs a single directory source, not a glob.
+A quoted glob expands on either side: a local source is expanded by cp2
+before the sync, a remote source (`user@host:data/*.iso`) by the server
+during the pull. A path that literally exists is never treated as a
+pattern; and the wildcard matches dotfiles like rsync's (use `--exclude`
+to drop `.git`, `target`, ...). `--watch` needs a single directory
+source, not a glob.
 
 ### File lists
 
@@ -234,10 +249,12 @@ cp2 --files-from manifests/microscopy.txt user@host:backup
 
 One absolute path per line — Unix and Windows line endings both work, blank
 lines are skipped, and paths may contain spaces. Entries may be files or
-directories (directories recurse), and each file syncs exactly once; missing
-entries are warned about and skipped. Local entries only. With `--delete`,
-only destination content under the listed paths is removed (rsync scope) —
-files sitting next to them are left alone.
+directories (directories recurse), and each file syncs exactly once. The
+list is read on the machine you run cp2 on: for a push the entries are
+local absolute paths (missing entries are warned about and skipped); for a
+pull they are absolute paths on the server, scanned and mirrored from
+there. With `--delete`, only destination content under the listed paths is
+removed (rsync scope) — files sitting next to them are left alone.
 
 ## Defaults
 
@@ -366,6 +383,7 @@ source headers, and their retained copyright lines live in
 | pxs | BSD-3-Clause | Staged-file sink / atomic commit (adapted, `src/platform/staging.rs`) |
 | librsync | MIT/Apache-2.0 | Delta-algorithm background (studied) |
 | rusync | BSD-3-Clause | rsync-style CLI/protocol study |
+| ripsync | MIT/Apache-2.0 | rsync protocol study |
 | zsync-rs | MIT | rsync-compatible delta study |
 | msy | MIT | Sync-pipeline study |
 | syncz | MIT | Sync-protocol study |

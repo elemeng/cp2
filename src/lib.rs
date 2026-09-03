@@ -45,7 +45,7 @@
 //! - **Verification & move-off** — `--verify` proves the destination bytes
 //!   match the source (on-the-fly hashing, no re-reads); `--remove-source-files`
 //!   deletes the source only after the destination is hash-verified, fsynced,
-//!   and re-checked — safe for freeing an instrument's disk.
+//!   and re-checked — made for freeing an instrument's disk.
 //! - **rsync semantics** — `-a` (special files/devices on Unix; owner/group
 //!   are never preserved — 0-Root), `--delete`,
 //!   `--backup`, `--no-*` opt-outs, include/exclude globs, exit code 23.
